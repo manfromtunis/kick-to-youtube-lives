@@ -30,9 +30,16 @@ OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/youtube"
 )
 
+AUTH_REQUIRED_MSG = "YouTube authorization expired or missing: run `py -m k2y auth`"
+
+
+class AuthRequired(Exception):
+    """Raised when YouTube authorization is expired or missing."""
+    pass
+
 
 class QuotaExceeded(Exception):
-    """Raised when YouTube API quota is exceeded (403 quotaExceeded or uploadLimitExceeded)."""
+    """Raised when YouTube API quota is exceeded (quotaExceeded, uploadLimitExceeded, dailyLimitExceeded)."""
     pass
 
 
@@ -56,6 +63,10 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
         raw = raw_body if raw_body is not None else e.read().decode("utf-8", errors="replace")
         data = json.loads(raw)
         if isinstance(data, dict):
+            # Check for invalid_grant on 400/401
+            if code in (400, 401) and data.get("error") == "invalid_grant":
+                return AuthRequired(AUTH_REQUIRED_MSG)
+
             if "error" in data:
                 err = data["error"]
                 if isinstance(err, dict):
@@ -66,13 +77,17 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
                         for item in errors
                         if isinstance(item, dict) and "reason" in item
                     ]
-                    if code == 403:
+                    # Any 4xx with quota reasons raises QuotaExceeded
+                    QUOTA_REASONS = {"quotaExceeded", "uploadLimitExceeded", "dailyLimitExceeded"}
+                    if 400 <= code < 500:
                         for r in reasons:
-                            if r in ("quotaExceeded", "uploadLimitExceeded"):
+                            if r in QUOTA_REASONS:
                                 return QuotaExceeded(f"{r}: {msg}")
                     if reasons:
                         reason = ", ".join(reasons)
                 elif isinstance(err, str):
+                    if code in (400, 401) and err == "invalid_grant":
+                        return AuthRequired(AUTH_REQUIRED_MSG)
                     reason = err
                     msg = data.get("error_description", "")
     except Exception:
@@ -112,8 +127,11 @@ def _token_request(token_uri: str, fields: dict, what: str) -> dict:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise _parse_youtube_error(e)
+        raw_body = e.read().decode("utf-8", errors="replace")
+        raise _parse_youtube_error(e, raw_body=raw_body)
     except Exception as e:
+        if isinstance(e, AuthRequired):
+            raise
         raise YouTubeError(f"{what} failed: {e}")
 
 
@@ -264,15 +282,25 @@ def auth(paste: bool = False) -> None:
 
 
 def access_token(force_refresh: bool = False) -> str:
-    raw = config.read_secret("youtube_token.json")
+    try:
+        raw = config.read_secret("youtube_token.json")
+    except config.MissingSecret:
+        raise AuthRequired(AUTH_REQUIRED_MSG)
+
+    if not raw.strip():
+        raise AuthRequired(AUTH_REQUIRED_MSG)
+
     try:
         token_data = json.loads(raw)
-    except Exception as e:
-        raise YouTubeError(f"Failed to parse youtube_token.json: {e}")
+    except Exception:
+        raise AuthRequired(AUTH_REQUIRED_MSG)
+
+    if not isinstance(token_data, dict):
+        raise AuthRequired(AUTH_REQUIRED_MSG)
 
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
-        raise YouTubeError("Missing refresh_token in youtube_token.json")
+        raise AuthRequired(AUTH_REQUIRED_MSG)
 
     current_token = token_data.get("access_token")
     expires_at = token_data.get("expires_at", 0)
@@ -311,10 +339,21 @@ def _authed(send: Callable[[str], object]) -> object:
         raise
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _init_upload_session(total_size: int, meta: dict) -> str:
+    title = str(meta.get("title", "")).replace("<", "").replace(">", "")[:100]
+    description = str(meta.get("description", "")).replace("<", "").replace(">", "")
+    description = _truncate_utf8(description, 5000)
+
     snippet: dict[str, object] = {
-        "title": str(meta.get("title", ""))[:100],
-        "description": str(meta.get("description", ""))[:5000],
+        "title": title,
+        "description": description,
         "categoryId": str(meta.get("category_id", meta.get("categoryId", "22"))),
         "defaultLanguage": "ar",
         "defaultAudioLanguage": "ar",
@@ -418,6 +457,16 @@ def upload(
 ) -> str:
     path = Path(path)
     total_size = path.stat().st_size
+    session_restarts = 0
+
+    def _restart_session() -> tuple[str, int]:
+        nonlocal session_restarts
+        session_restarts += 1
+        if session_restarts > 2:
+            raise YouTubeError("Upload session expired too many times (max 2 restarts)")
+        new_url = _init_upload_session(total_size, meta)
+        on_session(new_url)
+        return new_url, 0
 
     if session_url is None:
         session_url = _init_upload_session(total_size, meta)
@@ -432,9 +481,7 @@ def upload(
                     return video_id
                 break
             except _SessionExpired:
-                session_url = _init_upload_session(total_size, meta)
-                on_session(session_url)
-                offset = 0
+                session_url, offset = _restart_session()
                 break
             except _RETRYABLE as e:
                 attempts += 1
@@ -458,9 +505,7 @@ def upload(
                 if total_size == 0:
                     break
             except _SessionExpired:
-                session_url = _init_upload_session(total_size, meta)
-                on_session(session_url)
-                offset = 0
+                session_url, offset = _restart_session()
                 attempts = 0
             except _RETRYABLE as e:
                 attempts += 1
@@ -474,9 +519,7 @@ def upload(
                         return video_id
                     offset = next_byte
                 except _SessionExpired:
-                    session_url = _init_upload_session(total_size, meta)
-                    on_session(session_url)
-                    offset = 0
+                    session_url, offset = _restart_session()
                     attempts = 0
                 except _RETRYABLE:
                     pass

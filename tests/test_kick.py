@@ -1,12 +1,15 @@
 """Tests for k2y/kick.py."""
+import ast
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
 
+from k2y import kick
 from k2y.kick import KickError, best_rendition, download, list_vods, probe_duration
 
 SAMPLE_MASTER = """#EXTM3U
@@ -17,6 +20,16 @@ SAMPLE_MASTER = """#EXTM3U
 #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=230000,CODECS="avc1.4D401F,mp4a.40.2",RESOLUTION=284x160,VIDEO="160p30",FRAME-RATE=30.000
 160p30/playlist.m3u8
 """
+
+
+class TestDocstring(unittest.TestCase):
+    def test_docstring_is_first_statement(self):
+        source = Path(kick.__file__).read_text(encoding="utf-8")
+        parsed = ast.parse(source)
+        first_stmt = parsed.body[0]
+        self.assertIsInstance(first_stmt, ast.Expr)
+        self.assertIsInstance(first_stmt.value, ast.Constant)
+        self.assertIsInstance(first_stmt.value.value, str)
 
 
 class TestKick(unittest.TestCase):
@@ -55,7 +68,7 @@ https://cdn.example.com/stream/100k.m3u8
                 "id": 43,
                 "session_title": "Chilling",
                 "start_time": "2026-10-22T23:00:00Z",
-                "duration": 1800000,
+                "duration": 1800000.5,
                 "source": "https://stream.kick.com/43/master.m3u8",
                 "categories": [],
                 "is_live": True,
@@ -77,11 +90,10 @@ https://cdn.example.com/stream/100k.m3u8
         self.assertEqual(vods[0]["category"], "Grand Theft Auto V")
         self.assertFalse(vods[0]["is_live"])
 
-        # Second VOD has empty categories and is_live=True
         self.assertIsNone(vods[1]["category"])
         self.assertTrue(vods[1]["is_live"])
+        self.assertEqual(vods[1]["duration_s"], 1800)
 
-        # Check request headers
         req = mock_urlopen.call_args[0][0]
         self.assertIn("Mozilla", req.headers["User-agent"])
 
@@ -178,16 +190,36 @@ https://cdn.example.com/stream/100k.m3u8
             list_vods("testchannel")
 
     @patch("urllib.request.urlopen")
-    def test_list_vods_missing_key(self, mock_urlopen):
+    def test_list_vods_skips_malformed_items(self, mock_urlopen):
         payload = [
+            # 1. Not a dict
+            "not a dict item",
+            # 2. Missing session_title
             {
-                "id": 42,
-                # Missing session_title
+                "id": 1,
                 "start_time": "2026-10-22T20:00:00Z",
                 "duration": 7200000,
-                "source": "https://stream.kick.com/42/master.m3u8",
+                "source": "https://stream.kick.com/1/master.m3u8",
                 "is_live": False,
-            }
+            },
+            # 3. Non-positive duration
+            {
+                "id": 2,
+                "session_title": "Bad duration",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 0,
+                "source": "https://stream.kick.com/2/master.m3u8",
+                "is_live": False,
+            },
+            # 4. Valid item
+            {
+                "id": 3,
+                "session_title": "Good stream",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 3600000,
+                "source": "https://stream.kick.com/3/master.m3u8",
+                "is_live": False,
+            },
         ]
         mock_resp = MagicMock()
         mock_resp.status = 200
@@ -195,9 +227,15 @@ https://cdn.example.com/stream/100k.m3u8
         mock_resp.__enter__.return_value = mock_resp
         mock_urlopen.return_value = mock_resp
 
-        with self.assertRaises(KickError) as ctx:
-            list_vods("testchannel")
-        self.assertIn("session_title", str(ctx.exception))
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            vods = list_vods("testchannel")
+
+        self.assertEqual(len(vods), 1)
+        self.assertEqual(vods[0]["id"], 3)
+        self.assertEqual(vods[0]["duration_s"], 3600)
+        self.assertTrue(any("skipping malformed Kick item 0: not a dict" in m for m in cm.output))
+        self.assertTrue(any("skipping malformed Kick item 1: missing required key" in m for m in cm.output))
+        self.assertTrue(any("skipping malformed Kick item 2: duration is not a positive number" in m for m in cm.output))
 
     @patch("subprocess.run")
     def test_probe_duration(self, mock_subproc):
@@ -208,6 +246,7 @@ https://cdn.example.com/stream/100k.m3u8
 
         dur = probe_duration(Path("/fake/video.mp4"))
         self.assertAlmostEqual(dur, 12044.4)
+        self.assertEqual(mock_subproc.call_args.kwargs.get("timeout"), 120)
 
     @patch("subprocess.run")
     def test_probe_duration_error(self, mock_subproc):
@@ -219,6 +258,13 @@ https://cdn.example.com/stream/100k.m3u8
         with self.assertRaises(KickError):
             probe_duration(Path("/fake/bad.mp4"))
 
+    @patch("subprocess.run")
+    def test_probe_duration_timeout(self, mock_subproc):
+        mock_subproc.side_effect = subprocess.TimeoutExpired(cmd="ffprobe", timeout=120)
+        with self.assertRaises(KickError) as ctx:
+            probe_duration(Path("/fake/timeout.mp4"))
+        self.assertIn("timed out after 120 seconds", str(ctx.exception))
+
     @patch("k2y.kick.probe_duration")
     @patch("subprocess.run")
     @patch("urllib.request.urlopen")
@@ -227,14 +273,12 @@ https://cdn.example.com/stream/100k.m3u8
             dest = Path(tmp) / "source.mp4"
             part_file = Path(f"{dest}.part")
 
-            # Mock master playlist fetch
             mock_resp = MagicMock()
             mock_resp.status = 200
             mock_resp.read.return_value = SAMPLE_MASTER.encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
             mock_urlopen.return_value = mock_resp
 
-            # Mock ffmpeg creating .part file
             def create_part(*args, **kwargs):
                 part_file.write_text("dummy video data")
                 proc = MagicMock()
@@ -242,8 +286,6 @@ https://cdn.example.com/stream/100k.m3u8
                 return proc
 
             mock_subproc.side_effect = create_part
-
-            # Probe duration within 1% (expected 1000s, probe 1005s)
             mock_probe.return_value = 1005.0
 
             vod = {
@@ -255,6 +297,79 @@ https://cdn.example.com/stream/100k.m3u8
             self.assertEqual(res, dest)
             self.assertTrue(dest.exists())
             self.assertFalse(part_file.exists())
+            self.assertEqual(mock_subproc.call_args.kwargs.get("timeout"), 28800)
+
+    @patch("subprocess.run")
+    @patch("urllib.request.urlopen")
+    def test_download_zero_or_missing_duration_raises_kick_error(self, mock_urlopen, mock_subproc):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "source.mp4"
+            part_file = Path(f"{dest}.part")
+
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = SAMPLE_MASTER.encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            def create_part(*args, **kwargs):
+                part_file.write_text("dummy video data")
+                proc = MagicMock()
+                proc.returncode = 0
+                return proc
+
+            mock_subproc.side_effect = create_part
+
+            # 1. duration_s = 0
+            vod_zero = {
+                "id": 1,
+                "source_url": "https://stream.kick.com/x/media/hls/master.m3u8",
+                "duration_s": 0,
+            }
+            with self.assertRaises(KickError) as ctx:
+                download(vod_zero, dest)
+            self.assertIn("missing or invalid duration_s", str(ctx.exception))
+            self.assertFalse(part_file.exists())
+
+            # 2. duration_s missing
+            vod_missing = {
+                "id": 1,
+                "source_url": "https://stream.kick.com/x/media/hls/master.m3u8",
+            }
+            with self.assertRaises(KickError) as ctx:
+                download(vod_missing, dest)
+            self.assertIn("missing or invalid duration_s", str(ctx.exception))
+            self.assertFalse(part_file.exists())
+
+    @patch("subprocess.run")
+    @patch("urllib.request.urlopen")
+    def test_download_timeout_raises_kick_error_and_cleans_up(self, mock_urlopen, mock_subproc):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "source.mp4"
+            part_file = Path(f"{dest}.part")
+
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = SAMPLE_MASTER.encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            def fail_timeout(*args, **kwargs):
+                part_file.write_text("dummy partial")
+                raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=28800)
+
+            mock_subproc.side_effect = fail_timeout
+
+            vod = {
+                "id": 1,
+                "source_url": "https://stream.kick.com/x/media/hls/master.m3u8",
+                "duration_s": 1000,
+            }
+            with self.assertRaises(KickError) as ctx:
+                download(vod, dest)
+            self.assertIn("timed out after 8 hours", str(ctx.exception))
+            self.assertFalse(part_file.exists())
+            self.assertFalse(dest.exists())
 
     @patch("k2y.kick.probe_duration")
     @patch("subprocess.run")
@@ -277,8 +392,6 @@ https://cdn.example.com/stream/100k.m3u8
                 return proc
 
             mock_subproc.side_effect = create_part
-
-            # Probe duration exceeds 1% (expected 1000s, probe 950s -> 5% diff)
             mock_probe.return_value = 950.0
 
             vod = {
@@ -306,7 +419,6 @@ https://cdn.example.com/stream/100k.m3u8
             mock_resp.__enter__.return_value = mock_resp
             mock_urlopen.return_value = mock_resp
 
-            # Mock ffmpeg failing
             def fail_ffmpeg(*args, **kwargs):
                 part_file.write_text("corrupted")
                 proc = MagicMock()

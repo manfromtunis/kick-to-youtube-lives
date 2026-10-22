@@ -15,6 +15,7 @@ from k2y.media import (
     hms,
     part_description,
     part_title,
+    probe_duration,
     thumbnail,
     wrap_title,
 )
@@ -132,7 +133,6 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 20, "title": "P1"},
             {"start_s": 40, "title": "P2"},
         ]
-        # Extremely long channel name to trigger 5000 max chars
         desc = full_description(parts, "x" * 6000)
         self.assertLessEqual(len(desc), 5000)
 
@@ -148,10 +148,6 @@ class TestDescriptions(unittest.TestCase):
             ],
         }
         desc = part_description(part, "abc123xyz", "randomguy42")
-        # Moment re-based to part start (100):
-        # Inserted 0:00 with part title "Exploration"
-        # 130 - 100 = 30 -> "0:30 Found a chest"
-        # 200 - 100 = 100 -> "1:40 Fought wolves"
         expected_chaps = "0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
         expected_links = "Stream complet: https://youtu.be/abc123xyz\nLive sur https://kick.com/randomguy42"
         expected = f"Exploring the open world.\n\n{expected_chaps}\n\n{expected_links}"
@@ -181,7 +177,7 @@ class TestDescriptions(unittest.TestCase):
             "end_s": 100,
             "title": "Exploration",
             "description": "Just playing.",
-            "key_moments": [],  # only 1 inserted moment (0:00), < 3 items -> no chapters
+            "key_moments": [],
         }
         desc = part_description(part, "vid456", "randomguy42")
         expected = "Just playing.\n\nStream complet: https://youtu.be/vid456\nLive sur https://kick.com/randomguy42"
@@ -219,20 +215,55 @@ class TestFilterPath(unittest.TestCase):
     def test_windows_path_with_single_quote(self):
         p = Path(r"C:\Users\Melek's Files\font.ttf")
         filtered = _filter_path(p)
-        self.assertEqual(filtered, r"C\:/Users/Melek\'s Files/font.ttf")
+        self.assertEqual(filtered, r"C\:/Users/Melek\\\'s Files/font.ttf")
 
     def test_font_fallback_omits_fontfile(self):
         with patch("k2y.media._find_font", return_value=None), \
+             patch("k2y.media.probe_duration", return_value=20.0), \
              patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             with tempfile.NamedTemporaryFile(suffix=".mp4") as src, \
                  tempfile.NamedTemporaryFile(suffix=".jpg") as dst:
+                dst.write(b"fake jpeg content")
+                dst.flush()
                 thumbnail(Path(src.name), 10, "Title", Path(dst.name))
                 args = mock_run.call_args[0][0]
                 vf_idx = args.index("-vf")
                 vf_str = args[vf_idx + 1]
                 self.assertNotIn("fontfile=", vf_str)
                 self.assertIn("textfile=", vf_str)
+
+
+class TestMediaTimeouts(unittest.TestCase):
+    @patch("subprocess.run")
+    def test_cut_timeout(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "cut_timeout.mp4"
+            dest.write_bytes(b"partial")
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffmpeg", timeout=7200)
+            with self.assertRaises(RuntimeError) as ctx:
+                cut(Path("src.mp4"), 0, 10, dest)
+            self.assertIn("timed out after 2 hours", str(ctx.exception))
+            self.assertFalse(dest.exists())
+
+    @patch("subprocess.run")
+    def test_probe_duration_timeout(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffprobe", timeout=120)
+        with self.assertRaises(RuntimeError) as ctx:
+            probe_duration(Path("src.mp4"))
+        self.assertIn("timed out after 120 seconds", str(ctx.exception))
+
+    @patch("k2y.media.probe_duration", return_value=50.0)
+    @patch("subprocess.run")
+    def test_thumbnail_timeout(self, mock_run, mock_probe):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "thumb_timeout.jpg"
+            dest.write_bytes(b"partial")
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffmpeg", timeout=120)
+            with self.assertRaises(RuntimeError) as ctx:
+                thumbnail(Path("src.mp4"), 10, "Title", dest)
+            self.assertIn("timed out after 120 seconds", str(ctx.exception))
+            self.assertFalse(dest.exists())
 
 
 class TestMediaFFmpeg(unittest.TestCase):
@@ -270,7 +301,6 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertEqual(out_path, dest)
         self.assertTrue(dest.exists())
 
-        # Check duration with ffprobe within 2s of end-start (10s)
         probe_cmd = [
             "ffprobe",
             "-v", "error",
@@ -289,19 +319,16 @@ class TestMediaFFmpeg(unittest.TestCase):
             cut(bad_src, 0, 5, dest)
 
     def test_thumbnail_with_special_characters(self):
-        # Title contains apostrophe, colon, and accent "é"
         title = "L'aventure continue : début en beauté"
         dest = self.temp_dir / "thumb_special.jpg"
         out_path = thumbnail(self.synthetic_video, 3, title, dest)
         self.assertEqual(out_path, dest)
         self.assertTrue(dest.exists())
 
-        # Check size < 2 MB (2 * 1024 * 1024 bytes)
         size = dest.stat().st_size
         self.assertLess(size, 2 * 1024 * 1024)
         self.assertGreater(size, 0)
 
-        # Check image format and resolution: 1280x720 JPEG
         probe_cmd = [
             "ffprobe",
             "-v", "error",
@@ -316,6 +343,36 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertEqual(stream["codec_name"], "mjpeg")
         self.assertEqual(stream["width"], 1280)
         self.assertEqual(stream["height"], 720)
+
+    def test_thumbnail_clamps_at_s_and_verifies_non_empty(self):
+        # probed_duration is ~20s, max allowed at_s is 19
+        dest = self.temp_dir / "thumb_clamped.jpg"
+        out_path = thumbnail(self.synthetic_video, at_s=500, title="Far out", dest=dest)
+        self.assertEqual(out_path, dest)
+        self.assertTrue(dest.exists())
+        self.assertGreater(dest.stat().st_size, 0)
+
+    def test_thumbnail_empty_dest_raises_runtime_error(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            dest = self.temp_dir / "non_existent_thumb.jpg"
+            dest.unlink(missing_ok=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                thumbnail(self.synthetic_video, 5, "Title", dest)
+            self.assertIn("missing or empty", str(ctx.exception))
+
+    def test_thumbnail_real_ffmpeg_with_apostrophe_and_space_in_dir(self):
+        # Real ffmpeg run verifying drawtext text file and apostrophe escaping in directory name
+        with tempfile.TemporaryDirectory(dir=self.temp_dir, prefix="test 'dir with space ") as custom_td:
+            custom_dir = Path(custom_td)
+            dest = custom_dir / "thumb.jpg"
+            txt_file = dest.with_suffix(".txt")
+            out_path = thumbnail(self.synthetic_video, at_s=2, title="Melek's 'Special' Stream", dest=dest)
+            self.assertEqual(out_path, dest)
+            self.assertTrue(dest.exists())
+            self.assertGreater(dest.stat().st_size, 0)
+            # Text file created next to dest and deleted afterwards
+            self.assertFalse(txt_file.exists())
 
 
 if __name__ == "__main__":

@@ -96,19 +96,13 @@ class TestYouTube(unittest.TestCase):
         self.patch_config_dir.stop()
         self.temp_dir.cleanup()
 
-    # 1. Quota error parsing raises QuotaExceeded
+    # 1. Quota error parsing raises QuotaExceeded for quotaExceeded, uploadLimitExceeded, dailyLimitExceeded on any 4xx
     def test_quota_error_parsing_raises_quota_exceeded(self) -> None:
         quota_body = json.dumps({
             "error": {
                 "code": 403,
-                "message": "The request cannot be completed because you have exceeded your quota.",
-                "errors": [
-                    {
-                        "message": "The request cannot be completed because you have exceeded your quota.",
-                        "domain": "youtube.quota",
-                        "reason": "quotaExceeded",
-                    }
-                ],
+                "message": "Quota exceeded",
+                "errors": [{"reason": "quotaExceeded", "message": "limit"}],
             }
         }).encode("utf-8")
         err = _make_http_error(403, "Forbidden", quota_body)
@@ -118,15 +112,84 @@ class TestYouTube(unittest.TestCase):
 
         upload_limit_body = json.dumps({
             "error": {
-                "code": 403,
+                "code": 400,
                 "message": "User upload limit exceeded.",
                 "errors": [{"reason": "uploadLimitExceeded", "message": "limit"}],
             }
         }).encode("utf-8")
-        err2 = _make_http_error(403, "Forbidden", upload_limit_body)
+        err2 = _make_http_error(400, "Bad Request", upload_limit_body)
         parsed2 = youtube._parse_youtube_error(err2)
         self.assertIsInstance(parsed2, youtube.QuotaExceeded)
         self.assertIn("uploadLimitExceeded", str(parsed2))
+
+        daily_limit_body = json.dumps({
+            "error": {
+                "code": 429,
+                "message": "Daily limit exceeded.",
+                "errors": [{"reason": "dailyLimitExceeded", "message": "limit"}],
+            }
+        }).encode("utf-8")
+        err3 = _make_http_error(429, "Too Many Requests", daily_limit_body)
+        parsed3 = youtube._parse_youtube_error(err3)
+        self.assertIsInstance(parsed3, youtube.QuotaExceeded)
+        self.assertIn("dailyLimitExceeded", str(parsed3))
+
+    def test_ratelimit_exceeded_not_quota_exceeded(self) -> None:
+        rate_limit_body = json.dumps({
+            "error": {
+                "code": 403,
+                "message": "Rate limit exceeded",
+                "errors": [{"reason": "rateLimitExceeded", "message": "rate"}],
+            }
+        }).encode("utf-8")
+        err = _make_http_error(403, "Forbidden", rate_limit_body)
+        parsed = youtube._parse_youtube_error(err)
+        self.assertNotIsInstance(parsed, youtube.QuotaExceeded)
+        self.assertIsInstance(parsed, youtube.YouTubeError)
+
+    # AuthRequired tests
+    def test_auth_required_missing_secret(self) -> None:
+        (self.config_dir / "youtube_token.json").unlink(missing_ok=True)
+        with self.assertRaises(youtube.AuthRequired) as ctx:
+            youtube.access_token()
+        self.assertIn("YouTube authorization expired or missing: run `py -m k2y auth`", str(ctx.exception))
+        self.assertNotIn("mock_refresh_token", str(ctx.exception))
+
+    def test_auth_required_empty_or_invalid_json_or_lacks_refresh_token(self) -> None:
+        # Empty
+        config.write_secret("youtube_token.json", "")
+        with self.assertRaises(youtube.AuthRequired):
+            youtube.access_token()
+
+        # Invalid JSON
+        config.write_secret("youtube_token.json", "{not_valid_json")
+        with self.assertRaises(youtube.AuthRequired):
+            youtube.access_token()
+
+        # Lacks refresh_token
+        config.write_secret("youtube_token.json", json.dumps({"access_token": "only_acc"}))
+        with self.assertRaises(youtube.AuthRequired):
+            youtube.access_token()
+
+    @patch("urllib.request.urlopen")
+    def test_auth_required_on_invalid_grant(self, mock_urlopen: MagicMock) -> None:
+        expired_token_data = {
+            "refresh_token": "secret_refresh_token_123",
+            "access_token": "expired_token",
+            "expires_at": int(time.time()) - 100,
+        }
+        config.write_secret("youtube_token.json", json.dumps(expired_token_data))
+
+        invalid_grant_body = json.dumps({
+            "error": "invalid_grant",
+            "error_description": "Bad Request",
+        }).encode("utf-8")
+        mock_urlopen.side_effect = _make_http_error(400, "Bad Request", invalid_grant_body)
+
+        with self.assertRaises(youtube.AuthRequired) as ctx:
+            youtube.access_token()
+        self.assertIn("YouTube authorization expired or missing: run `py -m k2y auth`", str(ctx.exception))
+        self.assertNotIn("secret_refresh_token_123", str(ctx.exception))
 
     # 2. privacyStatus is private in the init request body
     @patch("urllib.request.urlopen")
@@ -156,7 +219,7 @@ class TestYouTube(unittest.TestCase):
             "title": "Stream title that may be long",
             "description": "Stream description",
             "category_id": 20,
-            "privacyStatus": "public",  # Attempt to pass non-private; must be ignored
+            "privacyStatus": "public",
             "tags": ["gaming", "kick"],
         }
         session_calls: list[str] = []
@@ -168,7 +231,6 @@ class TestYouTube(unittest.TestCase):
         )
         self.assertEqual(video_id, "vid_xyz")
 
-        # Check the init request
         init_req = recorded_requests[0]
         init_payload = json.loads(init_req.data.decode("utf-8"))
         self.assertEqual(init_payload["status"]["privacyStatus"], "private")
@@ -534,6 +596,35 @@ class TestYouTube(unittest.TestCase):
         self.assertEqual(vid, "vid_fresh")
         self.assertIn("https://upload.youtube.com/new_fresh_session", sessions)
 
+    # Session restart cap at 2
+    @patch("urllib.request.urlopen")
+    def test_upload_caps_session_restarts_at_2(self, mock_urlopen: MagicMock) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"G" * 300)
+
+        session_counter = 0
+
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
+            nonlocal session_counter
+            if "uploadType=resumable" in req.full_url:
+                session_counter += 1
+                return MockResponse(200, {"Location": f"https://upload.youtube.com/sess_{session_counter}"}, b"")
+            if "sess_" in req.full_url or "expired" in req.full_url:
+                # Every session query/upload returns 404 expired
+                raise _make_http_error(404, "Not Found", b"Expired")
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.upload(
+                dummy_video,
+                {"title": "Title"},
+                session_url="https://upload.youtube.com/expired_first",
+                on_session=lambda _: None,
+            )
+        self.assertIn("max 2 restarts", str(ctx.exception))
+        self.assertEqual(session_counter, 2)
+
     # 12. OAuth auth() loopback flow and PKCE
     @patch("http.server.HTTPServer")
     @patch("builtins.print")
@@ -671,9 +762,9 @@ class TestYouTube(unittest.TestCase):
 
         self.assertIn("state mismatch", str(ctx.exception))
 
-    # 15. Truncation of title and description per spec
+    # 15. Sanitization and Truncation of title and description per spec
     @patch("urllib.request.urlopen")
-    def test_metadata_truncation(self, mock_urlopen: MagicMock) -> None:
+    def test_metadata_sanitization_and_truncation(self, mock_urlopen: MagicMock) -> None:
         dummy_video = self.config_dir / "video.mp4"
         dummy_video.write_bytes(b"H" * 100)
 
@@ -687,8 +778,10 @@ class TestYouTube(unittest.TestCase):
 
         mock_urlopen.side_effect = fake_urlopen
 
-        long_title = "T" * 150
-        long_desc = "D" * 6000
+        # Contains < and >, exceeds 100 chars
+        long_title = "<Cool> " + ("T" * 150)
+        # Multibyte arabic chars (2 bytes each), exceeding 5000 bytes
+        long_desc = "<Desc> " + ("م" * 3000)
         vid = youtube.upload(
             dummy_video,
             {"title": long_title, "description": long_desc},
@@ -697,8 +790,17 @@ class TestYouTube(unittest.TestCase):
         )
         self.assertEqual(vid, "trunc_id")
         init_data = json.loads(recorded_reqs[0].data.decode("utf-8"))
-        self.assertEqual(len(init_data["snippet"]["title"]), 100)
-        self.assertEqual(len(init_data["snippet"]["description"]), 5000)
+        res_title = init_data["snippet"]["title"]
+        res_desc = init_data["snippet"]["description"]
+
+        self.assertNotIn("<", res_title)
+        self.assertNotIn(">", res_title)
+        self.assertNotIn("<", res_desc)
+        self.assertNotIn(">", res_desc)
+        self.assertLessEqual(len(res_title), 100)
+        self.assertLessEqual(len(res_desc.encode("utf-8")), 5000)
+        # Verify valid UTF-8 string boundary
+        res_desc.encode("utf-8").decode("utf-8")
 
     # 16. Multi-chunk upload (e.g. 18 MiB = two 8 MiB chunks + one 2 MiB chunk)
     @patch("urllib.request.urlopen")
@@ -722,7 +824,6 @@ class TestYouTube(unittest.TestCase):
                 raise _make_http_error(
                     308, "Resume Incomplete", b"", {"Range": f"bytes=0-{16 * 1024 * 1024 - 1}"}
                 )
-            # Final 2 MiB chunk returns 200 with video id
             return MockResponse(200, {}, json.dumps({"id": "multi_chunk_vid"}).encode("utf-8"))
 
         mock_urlopen.side_effect = fake_urlopen
@@ -817,6 +918,7 @@ class TestYouTube(unittest.TestCase):
         youtube._query_status_once("https://upload.youtube.com/sess", 1000)
         self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 300)
 
+        mock_urlopen.return_value = MockResponse(308, {"Range": "bytes=0-100"}, b"")
         youtube._upload_chunk_once("https://upload.youtube.com/sess", b"test", 0, 1000)
         self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 300)
 

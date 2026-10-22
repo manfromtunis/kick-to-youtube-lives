@@ -1,12 +1,19 @@
-from .media import FFMPEG
 """Kick VOD discovery, HLS rendition resolution, and video downloading."""
+from __future__ import annotations
+
 import json
+import logging
 from pathlib import Path
 import re
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from .media import FFMPEG
+
+logger = logging.getLogger("k2y")
+logger.addHandler(logging.NullHandler())
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)"
 
@@ -46,10 +53,21 @@ def list_vods(channel: str) -> list[dict]:
 
     required_keys = ("id", "session_title", "start_time", "duration", "source", "is_live")
     result = []
-    for item in items:
-        for k in required_keys:
-            if k not in item:
-                raise KickError(f"Missing required key '{k}' in Kick API response item")
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            logger.warning(f"skipping malformed Kick item {idx}: not a dict")
+            continue
+
+        item_id = item.get("id", idx)
+        missing_keys = [k for k in required_keys if k not in item]
+        if missing_keys:
+            logger.warning(f"skipping malformed Kick item {item_id}: missing required key '{missing_keys[0]}'")
+            continue
+
+        duration = item.get("duration")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+            logger.warning(f"skipping malformed Kick item {item_id}: duration is not a positive number ({duration})")
+            continue
 
         categories = item.get("categories")
         category = (
@@ -63,7 +81,7 @@ def list_vods(channel: str) -> list[dict]:
                 "id": item["id"],
                 "title": item["session_title"],
                 "started_at": item["start_time"],
-                "duration_s": item["duration"] // 1000,
+                "duration_s": int(duration // 1000),
                 "source_url": item["source"],
                 "category": category,
                 "is_live": item["is_live"],
@@ -106,7 +124,10 @@ def probe_duration(path: Path) -> float:
         "-of", "csv=p=0",
         str(path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise KickError(f"ffprobe timed out after 120 seconds for {path}")
     if proc.returncode != 0:
         raise KickError(f"ffprobe failed for {path}: {proc.stderr.strip()}")
     try:
@@ -145,7 +166,13 @@ def download(vod: dict, dest: Path) -> Path:
         "-f", "mp4",
         str(part_file),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=28800)
+    except subprocess.TimeoutExpired:
+        part_file.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        raise KickError("ffmpeg download timed out after 8 hours")
+
     if proc.returncode != 0:
         part_file.unlink(missing_ok=True)
         stderr_tail = proc.stderr.strip().splitlines()
@@ -153,9 +180,9 @@ def download(vod: dict, dest: Path) -> Path:
         raise KickError(f"ffmpeg download failed: {tail}")
 
     expected_duration = vod.get("duration_s")
-    if expected_duration is None:
+    if expected_duration is None or expected_duration <= 0:
         part_file.unlink(missing_ok=True)
-        raise KickError("VOD missing duration_s for duration check")
+        raise KickError("VOD missing or invalid duration_s for duration check")
 
     try:
         actual_duration = probe_duration(part_file)
@@ -164,7 +191,7 @@ def download(vod: dict, dest: Path) -> Path:
         raise KickError(f"Failed to probe duration of downloaded file: {e}") from e
 
     diff = abs(actual_duration - expected_duration)
-    if expected_duration > 0 and (diff / expected_duration) > 0.01:
+    if (diff / expected_duration) > 0.01:
         part_file.unlink(missing_ok=True)
         raise KickError(
             f"Duration mismatch: probed {actual_duration:.1f}s vs expected {expected_duration}s (>1% difference)"

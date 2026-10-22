@@ -1,8 +1,9 @@
 """Media manipulation: cutting parts, generating thumbnails, chapters and descriptions."""
+from __future__ import annotations
+
 from datetime import datetime
 from pathlib import Path
 import subprocess
-import tempfile
 import textwrap
 
 FONT_CANDIDATES = [
@@ -14,11 +15,31 @@ MAX_IMAGE_BYTES = 2 * 1024 * 1024
 FFMPEG = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
 
+def probe_duration(path: Path) -> float:
+    """Return container duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffprobe timed out after 120 seconds for {path}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}: {proc.stderr.strip()}")
+    try:
+        return float(proc.stdout.strip())
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse duration from ffprobe output: {proc.stdout}") from e
+
 
 def _filter_path(p: Path) -> str:
-    """Convert path to forward slashes, escaping drive colon and single quotes for ffmpeg."""
+    """Convert path to forward slashes, escaping colons and single quotes for unquoted ffmpeg filter syntax."""
     s = str(p).replace("\\", "/")
-    return s.replace(":", "\\:").replace("'", "\\'")
+    return s.replace(":", r"\:").replace("'", r"\\\'")
 
 
 def _find_font() -> Path | None:
@@ -75,8 +96,13 @@ def cut(src: Path, start_s: int, end_s: int, dest: Path) -> Path:
         "-avoid_negative_ts", "make_zero",
         str(dest),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg cut timed out after 2 hours for {dest}")
     if res.returncode != 0:
+        dest.unlink(missing_ok=True)
         tail = "\n".join(res.stderr.strip().splitlines()[-10:])
         raise RuntimeError(f"ffmpeg cut failed (code {res.returncode}): {tail}")
     return dest
@@ -103,35 +129,48 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
+    dur = probe_duration(src)
+    max_at = max(0, int(dur - 1))
+    clamped_at_s = max(0, min(int(at_s), max_at))
+
     wrapped = wrap_title(title)
 
-    # Use a temporary file for drawtext to handle apostrophes, colons, accents, etc.
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
-        tf.write(wrapped)
-        tf_path = Path(tf.name)
+    # Use a file next to dest with an ASCII name for drawtext
+    tf_path = dest.with_suffix(".txt")
+    tf_path.write_text(wrapped, encoding="utf-8")
 
     try:
         font_file = _find_font()
-        font_arg = f"fontfile='{_filter_path(font_file)}':" if font_file else ""
+        font_arg = f"fontfile={_filter_path(font_file)}:" if font_file else ""
         vf = (
             "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext={font_arg}textfile='{_filter_path(tf_path)}':"
+            f"drawtext={font_arg}textfile={_filter_path(tf_path)}:"
             "fontcolor=white:borderw=6:bordercolor=black:fontsize=72:text_align=center:"
             "x=(w-text_w)/2:y=h*2/3+(h/3-text_h)/2:expansion=none"
         )
         cmd = [
             *FFMPEG,
-            "-ss", str(at_s),
+            "-ss", str(clamped_at_s),
             "-i", str(src),
             "-vf", vf,
             "-frames:v", "1",
             "-q:v", "3",
             str(dest),
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(f"ffmpeg thumbnail timed out after 120 seconds for {dest}")
+
         if res.returncode != 0:
+            dest.unlink(missing_ok=True)
             tail = "\n".join(res.stderr.strip().splitlines()[-10:])
             raise RuntimeError(f"ffmpeg thumbnail failed (code {res.returncode}): {tail}")
+
+        if not dest.exists() or dest.stat().st_size == 0:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(f"Thumbnail generation failed: destination file {dest} is missing or empty")
 
         # If file is over 2MB, re-encode with higher q until under 2MB
         q = 3
@@ -145,11 +184,21 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
                 "-q:v", str(q),
                 str(tmp_dest),
             ]
-            re_res = subprocess.run(cmd_reencode, capture_output=True, text=True)
+            try:
+                re_res = subprocess.run(cmd_reencode, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                tmp_dest.unlink(missing_ok=True)
+                dest.unlink(missing_ok=True)
+                raise RuntimeError("ffmpeg re-encode timed out after 120 seconds")
+
             if re_res.returncode == 0 and tmp_dest.exists():
                 tmp_dest.replace(dest)
             else:
                 break
+
+        if not dest.exists() or dest.stat().st_size == 0:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(f"Thumbnail generation failed: destination file {dest} is missing or empty")
 
         return dest
     finally:

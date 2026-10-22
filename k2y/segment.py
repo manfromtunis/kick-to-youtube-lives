@@ -1,12 +1,10 @@
-import logging
-
-logger = logging.getLogger("k2y")
-logger.addHandler(logging.NullHandler())
-from .media import FFMPEG
 """Audio chunking, Gemini thematic segmentation, merge and repair."""
+from __future__ import annotations
+
 import base64
 import concurrent.futures
 import json
+import logging
 from pathlib import Path
 import subprocess
 import time
@@ -14,6 +12,10 @@ import urllib.error
 import urllib.request
 
 from k2y import config
+from .media import FFMPEG
+
+logger = logging.getLogger("k2y")
+logger.addHandler(logging.NullHandler())
 
 _sleep = time.sleep
 
@@ -175,12 +177,19 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
 
     per_day_models: set[str] = set()
     skipped_models: set[str] = set()
+    malformed_json_retries: int = 0
     last_error: Exception | None = None
 
     for attempt in range(8):
-        candidates = [m for m in models if m not in skipped_models and m not in per_day_models]
+        active = set(models) - skipped_models
+        if not active:
+            raise SegmentError("All candidate models returned 404")
+        if active <= per_day_models:
+            raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
+
+        candidates = [m for m in models if m in active and m not in per_day_models]
         if not candidates:
-            if set(models) <= per_day_models:
+            if active and active <= per_day_models:
                 raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
             raise SegmentError("All candidate models exhausted or unavailable")
 
@@ -191,25 +200,67 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
-            text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            candidates_data = resp_data.get("candidates")
+            candidate = (
+                candidates_data[0]
+                if (isinstance(candidates_data, list) and candidates_data)
+                else {}
+            )
+            finish_reason = (
+                candidate.get("finishReason")
+                or resp_data.get("promptFeedback", {}).get("blockReason")
+                or "EMPTY"
+            )
+            content = candidate.get("content") or {}
+            parts_list = content.get("parts") or []
+
+            text_val: str | None = None
+            if isinstance(parts_list, list):
+                for p in parts_list:
+                    if isinstance(p, dict) and "text" in p and not p.get("thought", False):
+                        text_val = p["text"]
+                        break
+
+            if text_val is None:
+                logger.warning(f"{model}: no candidate/text response (finishReason={finish_reason})")
+                last_error = SegmentError(f"No text part for {model} (finishReason={finish_reason})")
+                continue
+
+            text = text_val.strip()
             if text.startswith("```json"):
                 text = text[7:]
             if text.startswith("```"):
                 text = text[3:]
             if text.endswith("```"):
                 text = text[:-3]
-            return json.loads(text.strip())
+            try:
+                return json.loads(text.strip())
+            except json.JSONDecodeError as e:
+                malformed_json_retries += 1
+                logger.warning(f"{model}: malformed JSON response, retrying on another model: {e}")
+                last_error = SegmentError(f"Malformed Gemini response: {e}")
+                if malformed_json_retries > 1:
+                    raise last_error
+                continue
+
         except urllib.error.HTTPError as e:
             last_error = e
             if e.code == 404:
                 skipped_models.add(model)
                 logger.warning(f"{model}: HTTP {e.code}")
+                active = set(models) - skipped_models
+                if not active:
+                    raise SegmentError("All candidate models returned 404")
+                if active <= per_day_models:
+                    raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
                 continue
             elif e.code == 429:
                 err_body = e.read()
                 if _is_daily_quota_error(err_body):
                     per_day_models.add(model)
-                    if set(models) <= per_day_models:
+                    active = set(models) - skipped_models
+                    if active and active <= per_day_models:
                         raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
                 logger.warning(f"{model}: HTTP {e.code}")
             elif e.code not in (500, 503):
@@ -219,7 +270,7 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
         except urllib.error.URLError as e:
             last_error = e
             logger.warning(f"{model}: URLError")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
+        except (KeyError, IndexError) as e:
             raise SegmentError(f"Malformed Gemini response: {e}")
 
         if attempt < 7:
@@ -249,8 +300,12 @@ def chunk_audio(src: Path, workdir: Path, chunk_s: int = 600) -> list[Path]:
         str(audio_file),
     ]
     try:
-        subprocess.run(extract_cmd, capture_output=True, text=True, check=True)
+        subprocess.run(extract_cmd, capture_output=True, text=True, check=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        audio_file.unlink(missing_ok=True)
+        raise SegmentError("ffmpeg audio extraction timed out after 1 hour")
     except subprocess.CalledProcessError as e:
+        audio_file.unlink(missing_ok=True)
         raise SegmentError(f"ffmpeg audio extraction failed (code {e.returncode}): {e.stderr}")
 
     segment_cmd = [
@@ -262,7 +317,11 @@ def chunk_audio(src: Path, workdir: Path, chunk_s: int = 600) -> list[Path]:
         str(chunks_dir / "c%03d.ogg"),
     ]
     try:
-        subprocess.run(segment_cmd, capture_output=True, text=True, check=True)
+        subprocess.run(segment_cmd, capture_output=True, text=True, check=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        for c in chunks_dir.glob("c*.ogg"):
+            c.unlink(missing_ok=True)
+        raise SegmentError("ffmpeg audio segmenting timed out after 1 hour")
     except subprocess.CalledProcessError as e:
         raise SegmentError(f"ffmpeg audio segmenting failed (code {e.returncode}): {e.stderr}")
     finally:
@@ -477,7 +536,6 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
     return result
 
 
-
 def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model: str) -> list[dict]:
     src = Path(src)
     workdir = Path(workdir)
@@ -498,12 +556,24 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
             }]
             return repair(parts, duration_s, [0], min_part_s=min_part_minutes * 60)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(describe_chunk, i, cp, 600, models)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        try:
+            future_to_idx = {
+                executor.submit(describe_chunk, i, cp, 600, models): i
                 for i, cp in enumerate(chunk_paths)
-            ]
-            chunks = [f.result() for f in futures]
+            }
+            chunks_by_idx = {}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                try:
+                    chunks_by_idx[future_to_idx[future]] = future.result()
+                except Exception:
+                    for f in future_to_idx:
+                        f.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+            chunks = [chunks_by_idx[i] for i in range(len(chunk_paths))]
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         allowed_s = []
         for c in chunks:
@@ -519,6 +589,8 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
             try:
                 parts = merge(chunks, duration_s, models)
                 break
+            except (DailyQuota, config.MissingSecret):
+                raise
             except Exception as e:
                 last_merge_err = e
 
