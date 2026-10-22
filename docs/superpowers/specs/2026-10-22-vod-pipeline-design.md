@@ -131,12 +131,28 @@ if held):
      `ffmpeg -i <rendition m3u8> -c copy` run to `work_dir/<id>/source.mp4` (write to
      `.part`, rename on success). Check the result: `ffprobe` duration within 1% of
      Kick's `duration`, else error (the step is retried by the pipeline).
-   - **plan** (`segment.py`): extract audio (mono, 16 kHz, Opus 24 kbps), upload to Gemini
-     Files API, ask for thematic parts (prompt and JSON schema from the spike,
-     section 9), delete the remote file. Then **validate and repair** in code:
-     sort, clamp to [0, duration], make parts contiguous (each `start` = previous `end`),
-     merge parts shorter than `min_part_minutes` into the shorter neighbour, and fall back
-     to a single part if Gemini fails twice. VODs under 20 min get one part (no split).
+   - **plan** (`segment.py`), the design proven by the spike (section 9):
+     1. Extract audio (mono, 16 kHz, Opus 24 kbps) and split it into 10-minute chunks
+        (`ffmpeg -f segment -segment_time 600 -c copy`).
+     2. For each chunk, one Gemini call with the audio **inline** (base64, ~1 MB) returning
+        `{summary_en, activity, segments:[{at:"MM:SS", topic}]}` with times **relative to
+        the chunk**. Code converts to absolute seconds (`chunk_index*600 + at`, clamped
+        inside the chunk). Never send the whole file: whole-file timestamps drift ~3x.
+        Run at most 2 chunk calls concurrently.
+     3. One text-only merge call over the absolute timeline returns parts
+        `{start_s, title, description, summary_en, key_moments:[{at_s, what}]}`; every
+        `start_s` and `at_s` must be a timeline `at_s` value (code snaps any other value to
+        the nearest one). Prompt rules: cut where the subject changes, not at chunk edges;
+        15 to 60 min parts; titles short French or Latin-script darija; descriptions French.
+     4. **Validate and repair** in code: sort, first part at 0, clamp to [0, duration],
+        `end_s` = next `start_s` (last = duration), merge parts shorter than
+        `min_part_minutes` into the shorter neighbour, VODs under 20 min get one part.
+        If the merge fails twice, fall back to a single part.
+     Models: `config.model` first, then the fallback list `["gemini-3.8-flash",
+     "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3-flash-preview"]`, backoff on
+     429/500/503, rotating model per retry. A daily-quota 429 (`PerDay` in the quotaId)
+     stops the run like YouTube's quotaExceeded (retry next run, no attempt counted).
+     Prompts and schemas: start from `docs/spike/segment2.py`.
    - **cut** (`media.py`): `ffmpeg -ss <start> -to <end> -c copy` per part (keyframe
      snapping is acceptable). Thumbnail per upload: frame at the part's first key moment,
      1280x720 JPEG, title text overlaid with `drawtext` (bold, white, black outline,
@@ -203,7 +219,9 @@ thumbnails, all private) by `k2y run`, the review loop clean, PR open.
 
 ## 9. Spike results (2026-10-22)
 
-See `docs/spike/2026-10-22-thematic-cuts.md`.
+Thematic cuts work. Darija is understood; timestamps are accurate only when audio is sent in
+chunks; Gemini free tier (20 requests/day/model) is too small, so **billing must be enabled
+on the Gemini key** (about $0.30 per 3h stream). Details: `docs/spike/2026-10-22-thematic-cuts.md`.
 
 ## 10. Left to the builder
 
