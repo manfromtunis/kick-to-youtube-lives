@@ -58,7 +58,7 @@ Anti-goals (a failure even if it "works"):
 - **Machine**: Melek's **Windows** laptop (Python 3.12 + ffmpeg via
   `winget install Python.Python.3.12 Gyan.FFmpeg`). Development and the end-to-end test run on
   the Linux VM where T3 runs (Python 3.12, ffmpeg 6.1). All code must work on both:
-  `pathlib` everywhere, no `fcntl`, no POSIX-only calls, ffmpeg found on PATH.
+  `pathlib` everywhere, OS-specific calls only behind an `os.name` check (run lock), ffmpeg found on PATH.
 - **Stack (decided)**: Python **stdlib only** + `ffmpeg`/`ffprobe` binaries. No pip deps.
   OAuth, HTTP, multipart upload, SQLite all through stdlib.
 
@@ -206,16 +206,20 @@ token. Refresh the access token before each run. Print the URL too, for headless
 ### 6.7 Scheduling and portability
 
 - **Windows (target).** `k2y install-timer` runs
-  `schtasks /Create /F /SC MINUTE /MO 10 /TN k2y /TR "\"<pythonw.exe>\" -m k2y run"` with the
-  repo as working directory (wrap in a small `k2y-run.cmd` that `cd`s to the repo and appends
-  output to `work_dir/k2y.log`, since pythonw has no console). Uses `sys.executable` to find
-  Python (`pythonw.exe` next to it if present). Prints how to check it
-  (`schtasks /Query /TN k2y`) and how to remove it (`schtasks /Delete /TN k2y /F`).
-  The task runs only while Melek is logged in; that is acceptable.
+  `schtasks /Create /F /SC MINUTE /MO 10 /TN k2y /TR "\"<pythonw.exe>\" \"<repo>\\k2y-task.pyw\""`.
+  `k2y-task.pyw` (repo root, committed) puts its own folder first on `sys.path`, `chdir`s to
+  it and calls `k2y.cli.main(["run"])` inside a try/except that logs any crash to `k2y.log`.
+  `pythonw.exe` (next to `sys.executable`) has no console, so no window appears and there is
+  no batch file or code-page issue. Prints how to check (`schtasks /Query /TN k2y`), remove
+  (`schtasks /Delete /TN k2y /F`) and allow running on battery (README). The task runs only
+  while Melek is logged in; that is acceptable.
 - **Linux (VM, tests).** `install-timer` on Linux prints the equivalent crontab line
-  instead of installing anything.
-- **Run lock:** a lock file opened with `os.open(path, O_CREAT|O_EXCL)` holding the PID and
-  start time; a lock older than 8 hours or whose PID is gone is stale and replaced.
+  (paths quoted with `shlex.quote`) instead of installing anything.
+- **Run lock:** an OS lock held for the life of the process on `work_dir/k2y.lock`:
+  `msvcrt.locking(fd, LK_NBLCK, 1)` on Windows, `fcntl.flock(fd, LOCK_EX | LOCK_NB)` elsewhere
+  (only the branch for the current OS is imported). The OS releases it when the process dies
+  (crash, kill, power loss), so there is no staleness logic, no PID check and no steal.
+  Every command that writes state (`run`, `plan`, `retry`, `skip`, `backfill`) takes it.
 - **ffmpeg filter paths:** on Windows, drawtext `fontfile`/`textfile` paths must use forward
   slashes and escape the drive colon (`C\:/Windows/Fonts/arialbd.ttf`). Font: DejaVu Sans
   Bold on Linux, Arial Bold (`arialbd.ttf`) on Windows, first one that exists.
