@@ -77,77 +77,71 @@ MERGE_SCHEMA = {
     "required": ["parts"],
 }
 
-MERGE_PROMPT = """Below is a timeline of a {dur} livestream by a Tunisian streamer (Tunisian darija),
-described in chunks with topic changes at absolute times (seconds).
-Group it into thematic parts, the way an editor would cut it into separate YouTube videos.
-Rules:
-- Cut where the subject changes, not at chunk edges; chunk boundaries are arbitrary.
-- Parts must be 15 to 60 minutes long.
-- Titles must be short, punchy, in French or Latin-script darija like "Stream khedma fel gueyla".
-- Descriptions must be 1-2 sentences in French.
-- Every start_s and key_moments at_s must be timeline values from the at_s values listed below. First part starts at 0.
-- key_moments: 2-3 key moments per part, with at_s from the timeline and "what" in French.
-Timeline:
-{timeline}"""
+MERGE_PROMPT = """You are a video editor assembling thematic YouTube videos from a Kick livestream.
+The stream was {dur} long. Here is the chronological timeline of what happened:
+{timeline}
 
-
-class DailyQuota(Exception):
-    """Raised when Gemini returns 429 and error details contain a quotaId with 'PerDay'."""
+Instructions:
+1. Divide the stream into thematic parts (cut where the activity or subject changes).
+2. Each part must be between 15 and 60 minutes long (unless the whole stream is shorter).
+3. Do not cut exactly at chunk boundaries (00:00, 10:00, etc.) unless the topic really changes there.
+4. "start_s" for each part MUST be chosen from one of the "at_s" timestamps in the timeline. The first part MUST start at 0.
+5. "title": short, catchy title in French or Latin-script Tunisian darija (max 60 chars).
+6. "description": 1-2 paragraphs in French summarizing this part.
+7. "summary_en": 1 sentence in English summarizing the part.
+8. "key_moments": 1 to 3 highlight moments in this part. Each "at_s" MUST be chosen from the timeline "at_s" timestamps that fall within this part. "what": short description in French."""
 
 
 class SegmentError(Exception):
-    """Raised on segmentation or pipeline errors."""
+    pass
+
+
+class DailyQuota(Exception):
+    pass
 
 
 def _get_api_key() -> str:
-    try:
-        return config.read_secret("gemini.key")
-    except SystemExit:
-        return ""
+    return config.read_secret("gemini.key")
 
 
-def _is_daily_quota_error(body: bytes | str) -> bool:
+def _is_daily_quota_error(error_body: bytes | str) -> bool:
+    if isinstance(error_body, bytes):
+        error_body = error_body.decode("utf-8", errors="replace")
     try:
-        if isinstance(body, bytes):
-            body_str = body.decode("utf-8", errors="replace")
-        else:
-            body_str = str(body)
-        data = json.loads(body_str)
-        details = data.get("error", {}).get("details", [])
-        for item in details:
-            if isinstance(item, dict):
-                for v in item.get("violations", []):
-                    if isinstance(v, dict) and "PerDay" in v.get("quotaId", ""):
-                        return True
-                if "PerDay" in item.get("quotaId", ""):
+        data = json.loads(error_body)
+        err = data.get("error", {})
+        details = err.get("details", [])
+        for d in details:
+            if "quotaId" in d and "PerDay" in d.get("quotaId", ""):
+                return True
+            for vi in d.get("violations", []):
+                if "PerDay" in vi.get("quotaId", ""):
                     return True
-        return "PerDay" in body_str
     except Exception:
-        if isinstance(body, bytes):
-            return b"PerDay" in body
-        return "PerDay" in str(body)
+        pass
+    return "PerDay" in error_body
 
 
-def _parse_time_to_seconds(val: str | int | float) -> int:
-    if isinstance(val, (int, float)):
-        return int(val)
-    val = str(val).strip()
-    parts = val.split(":")
+def _parse_time_to_seconds(at_val: str | int) -> int:
+    if isinstance(at_val, int):
+        return max(0, at_val)
+    parts = str(at_val).strip().split(":")
     try:
         if len(parts) == 1:
-            return int(float(parts[0]))
+            return max(0, int(parts[0]))
         elif len(parts) == 2:
-            return int(float(parts[0])) * 60 + int(float(parts[1]))
+            return max(0, int(parts[0]) * 60 + int(parts[1]))
         elif len(parts) == 3:
-            return int(float(parts[0])) * 3600 + int(float(parts[1])) * 60 + int(float(parts[2]))
-    except (ValueError, TypeError):
-        pass
+            return max(0, int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+    except ValueError:
+        return 0
     return 0
 
 
 def _format_time(seconds: int) -> str:
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
@@ -159,10 +153,7 @@ def _snap(val: int, allowed: list[int]) -> int:
     return min(allowed, key=lambda a: abs(a - val))
 
 
-def generate(parts: list, schema: dict, models: list[str]) -> dict:
-    if not models:
-        raise SegmentError("No models provided for generate")
-
+def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
     body_bytes = json.dumps({
         "contents": [{"parts": parts}],
         "generationConfig": {
@@ -365,8 +356,8 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
                     first_desc = p.get("description", "").strip()
                 for km in p.get("key_moments", []):
                     at_s = _snap(km.get("at_s", 0), allowed_s) if allowed_s else km.get("at_s", 0)
-                    at_s = max(0, min(at_s, max(0, duration_s - 1))) if duration_s > 0 else 0
-                    all_km.append({"at_s": at_s, "what": km.get("what", "")})
+                    if 0 <= at_s < duration_s:
+                        all_km.append({"at_s": at_s, "what": km.get("what", "")})
         all_km.sort(key=lambda m: m["at_s"])
         seen_at = set()
         unique_km = []
@@ -434,6 +425,13 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
         else:
             cleaned[i]["end_s"] = duration_s
 
+        p_start = cleaned[i]["start_s"]
+        p_end = cleaned[i]["end_s"]
+        cleaned[i]["key_moments"] = [
+            km for km in cleaned[i]["key_moments"]
+            if p_start <= km["at_s"] < p_end
+        ]
+
     while len(cleaned) > 1:
         short_idx = None
         for i, p in enumerate(cleaned):
@@ -485,7 +483,10 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "end_s": p_right["end_s"],
             "title": title,
             "description": desc,
-            "key_moments": merged_km,
+            "key_moments": [
+                km for km in merged_km
+                if p_left["start_s"] <= km["at_s"] < p_right["end_s"]
+            ],
         }
         cleaned[left_idx:right_idx + 1] = [merged_part]
 
@@ -495,14 +496,25 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
         if not title:
             title = f"Partie {idx}"
         desc = p.get("description", "")
-        kms = p.get("key_moments", [])
+        p_start = p["start_s"]
+        p_end = p["end_s"]
+        kms = [
+            m for m in p.get("key_moments", [])
+            if p_start <= m["at_s"] < p_end
+        ]
         kms.sort(key=lambda m: m["at_s"])
+        seen_at = set()
+        unique_km = []
+        for km in kms:
+            if km["at_s"] not in seen_at:
+                seen_at.add(km["at_s"])
+                unique_km.append({"at_s": km["at_s"], "what": km.get("what", "")})
         result.append({
-            "start_s": p["start_s"],
-            "end_s": p["end_s"],
+            "start_s": p_start,
+            "end_s": p_end,
             "title": title,
             "description": desc,
-            "key_moments": [{"at_s": m["at_s"], "what": m.get("what", "")} for m in kms[:3]],
+            "key_moments": unique_km[:3],
         })
     return result
 

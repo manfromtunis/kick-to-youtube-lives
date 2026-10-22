@@ -55,7 +55,11 @@ def list_vods(channel: str) -> list[dict]:
                 raise KickError(f"Missing required key '{k}' in Kick API response item")
 
         categories = item.get("categories")
-        category = categories[0]["name"] if (categories and len(categories) > 0 and "name" in categories[0]) else None
+        category = (
+            categories[0].get("name")
+            if isinstance(categories, list) and len(categories) > 0 and isinstance(categories[0], dict)
+            else None
+        )
 
         result.append(
             {

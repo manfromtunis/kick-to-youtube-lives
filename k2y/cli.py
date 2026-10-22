@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 from . import config, db, kick, pipeline, youtube
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,10 +48,14 @@ def main(argv: list[str] | None = None) -> int:
     p_backfill.add_argument("vod_id", type=int, help="Kick VOD ID")
 
     # auth
-    subparsers.add_parser("auth", help="Authorize YouTube OAuth")
+    p_auth = subparsers.add_parser("auth", help="Authorize YouTube OAuth")
+    p_auth.add_argument("--paste", action="store_true", help="Authorize using pasted redirect URL (headless)")
 
     # install-timer
-    subparsers.add_parser("install-timer", help="Install systemd user timer")
+    subparsers.add_parser(
+        "install-timer",
+        help="Install Task Scheduler task on Windows or print crontab line",
+    )
 
     args = parser.parse_args(argv)
     if not args.command:
@@ -101,7 +112,10 @@ def main(argv: list[str] | None = None) -> int:
                 kick.download(dict(vod), source_file)
                 db.set_state(conn, args.vod_id, "downloaded")
 
-            from k2y import segment
+            if "k2y.segment" in sys.modules:
+                segment = sys.modules["k2y.segment"]
+            else:
+                from k2y import segment
             parts = segment.plan(
                 source_file,
                 cfg.vod_dir(args.vod_id),
@@ -168,30 +182,30 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "auth":
-            youtube.auth()
+            youtube.auth(paste=bool(getattr(args, "paste", False)))
             return 0
 
         elif args.command == "install-timer":
-            repo_dir = Path(__file__).resolve().parent.parent
-            service_src = repo_dir / "systemd" / "k2y.service"
-            timer_src = repo_dir / "systemd" / "k2y.timer"
-            target_dir = Path.home() / ".config" / "systemd" / "user"
-            target_dir.mkdir(parents=True, exist_ok=True)
-
-            service_content = service_src.read_text().replace("@REPO@", str(repo_dir))
-            (target_dir / "k2y.service").write_text(service_content)
-            (target_dir / "k2y.timer").write_text(timer_src.read_text())
-
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-            subprocess.run(["systemctl", "--user", "enable", "--now", "k2y.timer"], check=True)
-
-            print("Installed k2y.service and k2y.timer to ~/.config/systemd/user/")
-            print("Reloaded user daemon and enabled k2y.timer.")
-            print("Hint: run 'loginctl enable-linger $USER' if the timer should run while logged out.")
+            repo_dir = REPO_DIR
+            python_exe = sys.executable
+            if _is_windows():
+                cfg.work_dir.mkdir(parents=True, exist_ok=True)
+                cmd_path = cfg.work_dir / "k2y-run.cmd"
+                log_path = cfg.work_dir / "k2y.log"
+                cmd_content = f'cd /d "{repo_dir}"\n"{python_exe}" -m k2y run >> "{log_path}" 2>&1\n'
+                cmd_path.write_text(cmd_content, encoding="utf-8")
+                subprocess.run(
+                    ["schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", "10", "/TN", "k2y", "/TR", str(cmd_path)],
+                    check=True,
+                )
+                print("Task 'k2y' scheduled successfully.")
+                print("To check: schtasks /Query /TN k2y")
+                print("To remove: schtasks /Delete /TN k2y /F")
+            else:
+                log_path = cfg.work_dir / "k2y.log"
+                print(f"*/10 * * * * cd {repo_dir} && {python_exe} -m k2y run >> {log_path} 2>&1")
             return 0
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
-
-    return 0

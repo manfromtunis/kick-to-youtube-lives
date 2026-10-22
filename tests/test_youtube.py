@@ -68,6 +68,9 @@ class TestYouTube(unittest.TestCase):
         self.patch_config_dir = patch.object(config, "CONFIG_DIR", self.config_dir)
         self.patch_config_dir.start()
 
+        self.patch_sleep = patch.object(youtube, "_sleep", MagicMock())
+        self.mock_sleep = self.patch_sleep.start()
+
         # Seed valid client_secret.json
         client_secret_data = {
             "installed": {
@@ -89,6 +92,7 @@ class TestYouTube(unittest.TestCase):
         config.write_secret("youtube_token.json", json.dumps(token_data))
 
     def tearDown(self) -> None:
+        self.patch_sleep.stop()
         self.patch_config_dir.stop()
         self.temp_dir.cleanup()
 
@@ -134,7 +138,7 @@ class TestYouTube(unittest.TestCase):
 
         recorded_requests: list[urllib.request.Request] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             recorded_requests.append(req)
             if "uploadType=resumable" in req.full_url:
                 return MockResponse(
@@ -187,7 +191,7 @@ class TestYouTube(unittest.TestCase):
         def on_session_cb(url: str) -> None:
             event_order.append(f"on_session:{url}")
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             if "uploadType=resumable" in req.full_url:
                 event_order.append("init_post")
                 return MockResponse(
@@ -226,7 +230,7 @@ class TestYouTube(unittest.TestCase):
 
         recorded_ranges: list[str] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             content_range = req.headers.get("Content-range")
             recorded_ranges.append(str(content_range))
             if content_range == f"bytes */{total_size}":
@@ -260,7 +264,7 @@ class TestYouTube(unittest.TestCase):
 
         recorded_ranges: list[str] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             content_range = req.headers.get("Content-range")
             recorded_ranges.append(str(content_range))
             if content_range == f"bytes */{total_size}":
@@ -288,7 +292,7 @@ class TestYouTube(unittest.TestCase):
 
         call_count = 0
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             nonlocal call_count
             call_count += 1
             self.assertEqual(req.headers.get("Content-range"), "bytes */5000")
@@ -315,7 +319,7 @@ class TestYouTube(unittest.TestCase):
         }
         config.write_secret("youtube_token.json", json.dumps(expired_token_data))
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             data = urllib.parse.parse_qs(req.data.decode("utf-8"))
             self.assertEqual(data["grant_type"][0], "refresh_token")
             self.assertEqual(data["refresh_token"][0], "refresh_123")
@@ -389,7 +393,7 @@ class TestYouTube(unittest.TestCase):
 
         recorded_reqs: list[urllib.request.Request] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             recorded_reqs.append(req)
             return MockResponse(200, {}, b"{}")
 
@@ -410,7 +414,7 @@ class TestYouTube(unittest.TestCase):
 
         calls = 0
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             nonlocal calls
             calls += 1
             if "thumbnails/set" in req.full_url:
@@ -437,7 +441,7 @@ class TestYouTube(unittest.TestCase):
 
         attempts = 0
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             nonlocal attempts
             attempts += 1
             if "uploadType=resumable" in req.full_url:
@@ -467,17 +471,16 @@ class TestYouTube(unittest.TestCase):
         self.assertEqual(attempts, 4)
 
     # 10. 5xx retry with backoff and status query recovery
-    @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_upload_5xx_retry_recovers(
-        self, mock_urlopen: MagicMock, mock_sleep: MagicMock
+        self, mock_urlopen: MagicMock
     ) -> None:
         dummy_video = self.config_dir / "video.mp4"
         dummy_video.write_bytes(b"F" * 500)
 
         step = 0
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             nonlocal step
             step += 1
             if step == 1:
@@ -498,7 +501,7 @@ class TestYouTube(unittest.TestCase):
             on_session=lambda _: None,
         )
         self.assertEqual(vid, "vid_5xx_ok")
-        mock_sleep.assert_called_once()
+        self.mock_sleep.assert_called_once_with(5)
 
     # 11. 404/410 on session creates a new session
     @patch("urllib.request.urlopen")
@@ -508,7 +511,7 @@ class TestYouTube(unittest.TestCase):
 
         sessions: list[str] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             if "expired_session" in req.full_url:
                 raise _make_http_error(404, "Not Found", b"Session expired")
             if "uploadType=resumable" in req.full_url:
@@ -566,7 +569,7 @@ class TestYouTube(unittest.TestCase):
 
         mock_http_server.side_effect = fake_server_init
 
-        def fake_token_exchange(req: urllib.request.Request) -> MockResponse:
+        def fake_token_exchange(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             data = urllib.parse.parse_qs(req.data.decode("utf-8"))
             self.assertEqual(data["code"][0], "test_auth_code_123")
             self.assertEqual(data["grant_type"][0], "authorization_code")
@@ -676,7 +679,7 @@ class TestYouTube(unittest.TestCase):
 
         recorded_reqs: list[urllib.request.Request] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
             recorded_reqs.append(req)
             if "uploadType=resumable" in req.full_url:
                 return MockResponse(200, {"Location": "https://upload.youtube.com/sess_trunc"}, b"")
@@ -706,7 +709,7 @@ class TestYouTube(unittest.TestCase):
 
         uploaded_ranges: list[str] = []
 
-        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             if "uploadType=resumable" in req.full_url:
                 return MockResponse(200, {"Location": "https://upload.youtube.com/sess_multi"}, b"")
             content_range = req.headers.get("Content-range")
@@ -741,6 +744,86 @@ class TestYouTube(unittest.TestCase):
             uploaded_ranges[2],
             f"bytes {16 * 1024 * 1024}-{total_size - 1}/{total_size}",
         )
+
+    # 17. OAuth auth(paste=True) flow
+    @patch("builtins.print")
+    @patch("builtins.input")
+    @patch("urllib.request.urlopen")
+    def test_auth_paste_flow(
+        self,
+        mock_urlopen: MagicMock,
+        mock_input: MagicMock,
+        mock_print: MagicMock,
+    ) -> None:
+        captured_auth_url: list[str] = []
+
+        def fake_print(*args: object, **kwargs: object) -> None:
+            for a in args:
+                if "Open this URL to authorize k2y:" in str(a):
+                    captured_auth_url.append(str(a))
+
+        mock_print.side_effect = fake_print
+
+        def fake_token_exchange(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
+            self.assertEqual(timeout, 60)
+            data = urllib.parse.parse_qs(req.data.decode("utf-8"))
+            self.assertEqual(data["code"][0], "test_paste_code_456")
+            self.assertEqual(data["grant_type"][0], "authorization_code")
+            self.assertEqual(data["redirect_uri"][0], "http://127.0.0.1:8765")
+            self.assertIn("code_verifier", data)
+            return MockResponse(
+                200,
+                {},
+                json.dumps({
+                    "refresh_token": "pasted_refresh_token",
+                    "access_token": "pasted_access_token",
+                    "expires_in": 3600,
+                }).encode("utf-8"),
+            )
+
+        mock_urlopen.side_effect = fake_token_exchange
+
+        def fake_input(prompt: str = "") -> str:
+            raw = captured_auth_url[0]
+            url = raw.split("\n")[-1].strip()
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            state = qs["state"][0]
+            return f"http://127.0.0.1:8765/?state={state}&code=test_paste_code_456"
+
+        mock_input.side_effect = fake_input
+
+        youtube.auth(paste=True)
+
+        saved = json.loads(config.read_secret("youtube_token.json"))
+        self.assertEqual(saved["refresh_token"], "pasted_refresh_token")
+        self.assertEqual(saved["access_token"], "pasted_access_token")
+
+    @patch("builtins.print")
+    @patch("builtins.input", return_value="http://127.0.0.1:8765/?state=bad_state&code=test_paste_code")
+    def test_auth_paste_state_mismatch(self, mock_input: MagicMock, mock_print: MagicMock) -> None:
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.auth(paste=True)
+        self.assertIn("state mismatch", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_timeouts_on_urlopen(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = MockResponse(
+            200, {}, json.dumps({"access_token": "tok", "expires_in": 3600}).encode("utf-8")
+        )
+        youtube.access_token(force_refresh=True)
+        self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 60)
+
+        mock_urlopen.return_value = MockResponse(308, {"Range": "bytes=0-100"}, b"")
+        youtube._query_status_once("https://upload.youtube.com/sess", 1000)
+        self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 300)
+
+        youtube._upload_chunk_once("https://upload.youtube.com/sess", b"test", 0, 1000)
+        self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 300)
+
+    def test_retry_backoff_formula(self) -> None:
+        expected = [5, 10, 20, 40, 60, 60]
+        actual = [min(60, 5 * (2 ** (a - 1))) for a in range(1, 7)]
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

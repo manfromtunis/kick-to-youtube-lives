@@ -1,11 +1,15 @@
 """Unit tests for k2y.pipeline."""
 from __future__ import annotations
 
-import fcntl
+import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -21,6 +25,9 @@ class TestPipeline(unittest.TestCase):
         self.work_dir = Path(self.tmp.name) / "work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
+        self.stderr_patcher = patch("sys.stderr", io.StringIO())
+        self.mock_stderr = self.stderr_patcher.start()
+
         self.orig_config_dir = config.CONFIG_DIR
         config.CONFIG_DIR = self.config_dir
 
@@ -34,9 +41,14 @@ class TestPipeline(unittest.TestCase):
         self.conn = db.connect(self.cfg.db_path)
 
     def tearDown(self):
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
+            h.close()
+        pipeline._logging_configured = False
         pipeline.STEPS = self.orig_steps
         config.CONFIG_DIR = self.orig_config_dir
         self.conn.close()
+        self.stderr_patcher.stop()
         self.tmp.cleanup()
 
     def test_vod_new_to_done_all_steps_in_order(self):
@@ -208,7 +220,8 @@ class TestPipeline(unittest.TestCase):
         fake_segment.SegmentError = Exception
         fake_segment.plan = MagicMock(side_effect=DailyQuota("Gemini quota exhausted"))
 
-        with patch.dict(sys.modules, {"k2y.segment": fake_segment}):
+        with patch.object(sys.modules.get("k2y"), "segment", fake_segment, create=True), \
+             patch.dict(sys.modules, {"k2y.segment": fake_segment}):
             def step_quota(c, cfg, v):
                 from k2y import segment
                 raise segment.DailyQuota("Gemini quota exhausted")
@@ -226,17 +239,53 @@ class TestPipeline(unittest.TestCase):
 
     def test_lock_prevents_second_concurrent_run(self):
         lock_path = self.work_dir / "k2y.lock"
-        lock_fd = open(lock_path, "w")
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_path.write_text(f"{os.getpid()} {int(time.time())}\n")
 
-        try:
-            with patch("k2y.kick.list_vods") as mock_list:
+        with patch("k2y.kick.list_vods") as mock_list:
+            ret = pipeline.run(self.cfg)
+            self.assertEqual(ret, 0)
+            mock_list.assert_not_called()
+
+    def test_lock_replaces_stale_lock_by_age(self):
+        lock_path = self.work_dir / "k2y.lock"
+        # 9 hours old -> stale
+        stale_time = int(time.time()) - (9 * 3600)
+        lock_path.write_text(f"{os.getpid()} {stale_time}\n")
+
+        with patch("k2y.kick.list_vods", return_value=[]):
+            ret = pipeline.run(self.cfg)
+            self.assertEqual(ret, 0)
+
+    def test_lock_replaces_stale_lock_by_dead_pid(self):
+        lock_path = self.work_dir / "k2y.lock"
+        dead_pid = 99999999
+        lock_path.write_text(f"{dead_pid} {int(time.time())}\n")
+
+        with patch("k2y.pipeline._is_pid_running", return_value=False):
+            with patch("k2y.kick.list_vods", return_value=[]):
                 ret = pipeline.run(self.cfg)
                 self.assertEqual(ret, 0)
-                mock_list.assert_not_called()
-        finally:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-            lock_fd.close()
+
+    def test_lock_released_in_finally(self):
+        lock_path = self.work_dir / "k2y.lock"
+        self.assertFalse(lock_path.exists())
+
+        with patch("k2y.kick.list_vods", return_value=[]):
+            ret = pipeline.run(self.cfg)
+            self.assertEqual(ret, 0)
+
+        self.assertFalse(lock_path.exists())
+
+    def test_setup_logging_idempotent(self):
+        log_dir = self.work_dir / "log_test"
+        pipeline._logging_configured = False
+        pipeline.setup_logging(log_dir)
+        self.assertTrue(pipeline._logging_configured)
+        self.assertTrue((log_dir / "k2y.log").exists())
+
+        # Second call does not re-add handlers or fail
+        pipeline.setup_logging(log_dir)
+        self.assertTrue(pipeline._logging_configured)
 
     def test_discovery_skips_live_and_before_since(self):
         vod_live = {

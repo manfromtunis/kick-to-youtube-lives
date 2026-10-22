@@ -5,8 +5,25 @@ import subprocess
 import tempfile
 import textwrap
 
-FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+FONT_CANDIDATES = [
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    Path("C:/Windows/Fonts/arialbd.ttf"),
+    Path("C:/Windows/Fonts/arial.ttf"),
+]
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+
+def _filter_path(p: Path) -> str:
+    """Convert path to forward slashes, escaping drive colon and single quotes for ffmpeg."""
+    s = str(p).replace("\\", "/")
+    return s.replace(":", "\\:").replace("'", "\\'")
+
+
+def _find_font() -> Path | None:
+    for candidate in FONT_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def hms(seconds: int) -> str:
@@ -98,10 +115,11 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
         tf_path = Path(tf.name)
 
     try:
-        font_file = FONT_PATH if FONT_PATH.exists() else "Sans"
+        font_file = _find_font()
+        font_arg = f"fontfile='{_filter_path(font_file)}':" if font_file else ""
         vf = (
             "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext=fontfile='{font_file}':textfile='{tf_path}':"
+            f"drawtext={font_arg}textfile='{_filter_path(tf_path)}':"
             "fontcolor=white:borderw=6:bordercolor=black:fontsize=72:text_align=center:"
             "x=(w-text_w)/2:y=h*2/3+(h/3-text_h)/2:expansion=none"
         )
@@ -138,67 +156,98 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
                 str(tmp_dest),
             ]
             re_res = subprocess.run(cmd_reencode, capture_output=True, text=True)
-            if re_res.returncode != 0:
-                tail = "\n".join(re_res.stderr.strip().splitlines()[-10:])
-                raise RuntimeError(f"ffmpeg re-encode failed (code {re_res.returncode}): {tail}")
-            tmp_dest.replace(dest)
+            if re_res.returncode == 0 and tmp_dest.exists():
+                tmp_dest.replace(dest)
+            else:
+                break
 
         return dest
     finally:
-        tf_path.unlink(missing_ok=True)
+        try:
+            tf_path.unlink()
+        except OSError:
+            pass
 
 
-def full_description(vod_title: str, parts: list[dict], kick_channel: str) -> str:
-    """YouTube description for full VOD: chapters, blank line, Kick channel link."""
-    chaps = chapters([(p["start_s"], p["title"]) for p in parts])
-    kick_link = f"Live sur https://kick.com/{kick_channel}"
-    body = f"{chaps}\n\n{kick_link}" if chaps else kick_link
-    return body[:5000]
+def full_title(session_title: str, started_at: str) -> str:
+    """Kick session_title + ' | Stream du <DD/MM/YYYY>', max 100 chars."""
+    dt_str = ""
+    try:
+        dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        dt_str = dt.strftime("%d/%m/%Y")
+    except Exception:
+        dt_str = started_at[:10]
+
+    suffix = f" | Stream du {dt_str}"
+    max_session_len = 100 - len(suffix)
+    trimmed_title = session_title[:max_session_len]
+    return f"{trimmed_title}{suffix}"
 
 
-def part_description(part: dict, full_video_id: str | None, kick_channel: str) -> str:
-    """YouTube description for a part: description, chapters from key moments, full stream link, Kick link."""
-    desc = part.get("description", "").strip()
-    start_s = part.get("start_s", 0)
-    moments = [(m["at_s"] - start_s, m["what"]) for m in part.get("key_moments", [])]
-    if not any(t == 0 for t, _ in moments):
-        moments.insert(0, (0, part.get("title", "")))
-    chaps = chapters(moments)
+def part_title(gemini_title: str, index: int, total: int) -> str:
+    """Gemini title + ' | Partie <n>/<total>', max 100 chars."""
+    suffix = f" | Partie {index}/{total}"
+    max_gemini_len = 100 - len(suffix)
+    trimmed = gemini_title[:max_gemini_len]
+    return f"{trimmed}{suffix}"
+
+
+def full_description(session_title: str, parts: list[dict], channel: str) -> str:
+    """Format full VOD description."""
+    items = []
+    for p in parts:
+        start_s = int(p.get("start_s", 0))
+        t = str(p.get("title", "")).strip()
+        items.append((start_s, t))
+
+    chaps = chapters(items)
+    link_line = f"Live sur https://kick.com/{channel}"
+
+    if chaps:
+        desc = f"{chaps}\n\n{link_line}"
+    else:
+        desc = link_line
+
+    return desc[:5000]
+
+
+def part_description(part: dict, full_video_id: str | None, channel: str) -> str:
+    """Format part video description."""
+    desc_text = str(part.get("description", "")).strip()
+    part_start_s = int(part.get("start_s", 0))
+    part_end_s = int(part.get("end_s", 0))
+    part_title_str = str(part.get("title", "")).strip()
+
+    raw_kms = part.get("key_moments") or []
+    rebased_kms = []
+    has_zero = False
+    for km in raw_kms:
+        at_s = int(km.get("at_s", 0))
+        rel_s = at_s - part_start_s
+        if rel_s == 0:
+            has_zero = True
+        what = str(km.get("what", "")).strip()
+        rebased_kms.append((rel_s, what))
+
+    if not has_zero:
+        rebased_kms.insert(0, (0, part_title_str))
+
+    rebased_kms.sort(key=lambda x: x[0])
+    part_duration = part_end_s - part_start_s if part_end_s > part_start_s else None
+    chaps = chapters(rebased_kms, end_s=part_duration)
 
     links = []
     if full_video_id:
         links.append(f"Stream complet: https://youtu.be/{full_video_id}")
-    links.append(f"Live sur https://kick.com/{kick_channel}")
+    links.append(f"Live sur https://kick.com/{channel}")
     links_str = "\n".join(links)
 
-    sections = [s for s in [desc, chaps, links_str] if s]
+    sections = []
+    if desc_text:
+        sections.append(desc_text)
+    if chaps:
+        sections.append(chaps)
+    if links_str:
+        sections.append(links_str)
+
     return "\n\n".join(sections)[:5000]
-
-
-def full_title(session_title: str, started_at: str) -> str:
-    """Format full VOD title: f"{session_title} | Stream du {DD/MM/YYYY}", max 100 chars."""
-    try:
-        dt = datetime.fromisoformat(started_at.strip().replace("Z", "+00:00"))
-        date_str = dt.strftime("%d/%m/%Y")
-    except Exception:
-        raw = started_at.strip()[:10]
-        parts = raw.split("-")
-        if len(parts) == 3:
-            date_str = f"{parts[2]}/{parts[1]}/{parts[0]}"
-        else:
-            date_str = raw
-
-    suffix = f" | Stream du {date_str}"
-    max_prefix = 100 - len(suffix)
-    if len(session_title) > max_prefix:
-        session_title = session_title[:max_prefix]
-    return f"{session_title}{suffix}"
-
-
-def part_title(title: str, n: int, total: int) -> str:
-    """Format part title: f"{title} | Partie {n}/{total}", max 100 chars."""
-    suffix = f" | Partie {n}/{total}"
-    max_prefix = 100 - len(suffix)
-    if len(title) > max_prefix:
-        title = title[:max_prefix]
-    return f"{title}{suffix}"

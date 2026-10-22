@@ -4,8 +4,10 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 from k2y.media import (
+    _filter_path,
     chapters,
     cut,
     full_description,
@@ -206,6 +208,31 @@ class TestWrapTitle(unittest.TestCase):
         self.assertTrue(lines[1].endswith("…"))
         for line in lines:
             self.assertLessEqual(len(line), 24)
+
+
+class TestFilterPath(unittest.TestCase):
+    def test_windows_path_conversion_and_escaping(self):
+        p = Path(r"C:\Windows\Fonts\arialbd.ttf")
+        filtered = _filter_path(p)
+        self.assertEqual(filtered, r"C\:/Windows/Fonts/arialbd.ttf")
+
+    def test_windows_path_with_single_quote(self):
+        p = Path(r"C:\Users\Melek's Files\font.ttf")
+        filtered = _filter_path(p)
+        self.assertEqual(filtered, r"C\:/Users/Melek\'s Files/font.ttf")
+
+    def test_font_fallback_omits_fontfile(self):
+        with patch("k2y.media._find_font", return_value=None), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as src, \
+                 tempfile.NamedTemporaryFile(suffix=".jpg") as dst:
+                thumbnail(Path(src.name), 10, "Title", Path(dst.name))
+                args = mock_run.call_args[0][0]
+                vf_idx = args.index("-vf")
+                vf_str = args[vf_idx + 1]
+                self.assertNotIn("fontfile=", vf_str)
+                self.assertIn("textfile=", vf_str)
 
 
 class TestMediaFFmpeg(unittest.TestCase):

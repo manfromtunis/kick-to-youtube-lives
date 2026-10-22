@@ -86,6 +86,79 @@ https://cdn.example.com/stream/100k.m3u8
         self.assertIn("Mozilla", req.headers["User-agent"])
 
     @patch("urllib.request.urlopen")
+    def test_list_vods_unexpected_categories_shapes(self, mock_urlopen):
+        payload = [
+            {
+                "id": 1,
+                "session_title": "V1",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/1/master.m3u8",
+                "categories": None,
+                "is_live": False,
+            },
+            {
+                "id": 2,
+                "session_title": "V2",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/2/master.m3u8",
+                "categories": [None],
+                "is_live": False,
+            },
+            {
+                "id": 3,
+                "session_title": "V3",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/3/master.m3u8",
+                "categories": ["Gaming"],
+                "is_live": False,
+            },
+            {
+                "id": 4,
+                "session_title": "V4",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/4/master.m3u8",
+                "categories": [123],
+                "is_live": False,
+            },
+            {
+                "id": 5,
+                "session_title": "V5",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/5/master.m3u8",
+                "categories": "UnexpectedString",
+                "is_live": False,
+            },
+            {
+                "id": 6,
+                "session_title": "V6",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/6/master.m3u8",
+                "categories": [{"name": "ValidGame"}],
+                "is_live": False,
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        vods = list_vods("testchannel")
+        self.assertEqual(len(vods), 6)
+        self.assertIsNone(vods[0]["category"])
+        self.assertIsNone(vods[1]["category"])
+        self.assertIsNone(vods[2]["category"])
+        self.assertIsNone(vods[3]["category"])
+        self.assertIsNone(vods[4]["category"])
+        self.assertEqual(vods[5]["category"], "ValidGame")
+
+    @patch("urllib.request.urlopen")
     def test_list_vods_http_error(self, mock_urlopen):
         mock_urlopen.side_effect = urllib.error.HTTPError(
             url="https://kick.com", code=404, msg="Not Found", hdrs={}, fp=None

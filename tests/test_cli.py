@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -91,7 +92,8 @@ class TestCLI(unittest.TestCase):
         db.record_error(self.conn, 701, "Error", max_attempts=1)  # moves to failed
         self.assertEqual(db.get_vod(self.conn, 701)["state"], "failed")
 
-        ret = cli.main(["retry", "701"])
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "701"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 701)["state"], "new")
         self.assertEqual(db.get_vod(self.conn, 701)["attempts"], 0)
@@ -112,7 +114,8 @@ class TestCLI(unittest.TestCase):
         (v2_dir / "source.mp4").write_bytes(b"source")
         db.record_error(self.conn, 702, "Error", max_attempts=1)
 
-        ret = cli.main(["retry", "702"])
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "702"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 702)["state"], "downloaded")
 
@@ -133,7 +136,8 @@ class TestCLI(unittest.TestCase):
         db.save_plan(self.conn, 703, [{"start_s": 0, "end_s": 3600, "title": "P"}])
         db.record_error(self.conn, 703, "Error", max_attempts=1)
 
-        ret = cli.main(["retry", "703"])
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "703"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 703)["state"], "planned")
 
@@ -155,7 +159,8 @@ class TestCLI(unittest.TestCase):
         db.upsert_upload(self.conn, 704, 0, "Full VOD", 0, 3600)
         db.record_error(self.conn, 704, "Error", max_attempts=1)
 
-        ret = cli.main(["retry", "704"])
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "704"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 704)["state"], "cut")
 
@@ -171,7 +176,8 @@ class TestCLI(unittest.TestCase):
         }
         db.upsert_vod(self.conn, vod)
 
-        ret = cli.main(["skip", "801"])
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["skip", "801"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 801)["state"], "skipped")
 
@@ -186,7 +192,7 @@ class TestCLI(unittest.TestCase):
             "is_live": False,
         }
 
-        with patch("k2y.kick.list_vods", return_value=[old_vod]):
+        with patch("k2y.kick.list_vods", return_value=[old_vod]), patch("sys.stdout", io.StringIO()):
             ret = cli.main(["backfill", "901"])
 
         self.assertEqual(ret, 0)
@@ -216,14 +222,16 @@ class TestCLI(unittest.TestCase):
         db.upsert_upload(self.conn, vod_id, 1, "Old Part", 0, 1800)
 
         fake_segment = types.ModuleType("k2y.segment")
-        plan_result = [
+        plan_result = [\
             {"start_s": 0, "end_s": 1800, "title": "New Part 1", "description": "D1", "key_moments": []},
             {"start_s": 1800, "end_s": 3600, "title": "New Part 2", "description": "D2", "key_moments": []},
         ]
         fake_segment.plan = MagicMock(return_value=plan_result)
 
         stdout = io.StringIO()
-        with patch.dict(sys.modules, {"k2y.segment": fake_segment}), patch("sys.stdout", stdout):
+        with patch.object(sys.modules.get("k2y"), "segment", fake_segment, create=True), \
+             patch.dict(sys.modules, {"k2y.segment": fake_segment}), \
+             patch("sys.stdout", stdout):
             ret = cli.main(["plan", str(vod_id)])
 
         self.assertEqual(ret, 0)
@@ -242,24 +250,62 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ups[0]["idx"], 0)
         self.assertEqual(ups[0]["youtube_id"], "yt_keep_0")
 
-    def test_install_timer_command(self):
-        fake_home = Path(self.tmp.name) / "fake_home"
-        with patch("pathlib.Path.home", return_value=fake_home), \
-             patch("subprocess.run") as mock_run:
+    def test_install_timer_windows(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("k2y.cli._is_windows", return_value=True), \
+             patch("subprocess.run") as mock_run, \
+             patch("sys.stdout", stdout), \
+             patch("sys.stderr", stderr):
             ret = cli.main(["install-timer"])
 
         self.assertEqual(ret, 0)
-        user_systemd = fake_home / ".config" / "systemd" / "user"
-        service_file = user_systemd / "k2y.service"
-        timer_file = user_systemd / "k2y.timer"
+        cmd_file = self.work_dir / "k2y-run.cmd"
+        self.assertTrue(cmd_file.exists())
+        content = cmd_file.read_text(encoding="utf-8")
+        self.assertIn('cd /d "', content)
+        self.assertIn(f'"{sys.executable}" -m k2y run >> "', content)
+        self.assertIn('k2y.log" 2>&1', content)
 
-        self.assertTrue(service_file.exists())
-        self.assertTrue(timer_file.exists())
-        self.assertNotIn("@REPO@", service_file.read_text())
-        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[0], "schtasks")
+        self.assertEqual(args[1], "/Create")
+        self.assertIn("/TN", args)
+        self.assertIn("k2y", args)
+
+        out_text = stdout.getvalue()
+        self.assertIn("schtasks /Query /TN k2y", out_text)
+        self.assertIn("schtasks /Delete /TN k2y /F", out_text)
+
+    def test_install_timer_linux(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("k2y.cli._is_windows", return_value=False), \
+             patch("subprocess.run") as mock_run, \
+             patch("sys.stdout", stdout), \
+             patch("sys.stderr", stderr):
+            ret = cli.main(["install-timer"])
+
+        self.assertEqual(ret, 0)
+        mock_run.assert_not_called()
+        cmd_file = self.work_dir / "k2y-run.cmd"
+        self.assertFalse(cmd_file.exists())
+
+        out_text = stdout.getvalue()
+        self.assertTrue(out_text.strip().startswith("*/10 * * * * cd "))
+        self.assertIn("-m k2y run >> ", out_text)
+        self.assertIn("k2y.log 2>&1", out_text)
+
+    def test_auth_paste_command(self):
+        with patch("k2y.youtube.auth") as mock_auth, patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["auth", "--paste"])
+        self.assertEqual(ret, 0)
+        mock_auth.assert_called_once_with(paste=True)
 
     def test_exit_codes(self):
         # 2 on bad usage / missing command
-        self.assertEqual(cli.main([]), 2)
-        # 1 on not found VOD
-        self.assertEqual(cli.main(["retry", "9999"]), 1)
+        with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            self.assertEqual(cli.main([]), 2)
+            # 1 on not found VOD
+            self.assertEqual(cli.main(["retry", "9999"]), 1)

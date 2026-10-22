@@ -1,7 +1,8 @@
 """Paths, user config and secrets. Every other module reads settings from here only."""
+import dataclasses
+from dataclasses import dataclass
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("K2Y_CONFIG_DIR", Path.home() / ".config/k2y"))
@@ -28,7 +29,9 @@ def load() -> Config:
     raw = json.loads(p.read_text()) if p.exists() else {}
     if "work_dir" in raw:
         raw["work_dir"] = Path(raw["work_dir"]).expanduser()
-    return Config(**raw)
+    valid_fields = {f.name for f in dataclasses.fields(Config)}
+    filtered = {k: v for k, v in raw.items() if k in valid_fields}
+    return Config(**filtered)
 
 
 def secret_path(name: str) -> Path:

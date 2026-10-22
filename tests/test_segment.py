@@ -133,6 +133,59 @@ class TestRepair(unittest.TestCase):
         self.assertEqual(len(res[0]["key_moments"]), 3)
         self.assertEqual([km["at_s"] for km in res[0]["key_moments"]], [100, 200, 400])
 
+    def test_repair_drops_key_moments_outside_part_range(self):
+        duration_s = 3600
+        allowed_s = [0, 100, 1500, 1800, 2000, 2100, 3600]
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Part 1",
+                "key_moments": [
+                    {"at_s": 100, "what": "valid in part 1"},
+                    {"at_s": 1800, "what": "falls on end boundary, out of part 1"},
+                    {"at_s": 2000, "what": "falls into part 2, out of part 1"},
+                ],
+            },
+            {
+                "start_s": 1800,
+                "title": "Part 2",
+                "key_moments": [
+                    {"at_s": 1500, "what": "before part 2 start"},
+                    {"at_s": 2100, "what": "valid in part 2"},
+                    {"at_s": 3600, "what": "at duration end, out of part 2"},
+                ],
+            },
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=allowed_s, min_part_s=600)
+        self.assertEqual(len(res), 2)
+        km1 = res[0]["key_moments"]
+        self.assertEqual(len(km1), 1)
+        self.assertEqual(km1[0]["at_s"], 100)
+
+        km2 = res[1]["key_moments"]
+        self.assertEqual(len(km2), 1)
+        self.assertEqual(km2[0]["at_s"], 2100)
+
+    def test_repair_short_vod_drops_out_of_range_key_moments(self):
+        duration_s = 15 * 60  # 900s
+        allowed_s = [0, 200, 900, 1000]
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Short VOD",
+                "key_moments": [
+                    {"at_s": 200, "what": "valid"},
+                    {"at_s": 900, "what": "at duration_s boundary"},
+                    {"at_s": 1000, "what": "beyond duration_s"},
+                ],
+            }
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=allowed_s, min_part_s=900)
+        self.assertEqual(len(res), 1)
+        kms = res[0]["key_moments"]
+        self.assertEqual(len(kms), 1)
+        self.assertEqual(kms[0]["at_s"], 200)
+
     def test_repair_empty_title_fallback(self):
         duration_s = 3600
         parts = [
@@ -417,11 +470,10 @@ class TestMerge(unittest.TestCase):
         # Verify prompt rules in generate call
         call_parts = mock_generate.call_args[0][0]
         prompt_text = call_parts[0]["text"]
-        self.assertIn("cut where the subject changes, not at chunk edges", prompt_text.lower())
-        self.assertIn("15 to 60 minutes", prompt_text.lower())
-        self.assertIn("stream khedma fel gueyla", prompt_text.lower())
+        self.assertIn("cut where the activity or subject changes", prompt_text.lower())
+        self.assertIn("15 and 60 minutes", prompt_text.lower())
         self.assertIn("french", prompt_text.lower())
-        self.assertIn("timeline values", prompt_text.lower())
+        self.assertIn("latin-script tunisian darija", prompt_text.lower())
 
 
 class TestPlan(unittest.TestCase):

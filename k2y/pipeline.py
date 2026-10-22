@@ -3,21 +3,59 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime, timezone
-import fcntl
 import json
 import logging
+from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from typing import Callable
 
 from . import config, db, kick, media, youtube
 
 logger = logging.getLogger("k2y")
+_logging_configured = False
 
 
 class StopRun(Exception):
     """Raised to stop the entire pipeline run immediately without counting attempts."""
+
+
+def setup_logging(work_dir: Path) -> None:
+    """Configure stdlib logging to stderr and a RotatingFileHandler at work_dir/k2y.log.
+
+    5 MB max size, 3 backups, format '%(asctime)s %(levelname)s %(message)s'.
+    Idempotent (configures once).
+    """
+    global _logging_configured
+    if _logging_configured:
+        return
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log_file = work_dir / "k2y.log"
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(stderr_handler)
+    root_logger.addHandler(file_handler)
+
+    _logging_configured = True
 
 
 def _ensure_since(cfg: config.Config) -> config.Config:
@@ -230,9 +268,8 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
             if "k2y.segment" in sys.modules:
                 daily_quota_cls = getattr(sys.modules["k2y.segment"], "DailyQuota", None)
             is_daily_quota = (
-                isinstance(e, daily_quota_cls)
-                if daily_quota_cls is not None
-                else (type(e).__name__ == "DailyQuota")
+                (daily_quota_cls is not None and isinstance(e, daily_quota_cls))
+                or (type(e).__name__ == "DailyQuota")
             )
             if isinstance(e, youtube.QuotaExceeded) or is_daily_quota:
                 raise StopRun(str(e)) from e
@@ -249,19 +286,97 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
                 break
 
 
+def _is_pid_running(pid: int) -> bool:
+    """Check if process with pid is running.
+
+    On POSIX, uses os.kill(pid, 0).
+    On Windows, uses ctypes OpenProcess and GetExitCodeProcess.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # On Windows, query process status via OpenProcess and GetExitCodeProcess.
+        import ctypes
+        from ctypes import wintypes
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        h_process = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not h_process:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            success = kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
+            return bool(success and exit_code.value == still_active)
+        finally:
+            kernel32.CloseHandle(h_process)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+
+def _acquire_lock(lock_path: Path) -> bool:
+    """Acquire run lock via os.open(lock, O_CREAT|O_EXCL|O_WRONLY).
+
+    Writes '<pid> <unix time>'. If the lock exists and is older than 8 hours
+    or its PID is not running, replace it.
+    """
+    now = int(time.time())
+    pid = os.getpid()
+    payload = f"{pid} {now}\n".encode("utf-8")
+
+    for _ in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            # Check if stale
+            stale = False
+            try:
+                raw = lock_path.read_text(encoding="utf-8").strip()
+                parts = raw.split()
+                if len(parts) >= 2:
+                    lock_pid = int(parts[0])
+                    lock_time = int(parts[1])
+                    if (now - lock_time > 8 * 3600) or not _is_pid_running(lock_pid):
+                        stale = True
+                else:
+                    stale = True
+            except Exception:
+                stale = True
+
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            return False
+    return False
+
+
 def run(cfg: config.Config | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     if cfg is None:
         cfg = config.load()
 
+    setup_logging(cfg.work_dir)
+
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.work_dir / "k2y.lock"
-    lock_file = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
+
+    if not _acquire_lock(lock_path):
         logger.info("another run in progress")
-        lock_file.close()
         return 0
 
     try:
@@ -289,7 +404,9 @@ def run(cfg: config.Config | None = None) -> int:
         return 0
     finally:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        except Exception:
+            if lock_path.exists():
+                text = lock_path.read_text(encoding="utf-8").strip().split()
+                if not text or text[0] == str(os.getpid()):
+                    lock_path.unlink()
+        except OSError:
             pass
-        lock_file.close()
