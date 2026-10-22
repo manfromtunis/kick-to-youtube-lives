@@ -1,0 +1,747 @@
+"""Unit tests for k2y.youtube.
+
+Uses Python stdlib unittest only, no network access (all network mocked).
+"""
+from __future__ import annotations
+
+import email
+import io
+import json
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from k2y import config, youtube
+
+
+def _make_headers(headers: dict[str, str] | None = None) -> email.message.Message:
+    lines = [f"{k}: {v}" for k, v in (headers or {}).items()]
+    return email.message_from_string("\n".join(lines) + ("\n\n" if lines else ""))
+
+
+class MockResponse:
+    def __init__(
+        self,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+    ):
+        self.status = status
+        self.code = status
+        self.headers = _make_headers(headers)
+        self._body = io.BytesIO(body)
+
+    def read(self, *args: int) -> bytes:
+        return self._body.read(*args)
+
+    def __enter__(self) -> MockResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        pass
+
+
+def _make_http_error(
+    code: int,
+    reason: str = "Error",
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://www.googleapis.com/test",
+        code,
+        reason,
+        _make_headers(headers),
+        io.BytesIO(body),
+    )
+
+
+class TestYouTube(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_dir = Path(self.temp_dir.name)
+        self.patch_config_dir = patch.object(config, "CONFIG_DIR", self.config_dir)
+        self.patch_config_dir.start()
+
+        # Seed valid client_secret.json
+        client_secret_data = {
+            "installed": {
+                "client_id": "mock_client_id.apps.googleusercontent.com",
+                "client_secret": "mock_client_secret_xyz",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["http://localhost"],
+            }
+        }
+        config.write_secret("client_secret.json", json.dumps(client_secret_data))
+
+        # Seed valid youtube_token.json
+        token_data = {
+            "refresh_token": "mock_refresh_token",
+            "access_token": "mock_access_token",
+            "expires_at": int(time.time()) + 3600,
+        }
+        config.write_secret("youtube_token.json", json.dumps(token_data))
+
+    def tearDown(self) -> None:
+        self.patch_config_dir.stop()
+        self.temp_dir.cleanup()
+
+    # 1. Quota error parsing raises QuotaExceeded
+    def test_quota_error_parsing_raises_quota_exceeded(self) -> None:
+        quota_body = json.dumps({
+            "error": {
+                "code": 403,
+                "message": "The request cannot be completed because you have exceeded your quota.",
+                "errors": [
+                    {
+                        "message": "The request cannot be completed because you have exceeded your quota.",
+                        "domain": "youtube.quota",
+                        "reason": "quotaExceeded",
+                    }
+                ],
+            }
+        }).encode("utf-8")
+        err = _make_http_error(403, "Forbidden", quota_body)
+        parsed = youtube._parse_youtube_error(err)
+        self.assertIsInstance(parsed, youtube.QuotaExceeded)
+        self.assertIn("quotaExceeded", str(parsed))
+
+        upload_limit_body = json.dumps({
+            "error": {
+                "code": 403,
+                "message": "User upload limit exceeded.",
+                "errors": [{"reason": "uploadLimitExceeded", "message": "limit"}],
+            }
+        }).encode("utf-8")
+        err2 = _make_http_error(403, "Forbidden", upload_limit_body)
+        parsed2 = youtube._parse_youtube_error(err2)
+        self.assertIsInstance(parsed2, youtube.QuotaExceeded)
+        self.assertIn("uploadLimitExceeded", str(parsed2))
+
+    # 2. privacyStatus is private in the init request body
+    @patch("urllib.request.urlopen")
+    def test_privacy_status_is_private_in_init_request_body(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        dummy_video = self.config_dir / "test_video.mp4"
+        dummy_video.write_bytes(b"A" * 1024)
+
+        recorded_requests: list[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            recorded_requests.append(req)
+            if "uploadType=resumable" in req.full_url:
+                return MockResponse(
+                    200,
+                    {"Location": "https://upload.youtube.com/upload/session_123"},
+                    b"",
+                )
+            if "session_123" in req.full_url:
+                return MockResponse(200, {}, json.dumps({"id": "vid_xyz"}).encode("utf-8"))
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        meta = {
+            "title": "Stream title that may be long",
+            "description": "Stream description",
+            "category_id": 20,
+            "privacyStatus": "public",  # Attempt to pass non-private; must be ignored
+            "tags": ["gaming", "kick"],
+        }
+        session_calls: list[str] = []
+        video_id = youtube.upload(
+            dummy_video,
+            meta,
+            session_url=None,
+            on_session=session_calls.append,
+        )
+        self.assertEqual(video_id, "vid_xyz")
+
+        # Check the init request
+        init_req = recorded_requests[0]
+        init_payload = json.loads(init_req.data.decode("utf-8"))
+        self.assertEqual(init_payload["status"]["privacyStatus"], "private")
+        self.assertEqual(init_payload["status"]["selfDeclaredMadeForKids"], False)
+        self.assertEqual(init_payload["snippet"]["defaultLanguage"], "ar")
+        self.assertEqual(init_payload["snippet"]["defaultAudioLanguage"], "ar")
+        self.assertEqual(init_payload["snippet"]["categoryId"], "20")
+        self.assertEqual(init_payload["snippet"]["tags"], ["gaming", "kick"])
+
+    # 3. on_session is called before the first chunk
+    @patch("urllib.request.urlopen")
+    def test_on_session_is_called_before_first_chunk(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        dummy_video = self.config_dir / "test_video.mp4"
+        dummy_video.write_bytes(b"B" * 1024)
+
+        event_order: list[str] = []
+
+        def on_session_cb(url: str) -> None:
+            event_order.append(f"on_session:{url}")
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            if "uploadType=resumable" in req.full_url:
+                event_order.append("init_post")
+                return MockResponse(
+                    200,
+                    {"Location": "https://upload.youtube.com/upload/my_session"},
+                    b"",
+                )
+            if "my_session" in req.full_url:
+                event_order.append(f"chunk_put:{req.headers.get('Content-range')}")
+                return MockResponse(200, {}, json.dumps({"id": "res_vid"}).encode("utf-8"))
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        meta = {"title": "Title", "description": "Desc", "category_id": "22"}
+        vid = youtube.upload(dummy_video, meta, session_url=None, on_session=on_session_cb)
+        self.assertEqual(vid, "res_vid")
+
+        self.assertEqual(
+            event_order,
+            [
+                "init_post",
+                "on_session:https://upload.youtube.com/upload/my_session",
+                "chunk_put:bytes 0-1023/1024",
+            ],
+        )
+
+    # 4. resume from a 308 with Range: bytes=0-8388607 continues at 8388608
+    @patch("urllib.request.urlopen")
+    def test_resume_from_308_range_continues_at_8388608(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        total_size = 10 * 1024 * 1024  # 10 MiB
+        dummy_video = self.config_dir / "large_video.mp4"
+        dummy_video.write_bytes(b"C" * total_size)
+
+        recorded_ranges: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            content_range = req.headers.get("Content-range")
+            recorded_ranges.append(str(content_range))
+            if content_range == f"bytes */{total_size}":
+                raise _make_http_error(
+                    308,
+                    "Resume Incomplete",
+                    b"",
+                    {"Range": "bytes=0-8388607"},
+                )
+            return MockResponse(200, {}, json.dumps({"id": "resumed_vid"}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        meta = {"title": "Title", "description": "Desc"}
+        vid = youtube.upload(
+            dummy_video,
+            meta,
+            session_url="https://upload.youtube.com/existing_session",
+            on_session=lambda _: None,
+        )
+        self.assertEqual(vid, "resumed_vid")
+        self.assertEqual(recorded_ranges[0], f"bytes */{total_size}")
+        self.assertEqual(recorded_ranges[1], f"bytes 8388608-{total_size - 1}/{total_size}")
+
+    # Resume from 308 with no Range header continues at 0
+    @patch("urllib.request.urlopen")
+    def test_resume_from_308_no_range_continues_at_0(self, mock_urlopen: MagicMock) -> None:
+        total_size = 1000
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"Z" * total_size)
+
+        recorded_ranges: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            content_range = req.headers.get("Content-range")
+            recorded_ranges.append(str(content_range))
+            if content_range == f"bytes */{total_size}":
+                raise _make_http_error(308, "Resume Incomplete", b"", {})
+            return MockResponse(200, {}, json.dumps({"id": "vid_zero_resumed"}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        vid = youtube.upload(
+            dummy_video,
+            {"title": "Title"},
+            session_url="https://upload.youtube.com/existing_session",
+            on_session=lambda _: None,
+        )
+        self.assertEqual(vid, "vid_zero_resumed")
+        self.assertEqual(recorded_ranges[1], f"bytes 0-{total_size - 1}/{total_size}")
+
+    # 5. 200 on status query returns the id without uploading
+    @patch("urllib.request.urlopen")
+    def test_200_on_status_query_returns_id_without_uploading(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"D" * 5000)
+
+        call_count = 0
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            nonlocal call_count
+            call_count += 1
+            self.assertEqual(req.headers.get("Content-range"), "bytes */5000")
+            return MockResponse(200, {}, json.dumps({"id": "already_uploaded_id"}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        vid = youtube.upload(
+            dummy_video,
+            {"title": "Title"},
+            session_url="https://upload.youtube.com/done_session",
+            on_session=lambda _: None,
+        )
+        self.assertEqual(vid, "already_uploaded_id")
+        self.assertEqual(call_count, 1)
+
+    # 6. token refresh when expired
+    @patch("urllib.request.urlopen")
+    def test_token_refresh_when_expired(self, mock_urlopen: MagicMock) -> None:
+        expired_token_data = {
+            "refresh_token": "refresh_123",
+            "access_token": "old_expired_token",
+            "expires_at": int(time.time()) - 100,
+        }
+        config.write_secret("youtube_token.json", json.dumps(expired_token_data))
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            data = urllib.parse.parse_qs(req.data.decode("utf-8"))
+            self.assertEqual(data["grant_type"][0], "refresh_token")
+            self.assertEqual(data["refresh_token"][0], "refresh_123")
+            self.assertEqual(data["client_id"][0], "mock_client_id.apps.googleusercontent.com")
+            return MockResponse(
+                200,
+                {},
+                json.dumps({
+                    "access_token": "fresh_access_token_999",
+                    "expires_in": 3600,
+                }).encode("utf-8"),
+            )
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        tok = youtube.access_token()
+        self.assertEqual(tok, "fresh_access_token_999")
+
+        saved = json.loads(config.read_secret("youtube_token.json"))
+        self.assertEqual(saved["access_token"], "fresh_access_token_999")
+        self.assertGreater(saved["expires_at"], time.time() + 3500)
+
+    # Test token not refreshed when valid (> 60s)
+    @patch("urllib.request.urlopen")
+    def test_token_not_refreshed_when_valid(self, mock_urlopen: MagicMock) -> None:
+        valid_token_data = {
+            "refresh_token": "refresh_123",
+            "access_token": "valid_token_abc",
+            "expires_at": int(time.time()) + 1800,
+        }
+        config.write_secret("youtube_token.json", json.dumps(valid_token_data))
+
+        tok = youtube.access_token()
+        self.assertEqual(tok, "valid_token_abc")
+        mock_urlopen.assert_not_called()
+
+    # 7. thumbnail forbidden message
+    @patch("urllib.request.urlopen")
+    def test_thumbnail_forbidden_message(self, mock_urlopen: MagicMock) -> None:
+        dummy_jpeg = self.config_dir / "thumb.jpg"
+        dummy_jpeg.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+        err_body = json.dumps({
+            "error": {
+                "code": 403,
+                "message": "The caller does not have permission",
+                "errors": [
+                    {
+                        "message": "The caller does not have permission",
+                        "domain": "youtube.thumbnail",
+                        "reason": "forbidden",
+                    }
+                ],
+            }
+        }).encode("utf-8")
+        mock_urlopen.side_effect = _make_http_error(403, "Forbidden", err_body)
+
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.set_thumbnail("vid_123", dummy_jpeg)
+
+        self.assertEqual(
+            str(ctx.exception),
+            "custom thumbnails need a phone-verified channel: https://www.youtube.com/verify",
+        )
+
+    # 8. thumbnail success
+    @patch("urllib.request.urlopen")
+    def test_thumbnail_success(self, mock_urlopen: MagicMock) -> None:
+        dummy_jpeg = self.config_dir / "thumb.jpg"
+        dummy_jpeg.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 50)
+
+        recorded_reqs: list[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            recorded_reqs.append(req)
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        youtube.set_thumbnail("video_abc", dummy_jpeg)
+
+        self.assertEqual(len(recorded_reqs), 1)
+        req = recorded_reqs[0]
+        self.assertIn("videoId=video_abc", req.full_url)
+        self.assertEqual(req.headers.get("Content-type"), "image/jpeg")
+        self.assertEqual(req.headers.get("Authorization"), "Bearer mock_access_token")
+
+    # Thumbnail 401 retry
+    @patch("urllib.request.urlopen")
+    def test_thumbnail_401_retry(self, mock_urlopen: MagicMock) -> None:
+        dummy_jpeg = self.config_dir / "thumb.jpg"
+        dummy_jpeg.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 50)
+
+        calls = 0
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            nonlocal calls
+            calls += 1
+            if "thumbnails/set" in req.full_url:
+                if calls == 1:
+                    raise _make_http_error(401, "Unauthorized", b"")
+                return MockResponse(200, {}, b"{}")
+            if "oauth2.googleapis.com/token" in req.full_url:
+                return MockResponse(
+                    200,
+                    {},
+                    json.dumps({"access_token": "thumb_new_tok", "expires_in": 3600}).encode("utf-8"),
+                )
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        youtube.set_thumbnail("video_abc", dummy_jpeg)
+        self.assertEqual(calls, 3)
+
+    # 9. 401 retry in upload and thumbnail
+    @patch("urllib.request.urlopen")
+    def test_401_retry_in_upload_init(self, mock_urlopen: MagicMock) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"E" * 100)
+
+        attempts = 0
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            nonlocal attempts
+            attempts += 1
+            if "uploadType=resumable" in req.full_url:
+                if attempts == 1:
+                    raise _make_http_error(401, "Unauthorized", b"")
+                return MockResponse(
+                    200,
+                    {"Location": "https://upload.youtube.com/session_401_recovered"},
+                    b"",
+                )
+            if "oauth2.googleapis.com/token" in req.full_url:
+                return MockResponse(
+                    200,
+                    {},
+                    json.dumps({
+                        "access_token": "new_refreshed_tok",
+                        "expires_in": 3600,
+                    }).encode("utf-8"),
+                )
+            if "session_401_recovered" in req.full_url:
+                return MockResponse(200, {}, json.dumps({"id": "rec_vid"}).encode("utf-8"))
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        vid = youtube.upload(dummy_video, {"title": "Title"}, None, lambda _: None)
+        self.assertEqual(vid, "rec_vid")
+        self.assertEqual(attempts, 4)
+
+    # 10. 5xx retry with backoff and status query recovery
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_upload_5xx_retry_recovers(
+        self, mock_urlopen: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"F" * 500)
+
+        step = 0
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            nonlocal step
+            step += 1
+            if step == 1:
+                raise _make_http_error(503, "Service Unavailable", b"Backend error")
+            if step == 2:
+                raise _make_http_error(
+                    308, "Resume Incomplete", b"", {"Range": "bytes=0-99"}
+                )
+            if step == 3:
+                return MockResponse(200, {}, json.dumps({"id": "vid_5xx_ok"}).encode("utf-8"))
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        vid = youtube.upload(
+            dummy_video,
+            {"title": "Title"},
+            session_url="https://upload.youtube.com/retry_session",
+            on_session=lambda _: None,
+        )
+        self.assertEqual(vid, "vid_5xx_ok")
+        mock_sleep.assert_called_once()
+
+    # 11. 404/410 on session creates a new session
+    @patch("urllib.request.urlopen")
+    def test_404_session_expired_restarts_session(self, mock_urlopen: MagicMock) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"G" * 300)
+
+        sessions: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            if "expired_session" in req.full_url:
+                raise _make_http_error(404, "Not Found", b"Session expired")
+            if "uploadType=resumable" in req.full_url:
+                return MockResponse(
+                    200,
+                    {"Location": "https://upload.youtube.com/new_fresh_session"},
+                    b"",
+                )
+            if "new_fresh_session" in req.full_url:
+                return MockResponse(200, {}, json.dumps({"id": "vid_fresh"}).encode("utf-8"))
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        vid = youtube.upload(
+            dummy_video,
+            {"title": "Title"},
+            session_url="https://upload.youtube.com/expired_session",
+            on_session=sessions.append,
+        )
+        self.assertEqual(vid, "vid_fresh")
+        self.assertIn("https://upload.youtube.com/new_fresh_session", sessions)
+
+    # 12. OAuth auth() loopback flow and PKCE
+    @patch("http.server.HTTPServer")
+    @patch("builtins.print")
+    @patch("webbrowser.open")
+    @patch("urllib.request.urlopen")
+    def test_auth_loopback_flow(
+        self,
+        mock_urlopen: MagicMock,
+        mock_browser: MagicMock,
+        mock_print: MagicMock,
+        mock_http_server: MagicMock,
+    ) -> None:
+        captured_html: list[bytes] = []
+
+        def fake_server_init(addr: tuple[str, int], handler_cls: type) -> MagicMock:
+            server = MagicMock()
+            server.server_port = 8080
+
+            def handle_request() -> None:
+                auth_url = mock_browser.call_args[0][0]
+                state = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)["state"][0]
+                handler = handler_cls.__new__(handler_cls)
+                handler.path = f"/?state={state}&code=test_auth_code_123"
+                handler.wfile = io.BytesIO()
+                handler.send_response = MagicMock()
+                handler.send_header = MagicMock()
+                handler.end_headers = MagicMock()
+                handler.do_GET()
+                captured_html.append(handler.wfile.getvalue())
+
+            server.handle_request = handle_request
+            return server
+
+        mock_http_server.side_effect = fake_server_init
+
+        def fake_token_exchange(req: urllib.request.Request) -> MockResponse:
+            data = urllib.parse.parse_qs(req.data.decode("utf-8"))
+            self.assertEqual(data["code"][0], "test_auth_code_123")
+            self.assertEqual(data["grant_type"][0], "authorization_code")
+            self.assertIn("code_verifier", data)
+            return MockResponse(
+                200,
+                {},
+                json.dumps({
+                    "refresh_token": "brand_new_refresh_tok",
+                    "access_token": "brand_new_access_tok",
+                    "expires_in": 3600,
+                }).encode("utf-8"),
+            )
+
+        mock_urlopen.side_effect = fake_token_exchange
+
+        youtube.auth()
+
+        self.assertIn(b"k2y: you can close this tab", captured_html[0])
+        saved = json.loads(config.read_secret("youtube_token.json"))
+        self.assertEqual(saved["refresh_token"], "brand_new_refresh_tok")
+        self.assertEqual(saved["access_token"], "brand_new_access_tok")
+
+    # 13. OAuth auth() fails if no refresh token
+    @patch("http.server.HTTPServer")
+    @patch("builtins.print")
+    @patch("webbrowser.open")
+    @patch("urllib.request.urlopen")
+    def test_auth_missing_refresh_token_raises_youtube_error(
+        self,
+        mock_urlopen: MagicMock,
+        mock_browser: MagicMock,
+        mock_print: MagicMock,
+        mock_http_server: MagicMock,
+    ) -> None:
+        def fake_server_init(addr: tuple[str, int], handler_cls: type) -> MagicMock:
+            server = MagicMock()
+            server.server_port = 8080
+
+            def handle_request() -> None:
+                auth_url = mock_browser.call_args[0][0]
+                state = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)["state"][0]
+                handler = handler_cls.__new__(handler_cls)
+                handler.path = f"/?state={state}&code=code_no_refresh"
+                handler.wfile = io.BytesIO()
+                handler.send_response = MagicMock()
+                handler.send_header = MagicMock()
+                handler.end_headers = MagicMock()
+                handler.do_GET()
+
+            server.handle_request = handle_request
+            return server
+
+        mock_http_server.side_effect = fake_server_init
+
+        mock_urlopen.return_value = MockResponse(
+            200,
+            {},
+            json.dumps({"access_token": "acc_only", "expires_in": 3600}).encode("utf-8"),
+        )
+
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.auth()
+
+        self.assertIn("refresh_token", str(ctx.exception))
+
+    # 14. OAuth auth() fails on state mismatch
+    @patch("http.server.HTTPServer")
+    @patch("builtins.print")
+    @patch("webbrowser.open")
+    @patch("urllib.request.urlopen")
+    def test_auth_state_mismatch_raises_youtube_error(
+        self,
+        mock_urlopen: MagicMock,
+        mock_browser: MagicMock,
+        mock_print: MagicMock,
+        mock_http_server: MagicMock,
+    ) -> None:
+        def fake_server_init(addr: tuple[str, int], handler_cls: type) -> MagicMock:
+            server = MagicMock()
+            server.server_port = 8080
+
+            def handle_request() -> None:
+                handler = handler_cls.__new__(handler_cls)
+                handler.path = "/?state=wrong_state&code=test_code"
+                handler.wfile = io.BytesIO()
+                handler.send_response = MagicMock()
+                handler.send_header = MagicMock()
+                handler.end_headers = MagicMock()
+                handler.do_GET()
+
+            server.handle_request = handle_request
+            return server
+
+        mock_http_server.side_effect = fake_server_init
+
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.auth()
+
+        self.assertIn("state mismatch", str(ctx.exception))
+
+    # 15. Truncation of title and description per spec
+    @patch("urllib.request.urlopen")
+    def test_metadata_truncation(self, mock_urlopen: MagicMock) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"H" * 100)
+
+        recorded_reqs: list[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            recorded_reqs.append(req)
+            if "uploadType=resumable" in req.full_url:
+                return MockResponse(200, {"Location": "https://upload.youtube.com/sess_trunc"}, b"")
+            return MockResponse(200, {}, json.dumps({"id": "trunc_id"}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        long_title = "T" * 150
+        long_desc = "D" * 6000
+        vid = youtube.upload(
+            dummy_video,
+            {"title": long_title, "description": long_desc},
+            None,
+            lambda _: None,
+        )
+        self.assertEqual(vid, "trunc_id")
+        init_data = json.loads(recorded_reqs[0].data.decode("utf-8"))
+        self.assertEqual(len(init_data["snippet"]["title"]), 100)
+        self.assertEqual(len(init_data["snippet"]["description"]), 5000)
+
+    # 16. Multi-chunk upload (e.g. 18 MiB = two 8 MiB chunks + one 2 MiB chunk)
+    @patch("urllib.request.urlopen")
+    def test_multi_chunk_upload(self, mock_urlopen: MagicMock) -> None:
+        total_size = 18 * 1024 * 1024  # 18 MiB
+        dummy_video = self.config_dir / "18mb.mp4"
+        dummy_video.write_bytes(b"M" * total_size)
+
+        uploaded_ranges: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request) -> MockResponse:
+            if "uploadType=resumable" in req.full_url:
+                return MockResponse(200, {"Location": "https://upload.youtube.com/sess_multi"}, b"")
+            content_range = req.headers.get("Content-range")
+            uploaded_ranges.append(str(content_range))
+            if content_range == f"bytes 0-{8 * 1024 * 1024 - 1}/{total_size}":
+                raise _make_http_error(
+                    308, "Resume Incomplete", b"", {"Range": f"bytes=0-{8 * 1024 * 1024 - 1}"}
+                )
+            if content_range == f"bytes {8 * 1024 * 1024}-{16 * 1024 * 1024 - 1}/{total_size}":
+                raise _make_http_error(
+                    308, "Resume Incomplete", b"", {"Range": f"bytes=0-{16 * 1024 * 1024 - 1}"}
+                )
+            # Final 2 MiB chunk returns 200 with video id
+            return MockResponse(200, {}, json.dumps({"id": "multi_chunk_vid"}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        vid = youtube.upload(
+            dummy_video,
+            {"title": "18MB video"},
+            session_url=None,
+            on_session=lambda _: None,
+        )
+        self.assertEqual(vid, "multi_chunk_vid")
+        self.assertEqual(len(uploaded_ranges), 3)
+        self.assertEqual(uploaded_ranges[0], f"bytes 0-{8 * 1024 * 1024 - 1}/{total_size}")
+        self.assertEqual(
+            uploaded_ranges[1],
+            f"bytes {8 * 1024 * 1024}-{16 * 1024 * 1024 - 1}/{total_size}",
+        )
+        self.assertEqual(
+            uploaded_ranges[2],
+            f"bytes {16 * 1024 * 1024}-{total_size - 1}/{total_size}",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
