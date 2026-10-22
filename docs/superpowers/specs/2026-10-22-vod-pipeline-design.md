@@ -220,10 +220,12 @@ token. Refresh the access token before each run. Print the URL too, for headless
   (only the branch for the current OS is imported). The OS releases it when the process dies
   (crash, kill, power loss), so there is no staleness logic, no PID check and no steal.
   Every command that writes state (`run`, `plan`, `retry`, `skip`, `backfill`) takes it.
-- **ffmpeg filter paths:** on Windows, drawtext `fontfile`/`textfile` paths must use forward
-  slashes and escape the drive colon (`C\:/Windows/Fonts/arialbd.ttf`). Font: DejaVu Sans
-  Bold on Linux, Arial Bold (`arialbd.ttf`) on Windows, first one that exists.
-- **Logging:** stdlib `logging` to stderr and to `work_dir/k2y.log` (rotating, 5 MB x 3).
+- **ffmpeg filter paths:** no user-controlled path goes into a filter string. The thumbnail
+  ffmpeg runs with `cwd` = the thumbnail's folder and `textfile=<ascii name>.txt` relative.
+  The font path is a fixed ASCII system path; escape it for filter syntax (forward slashes,
+  drive colon escaped) and prove it with a real ffmpeg run on a path containing `C:`.
+  Font: DejaVu Sans Bold on Linux, Arial Bold (`arialbd.ttf`) on Windows, first one that exists.
+- **Logging:** stdlib `logging` to stderr (only when it is a TTY) and to `work_dir/k2y.log` (rotating, 5 MB x 3).
 - **Headless OAuth:** `k2y auth --paste` prints the consent URL (redirect
   `http://127.0.0.1:8765`), the user approves in any browser, the browser fails to load the
   redirect, and the user pastes that full URL back; the CLI checks `state` and exchanges the
