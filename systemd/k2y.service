@@ -1,0 +1,9 @@
+[Unit]
+Description=k2y Kick to YouTube
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+ExecStart=/usr/bin/python3 -m k2y run
+Nice=10
+TimeoutStartSec=6h
