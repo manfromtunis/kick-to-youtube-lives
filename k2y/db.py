@@ -79,11 +79,26 @@ def pending_vods(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def set_state(conn: sqlite3.Connection, vod_id: int, state: str, error: str | None = None) -> None:
-    """Update state, error, and updated_at for a VOD."""
+    """Update state, error, and updated_at for a VOD. Resets attempts when error is None."""
+    with conn:
+        if error is None:
+            conn.execute(
+                "UPDATE vods SET state = ?, error = NULL, attempts = 0, updated_at = ? WHERE id = ?",
+                (state, _now_iso(), vod_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE vods SET state = ?, error = ?, updated_at = ? WHERE id = ?",
+                (state, error, _now_iso(), vod_id),
+            )
+
+
+def set_duration(conn: sqlite3.Connection, vod_id: int, duration_s: int) -> None:
+    """Update duration_s for a VOD."""
     with conn:
         conn.execute(
-            "UPDATE vods SET state = ?, error = ?, updated_at = ? WHERE id = ?",
-            (state, error, _now_iso(), vod_id),
+            "UPDATE vods SET duration_s = ?, updated_at = ? WHERE id = ?",
+            (duration_s, _now_iso(), vod_id),
         )
 
 
@@ -160,6 +175,15 @@ def clear_pending_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
     with conn:
         conn.execute(
             "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL",
+            (vod_id,),
+        )
+
+
+def delete_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
+    """Delete all uploads for vod_id."""
+    with conn:
+        conn.execute(
+            "DELETE FROM uploads WHERE vod_id = ?",
             (vod_id,),
         )
 

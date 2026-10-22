@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import sys
 import tempfile
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-from k2y import cli, config, db
+from k2y import cli, config, db, segment, youtube
 
 
 class TestCLI(unittest.TestCase):
@@ -22,6 +22,12 @@ class TestCLI(unittest.TestCase):
         self.work_dir = Path(self.tmp.name) / "work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
+        class FakeAuthRequired(Exception):
+            pass
+
+        self.auth_req_patcher = patch.object(youtube, "AuthRequired", FakeAuthRequired, create=True)
+        self.auth_req_patcher.start()
+
         self.orig_config_dir = config.CONFIG_DIR
         config.CONFIG_DIR = self.config_dir
 
@@ -31,13 +37,14 @@ class TestCLI(unittest.TestCase):
             "channel": "randomguy42",
             "work_dir": str(self.work_dir),
             "since": "2026-10-22",
-        }))
+        }), encoding="utf-8")
 
         self.cfg = config.load()
         self.conn = db.connect(self.cfg.db_path)
 
     def tearDown(self):
         config.CONFIG_DIR = self.orig_config_dir
+        self.auth_req_patcher.stop()
         self.conn.close()
         self.tmp.cleanup()
 
@@ -55,7 +62,6 @@ class TestCLI(unittest.TestCase):
         db.upsert_upload(self.conn, 601, 0, "Full VOD", 0, 3600)
         db.update_upload(self.conn, 601, 0, youtube_id="yt_601")
         db.upsert_upload(self.conn, 601, 1, "Part 1", 0, 1800)
-        # 1 out of 2 uploads done
 
         stdout = io.StringIO()
         with patch("sys.stdout", stdout):
@@ -89,7 +95,7 @@ class TestCLI(unittest.TestCase):
             "is_live": False,
         }
         db.upsert_vod(self.conn, v1)
-        db.record_error(self.conn, 701, "Error", max_attempts=1)  # moves to failed
+        db.record_error(self.conn, 701, "Error", max_attempts=1)
         self.assertEqual(db.get_vod(self.conn, 701)["state"], "failed")
 
         with patch("sys.stdout", io.StringIO()):
@@ -141,7 +147,7 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 703)["state"], "planned")
 
-        # 4. Upload rows exist -> 'cut'
+        # 4. Upload rows exist but incomplete or missing files -> 'planned'
         v4 = {
             "id": 704,
             "title": "V4",
@@ -154,9 +160,32 @@ class TestCLI(unittest.TestCase):
         db.upsert_vod(self.conn, v4)
         v4_dir = self.cfg.vod_dir(704)
         v4_dir.mkdir(parents=True, exist_ok=True)
-        (v4_dir / "source.mp4").write_bytes(b"source")
-        db.save_plan(self.conn, 704, [{"start_s": 0, "end_s": 3600, "title": "P"}])
-        db.upsert_upload(self.conn, 704, 0, "Full VOD", 0, 3600)
+        src4 = v4_dir / "source.mp4"
+        src4.write_bytes(b"source")
+        plan4 = [{"start_s": 0, "end_s": 1800, "title": "P1"}, {"start_s": 1800, "end_s": 3600, "title": "P2"}]
+        db.save_plan(self.conn, 704, plan4)  # expected 3 rows
+        db.upsert_upload(self.conn, 704, 0, "Full VOD", 0, 3600, file=src4)
+        db.record_error(self.conn, 704, "Error", max_attempts=1)
+
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "704"])
+        self.assertEqual(ret, 0)
+        self.assertEqual(db.get_vod(self.conn, 704)["state"], "planned")
+
+        # 5. All expected rows exist with all files -> 'cut'
+        p1 = v4_dir / "part_1.mp4"
+        p1.write_bytes(b"p1")
+        p2 = v4_dir / "part_2.mp4"
+        p2.write_bytes(b"p2")
+        t0 = v4_dir / "thumb_0.jpg"
+        t0.write_bytes(b"t0")
+        t1 = v4_dir / "thumb_1.jpg"
+        t1.write_bytes(b"t1")
+        t2 = v4_dir / "thumb_2.jpg"
+        t2.write_bytes(b"t2")
+        db.upsert_upload(self.conn, 704, 0, "Full VOD", 0, 3600, file=src4, thumb=t0)
+        db.upsert_upload(self.conn, 704, 1, "P1", 0, 1800, file=p1, thumb=t1)
+        db.upsert_upload(self.conn, 704, 2, "P2", 1800, 3600, file=p2, thumb=t2)
         db.record_error(self.conn, 704, "Error", max_attempts=1)
 
         with patch("sys.stdout", io.StringIO()):
@@ -164,7 +193,7 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 704)["state"], "cut")
 
-    def test_skip_command(self):
+    def test_skip_command_cleans_up_vod_folder(self):
         vod = {
             "id": 801,
             "title": "Stream Skip",
@@ -175,11 +204,38 @@ class TestCLI(unittest.TestCase):
             "is_live": False,
         }
         db.upsert_vod(self.conn, vod)
+        v_dir = self.cfg.vod_dir(801)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "temp.txt").write_text("temporary")
 
         with patch("sys.stdout", io.StringIO()):
             ret = cli.main(["skip", "801"])
         self.assertEqual(ret, 0)
         self.assertEqual(db.get_vod(self.conn, 801)["state"], "skipped")
+        self.assertFalse(v_dir.exists())
+
+    def test_skip_logs_warning_on_rmtree_failure(self):
+        vod = {
+            "id": 802,
+            "title": "Stream Skip Fail",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/802",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        v_dir = self.cfg.vod_dir(802)
+        v_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch("shutil.rmtree", side_effect=OSError("locked folder")), \
+             self.assertLogs("k2y", level="WARNING") as cm, \
+             patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["skip", "802"])
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(db.get_vod(self.conn, 802)["state"], "skipped")
+        self.assertTrue(any("Failed to remove VOD directory" in msg for msg in cm.output))
 
     def test_backfill_command(self):
         old_vod = {
@@ -192,15 +248,89 @@ class TestCLI(unittest.TestCase):
             "is_live": False,
         }
 
-        with patch("k2y.kick.list_vods", return_value=[old_vod]), patch("sys.stdout", io.StringIO()):
+        # First backfill: newly inserted
+        stdout1 = io.StringIO()
+        with patch("k2y.kick.list_vods", return_value=[old_vod]), patch("sys.stdout", stdout1):
             ret = cli.main(["backfill", "901"])
 
         self.assertEqual(ret, 0)
-        row = db.get_vod(self.conn, 901)
-        self.assertIsNotNone(row)
-        self.assertEqual(row["title"], "Old Stream Backfill")
+        self.assertIn("Backfilled VOD 901: Old Stream Backfill", stdout1.getvalue())
 
-    def test_plan_command_clears_unuploaded_rows(self):
+        # Second backfill: already known
+        stdout2 = io.StringIO()
+        with patch("k2y.kick.list_vods", return_value=[old_vod]), patch("sys.stdout", stdout2):
+            ret = cli.main(["backfill", "901"])
+
+        self.assertEqual(ret, 0)
+        self.assertIn("already known", stdout2.getvalue())
+
+    def test_lock_held_prints_message_and_exits_1(self):
+        lock_path = self.work_dir / "k2y.lock"
+        # Hold lock with current PID
+        lock_path.write_text(f"{os.getpid()} {int(1e9)}\n")
+
+        for cmd in ["plan", "retry", "skip", "backfill"]:
+            stderr = io.StringIO()
+            with patch("sys.stderr", stderr):
+                ret = cli.main([cmd, "123"])
+            self.assertEqual(ret, 1)
+            self.assertIn("a run is in progress, try again later", stderr.getvalue())
+
+    def test_plan_command_refuses_when_done_or_skipped(self):
+        v_done = {
+            "id": 910,
+            "title": "Done VOD",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/910",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, v_done)
+        db.set_state(self.conn, 910, "done")
+
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["plan", "910"])
+        self.assertEqual(ret, 1)
+        self.assertIn("Cannot re-plan VOD 910", stderr.getvalue())
+
+        db.set_state(self.conn, 910, "skipped")
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["plan", "910"])
+        self.assertEqual(ret, 1)
+        self.assertIn("Cannot re-plan VOD 910", stderr.getvalue())
+
+    def test_plan_command_refuses_when_uploads_have_youtube_id_or_session(self):
+        v = {
+            "id": 920,
+            "title": "Uploaded VOD",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/920",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, v)
+        db.upsert_upload(self.conn, 920, 0, "Full VOD", 0, 3600)
+        db.update_upload(self.conn, 920, 0, youtube_id="yt_already")
+
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["plan", "920"])
+        self.assertEqual(ret, 1)
+        self.assertIn("Cannot re-plan VOD 920", stderr.getvalue())
+
+        # Test upload_session
+        db.update_upload(self.conn, 920, 0, youtube_id=None, upload_session="http://session")
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["plan", "920"])
+        self.assertEqual(ret, 1)
+        self.assertIn("Cannot re-plan VOD 920", stderr.getvalue())
+
+    def test_plan_command_saves_before_printing_and_deletes_all_upload_rows(self):
         vod_id = 950
         vod = {
             "id": vod_id,
@@ -216,22 +346,18 @@ class TestCLI(unittest.TestCase):
         vod_dir.mkdir(parents=True, exist_ok=True)
         (vod_dir / "source.mp4").write_bytes(b"source data")
 
-        # Row 0 has youtube_id; row 1 does not
-        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600)
-        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_keep_0")
-        db.upsert_upload(self.conn, vod_id, 1, "Old Part", 0, 1800)
+        # Existing upload rows without youtube_id or session
+        db.upsert_upload(self.conn, vod_id, 0, "Old Row 0", 0, 3600)
+        db.upsert_upload(self.conn, vod_id, 1, "Old Row 1", 0, 1800)
+        self.assertEqual(len(db.uploads(self.conn, vod_id)), 2)
 
-        fake_segment = types.ModuleType("k2y.segment")
-        plan_result = [\
+        plan_result = [
             {"start_s": 0, "end_s": 1800, "title": "New Part 1", "description": "D1", "key_moments": []},
             {"start_s": 1800, "end_s": 3600, "title": "New Part 2", "description": "D2", "key_moments": []},
         ]
-        fake_segment.plan = MagicMock(return_value=plan_result)
 
         stdout = io.StringIO()
-        with patch.object(sys.modules.get("k2y"), "segment", fake_segment, create=True), \
-             patch.dict(sys.modules, {"k2y.segment": fake_segment}), \
-             patch("sys.stdout", stdout):
+        with patch("k2y.segment.plan", return_value=plan_result), patch("sys.stdout", stdout):
             ret = cli.main(["plan", str(vod_id)])
 
         self.assertEqual(ret, 0)
@@ -244,11 +370,9 @@ class TestCLI(unittest.TestCase):
         saved_plan = json.loads(row["plan_json"])
         self.assertEqual(len(saved_plan), 2)
 
-        # Verify row 0 kept and row 1 deleted
+        # Verify all previous upload rows were deleted on re-plan
         ups = db.uploads(self.conn, vod_id)
-        self.assertEqual(len(ups), 1)
-        self.assertEqual(ups[0]["idx"], 0)
-        self.assertEqual(ups[0]["youtube_id"], "yt_keep_0")
+        self.assertEqual(len(ups), 0)
 
     def test_install_timer_windows(self):
         stdout = io.StringIO()
@@ -263,9 +387,10 @@ class TestCLI(unittest.TestCase):
         cmd_file = self.work_dir / "k2y-run.cmd"
         self.assertTrue(cmd_file.exists())
         content = cmd_file.read_text(encoding="utf-8")
+        self.assertTrue(content.startswith("@echo off\n"))
         self.assertIn('cd /d "', content)
-        self.assertIn(f'"{sys.executable}" -m k2y run >> "', content)
-        self.assertIn('k2y.log" 2>&1', content)
+        self.assertIn('-m k2y run >> "', content)
+        self.assertIn('k2y-task.log" 2>&1', content)
 
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
@@ -273,6 +398,9 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(args[1], "/Create")
         self.assertIn("/TN", args)
         self.assertIn("k2y", args)
+        self.assertIn("/TR", args)
+        tr_index = args.index("/TR")
+        self.assertEqual(args[tr_index + 1], '"' + str(cmd_file) + '"')
 
         out_text = stdout.getvalue()
         self.assertIn("schtasks /Query /TN k2y", out_text)
@@ -295,14 +423,13 @@ class TestCLI(unittest.TestCase):
         out_text = stdout.getvalue()
         self.assertTrue(out_text.strip().startswith("*/10 * * * * cd "))
         self.assertIn("-m k2y run >> ", out_text)
-        self.assertIn("k2y.log 2>&1", out_text)
+        self.assertIn("k2y-task.log 2>&1", out_text)
 
     def test_auth_paste_command(self):
         with patch("k2y.youtube.auth") as mock_auth, patch("sys.stdout", io.StringIO()):
             ret = cli.main(["auth", "--paste"])
         self.assertEqual(ret, 0)
         mock_auth.assert_called_once_with(paste=True)
-
 
     def test_missing_secret_exits_1_and_prints_to_stderr(self):
         stderr = io.StringIO()
@@ -314,8 +441,10 @@ class TestCLI(unittest.TestCase):
         self.assertIn("missing secret client_secret.json", stderr.getvalue())
 
     def test_exit_codes(self):
-        # 2 on bad usage / missing command
         with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
             self.assertEqual(cli.main([]), 2)
-            # 1 on not found VOD
             self.assertEqual(cli.main(["retry", "9999"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

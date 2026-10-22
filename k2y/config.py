@@ -1,10 +1,13 @@
-from datetime import datetime, timezone
 """Paths, user config and secrets. Every other module reads settings from here only."""
+from __future__ import annotations
+
 import dataclasses
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+
 
 class MissingSecret(RuntimeError):
     pass
@@ -36,7 +39,7 @@ def ensure_since(cfg: Config) -> Config:
     raw = {}
     if p.exists():
         try:
-            raw = json.loads(p.read_text())
+            raw = json.loads(p.read_text(encoding="utf-8-sig"))
         except Exception:
             raw = {}
     stored_since = raw.get("since")
@@ -45,13 +48,13 @@ def ensure_since(cfg: Config) -> Config:
     today = datetime.now(timezone.utc).date().isoformat()
     raw["since"] = today
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(raw, indent=2))
+    p.write_text(json.dumps(raw, indent=2), encoding="utf-8")
     return dataclasses.replace(cfg, since=today)
 
 
 def load() -> Config:
     p = CONFIG_DIR / "config.json"
-    raw = json.loads(p.read_text()) if p.exists() else {}
+    raw = json.loads(p.read_text(encoding="utf-8-sig")) if p.exists() else {}
     if "work_dir" in raw:
         raw["work_dir"] = Path(raw["work_dir"]).expanduser()
     valid_fields = {f.name for f in dataclasses.fields(Config)}
@@ -68,12 +71,21 @@ def read_secret(name: str) -> str:
     p = secret_path(name)
     if not p.exists():
         raise MissingSecret(f"missing secret {p} (see docs/superpowers/specs/2026-10-22-vod-pipeline-design.md section 5)")
-    return p.read_text().strip()
+    return p.read_text(encoding="utf-8-sig").strip()
 
 
 def write_secret(name: str, text: str) -> None:
     p = secret_path(name)
     p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
+    temp_file = p.parent / f"{name}.{os.getpid()}.tmp"
+    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(temp_file, p)
+    except Exception:
+        try:
+            temp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

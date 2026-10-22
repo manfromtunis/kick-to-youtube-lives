@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 
-from . import config, db, kick, pipeline, youtube
+from . import config, db, kick, pipeline, segment, youtube
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 
@@ -26,7 +29,30 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _with_lock(cfg: config.Config, action):
+    cfg.work_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cfg.work_dir / "k2y.lock"
+    if not pipeline.acquire_lock(lock_path):
+        print("a run is in progress, try again later", file=sys.stderr)
+        return 1
+    try:
+        return action()
+    finally:
+        pipeline.release_lock(lock_path)
+
+
 def main(argv: list[str] | None = None) -> int:
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         prog="k2y",
         description="Kick to YouTube live VOD pipeline",
@@ -100,97 +126,161 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "plan":
-            conn, vod = _vod_or_err(cfg, args.vod_id)
-            if not vod:
-                return 1
+            def do_plan():
+                conn, vod = _vod_or_err(cfg, args.vod_id)
+                if not vod:
+                    return 1
 
-            source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
-            if not source_file.exists():
-                kick.download(dict(vod), source_file)
-                db.set_state(conn, args.vod_id, "downloaded")
+                if vod["state"] in ("done", "skipped"):
+                    print(f"Cannot re-plan VOD {args.vod_id}: state is {vod['state']}", file=sys.stderr)
+                    return 1
 
-            if "k2y.segment" in sys.modules:
-                segment = sys.modules["k2y.segment"]
-            else:
-                from k2y import segment
-            parts = segment.plan(
-                source_file,
-                cfg.vod_dir(args.vod_id),
-                int(vod["duration_s"]),
-                int(cfg.min_part_minutes),
-                str(cfg.model),
-            )
+                ups = db.uploads(conn, args.vod_id)
+                if any(u["youtube_id"] or u["upload_session"] for u in ups):
+                    print(f"Cannot re-plan VOD {args.vod_id}: upload in progress or completed", file=sys.stderr)
+                    return 1
 
-            print(f"{'Start':<8} {'End':<8} {'Min':<6} {'Title'}")
-            for p in parts:
-                mins = round((p["end_s"] - p["start_s"]) / 60, 1)
-                print(f"{p['start_s']:<8} {p['end_s']:<8} {mins:<6.1f} {p['title']}")
-
-            db.save_plan(conn, args.vod_id, parts)
-            db.set_state(conn, args.vod_id, "planned")
-            db.clear_pending_uploads(conn, args.vod_id)
-            return 0
-
-        elif args.command == "retry":
-            conn, vod = _vod_or_err(cfg, args.vod_id)
-            if not vod:
-                return 1
-
-            if vod["state"] == "failed":
                 source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
                 if not source_file.exists():
-                    target = "new"
-                elif not vod["plan_json"]:
-                    target = "downloaded"
-                elif len(db.uploads(conn, args.vod_id)) == 0:
-                    target = "planned"
-                else:
-                    target = "cut"
-            else:
-                target = vod["state"]
+                    kick.download(dict(vod), source_file)
+                    dur = int(kick.probe_duration(source_file))
+                    db.set_duration(conn, args.vod_id, dur)
+                    db.set_state(conn, args.vod_id, "downloaded")
+                    vod = db.get_vod(conn, args.vod_id)
 
-            db.reset(conn, args.vod_id, target)
-            return 0
+                parts = segment.plan(
+                    source_file,
+                    cfg.vod_dir(args.vod_id),
+                    int(vod["duration_s"]),
+                    int(cfg.min_part_minutes),
+                    str(cfg.model),
+                )
+
+                db.delete_uploads(conn, args.vod_id)
+                db.save_plan(conn, args.vod_id, parts)
+                db.set_state(conn, args.vod_id, "planned")
+
+                print(f"{'Start':<8} {'End':<8} {'Min':<6} {'Title'}")
+                for p in parts:
+                    mins = round((p["end_s"] - p["start_s"]) / 60, 1)
+                    print(f"{p['start_s']:<8} {p['end_s']:<8} {mins:<6.1f} {p['title']}")
+
+                return 0
+
+            return _with_lock(cfg, do_plan)
+
+        elif args.command == "retry":
+            def do_retry():
+                conn, vod = _vod_or_err(cfg, args.vod_id)
+                if not vod:
+                    return 1
+
+                if vod["state"] == "failed":
+                    source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
+                    if not source_file.exists():
+                        target = "new"
+                    elif not vod["plan_json"]:
+                        target = "downloaded"
+                    else:
+                        plan = json.loads(vod["plan_json"])
+                        expected = pipeline.expected_upload_count(plan)
+                        ups = db.uploads(conn, args.vod_id)
+                        indices = {u["idx"] for u in ups}
+                        all_files_exist = (
+                            indices == set(range(expected))
+                            and all(
+                                u["file"] and Path(u["file"]).exists()
+                                and (not u["thumb"] or Path(u["thumb"]).exists())
+                                for u in ups
+                            )
+                        )
+                        if all_files_exist:
+                            target = "cut"
+                        else:
+                            target = "planned"
+                else:
+                    target = vod["state"]
+
+                db.reset(conn, args.vod_id, target)
+                return 0
+
+            return _with_lock(cfg, do_retry)
 
         elif args.command == "skip":
-            conn, vod = _vod_or_err(cfg, args.vod_id)
-            if not vod:
-                return 1
-            db.set_state(conn, args.vod_id, "skipped")
-            return 0
+            def do_skip():
+                conn, vod = _vod_or_err(cfg, args.vod_id)
+                if not vod:
+                    return 1
+                vod_dir = cfg.vod_dir(args.vod_id)
+                if vod_dir.exists():
+                    try:
+                        shutil.rmtree(vod_dir)
+                    except Exception as e:
+                        logging.getLogger("k2y").warning(f"Failed to remove VOD directory {vod_dir}: {e}")
+                db.set_state(conn, args.vod_id, "skipped")
+                return 0
+
+            return _with_lock(cfg, do_skip)
 
         elif args.command == "backfill":
-            conn = db.connect(cfg.db_path)
-            vods = kick.list_vods(cfg.channel)
-            match = next((v for v in vods if v["id"] == args.vod_id), None)
-            if not match:
-                print(f"VOD {args.vod_id} not found in channel {cfg.channel}", file=sys.stderr)
-                return 1
-            db.upsert_vod(conn, match)
-            print(f"Backfilled VOD {args.vod_id}: {match['title']}")
-            return 0
+            def do_backfill():
+                conn = db.connect(cfg.db_path)
+                vods = kick.list_vods(cfg.channel)
+                match = next((v for v in vods if v["id"] == args.vod_id), None)
+                if not match:
+                    print(f"VOD {args.vod_id} not found in channel {cfg.channel}", file=sys.stderr)
+                    return 1
+                inserted = db.upsert_vod(conn, match)
+                if inserted:
+                    print(f"Backfilled VOD {args.vod_id}: {match['title']}")
+                else:
+                    print("already known")
+                return 0
+
+            return _with_lock(cfg, do_backfill)
 
         elif args.command == "auth":
             youtube.auth(paste=args.paste)
             return 0
 
         elif args.command == "install-timer":
-            python_exe = sys.executable
-            log_path = cfg.work_dir / "k2y.log"
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            python_exe = str(pythonw) if pythonw.exists() else sys.executable
+            task_log = cfg.work_dir / "k2y-task.log"
             if _is_windows():
                 cfg.work_dir.mkdir(parents=True, exist_ok=True)
                 cmd_path = cfg.work_dir / "k2y-run.cmd"
-                cmd_content = f'cd /d "{REPO_DIR}"\n"{python_exe}" -m k2y run >> "{log_path}" 2>&1\n'
-                cmd_path.write_text(cmd_content, encoding="utf-8")
+                cmd_content = (
+                    f"@echo off\n"
+                    f'cd /d "{REPO_DIR}"\n'
+                    f'"{python_exe}" -m k2y run >> "{task_log}" 2>&1\n'
+                )
+                cmd_encoding = "mbcs" if sys.platform == "win32" else "utf-8"
+                cmd_path.write_text(cmd_content, encoding=cmd_encoding)
                 subprocess.run(
-                    ["schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", "10", "/TN", "k2y", "/TR", str(cmd_path)],
+                    [
+                        "schtasks",
+                        "/Create",
+                        "/F",
+                        "/SC",
+                        "MINUTE",
+                        "/MO",
+                        "10",
+                        "/TN",
+                        "k2y",
+                        "/TR",
+                        '"' + str(cmd_path) + '"',
+                    ],
                     check=True,
                 )
                 print("Task 'k2y' scheduled successfully.")
                 print("To check: schtasks /Query /TN k2y")
                 print("To remove: schtasks /Delete /TN k2y /F")
             else:
-                print(f"*/10 * * * * cd {REPO_DIR} && {python_exe} -m k2y run >> {log_path} 2>&1")
+                repo_q = shlex.quote(str(REPO_DIR))
+                py_q = shlex.quote(sys.executable)
+                log_q = shlex.quote(str(task_log))
+                print(f"*/10 * * * * cd {repo_q} && {py_q} -m k2y run >> {log_q} 2>&1")
             return 0
 
     except config.MissingSecret as e:

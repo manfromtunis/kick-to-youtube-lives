@@ -6,15 +6,17 @@ Kick livestream VODs to YouTube, automatically.
 
 ## Usage
 
+All commands (`py -m k2y ...`) must be run from the repository root folder (`kick-to-youtube-lives`).
+
 ### Windows Setup
 1. Install Python 3.12 and FFmpeg:
    ```cmd
    winget install Python.Python.3.12 Gyan.FFmpeg
    ```
-2. Clone the repository:
+2. Clone the repository and enter the clone directory:
    ```cmd
    git clone <repo-url>
-   cd k2y
+   cd kick-to-youtube-lives
    ```
 3. Put credentials in `%USERPROFILE%\.config\k2y\` (see `docs/superpowers/specs/2026-10-22-vod-pipeline-design.md` section 5):
    - `gemini.key`: Gemini API key with billing enabled.
@@ -32,20 +34,24 @@ Kick livestream VODs to YouTube, automatically.
    ```cmd
    py -m k2y install-timer
    ```
+   **Battery condition**: By default, Windows Task Scheduler only runs tasks when connected to AC power. To allow runs while on battery, open **Task Scheduler** (`taskschd.msc`), select **Task Scheduler Library > k2y**, open **Properties > Conditions**, and untick **"Start the task only if the computer is on AC power"** (and untick "Stop if the computer switches to battery power").
 6. Check pipeline status:
    ```cmd
    py -m k2y status
    ```
 
 ### Daily Use
+Run all commands from the `kick-to-youtube-lives` root directory:
 - `py -m k2y status` (or `py -m k2y status --json`): view pipeline status, state, upload progress, attempts, and errors.
 - `py -m k2y plan <vod_id>`: run download (if needed) and generate thematic segmentation parts preview without uploading.
 - `py -m k2y retry <vod_id>`: clear errors and reset failed or errored VODs to re-process.
-- `py -m k2y skip <vod_id>`: mark a VOD as skipped to ignore it.
+- `py -m k2y skip <vod_id>`: mark a VOD as skipped to ignore it (cleans up any existing work directory for that VOD).
 - `py -m k2y backfill <vod_id>`: fetch and process an older Kick VOD from before the `since` cutoff.
 
 ### Logs
-Logs are written to `%USERPROFILE%\.local\share\k2y\k2y.log` (RotatingFileHandler, 5 MB, 3 backups).
+Logs are kept in `%USERPROFILE%\.local\share\k2y\`:
+- `k2y.log`: pipeline state machine and execution logs written by Python's `RotatingFileHandler` (5 MB max, 3 backups, UTF-8).
+- `k2y-task.log`: scheduler wrapper log capturing console stdout/stderr redirects from the automated Task Scheduler runner.
 
 ### Privacy & Quotas
 - **Private-only**: All videos are uploaded strictly with `privacyStatus: private`. There is no option to publish publicly.

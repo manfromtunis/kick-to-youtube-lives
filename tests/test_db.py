@@ -84,20 +84,43 @@ class TestDB(unittest.TestCase):
         # Should exclude 1, 4, 5, and order by started_at (VOD 2 was 2026-10-18, VOD 3 was 2026-10-19)
         self.assertEqual(pending_ids, [2, 3])
 
-    def test_set_state_and_updated_at(self):
+    def test_set_state_resets_attempts_and_error(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
         db.upsert_vod(self.conn, vod)
 
-        db.set_state(self.conn, 1, "downloaded", error="temp error")
+        db.record_error(self.conn, 1, "transient error", max_attempts=3)
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["error"], "transient error")
+
+        # Step succeeds: set_state called without error clears attempts and error
+        db.set_state(self.conn, 1, "downloaded")
         row = db.get_vod(self.conn, 1)
         self.assertEqual(row["state"], "downloaded")
-        self.assertEqual(row["error"], "temp error")
-
-        # Calling set_state without error clears it
-        db.set_state(self.conn, 1, "planned")
-        row = db.get_vod(self.conn, 1)
-        self.assertEqual(row["state"], "planned")
+        self.assertEqual(row["attempts"], 0)
         self.assertIsNone(row["error"])
+
+        # When error is explicitly provided, it sets the error
+        db.set_state(self.conn, 1, "downloaded", error="explicit error")
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["error"], "explicit error")
+
+    def test_set_duration(self):
+        vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        db.upsert_vod(self.conn, vod)
+        db.set_duration(self.conn, 1, 3599)
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["duration_s"], 3599)
+
+    def test_delete_uploads(self):
+        vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        db.upsert_vod(self.conn, vod)
+        db.upsert_upload(self.conn, 1, 0, "Full VOD", 0, 100)
+        db.upsert_upload(self.conn, 1, 1, "Part 1", 0, 50)
+        self.assertEqual(len(db.uploads(self.conn, 1)), 2)
+
+        db.delete_uploads(self.conn, 1)
+        self.assertEqual(len(db.uploads(self.conn, 1)), 0)
 
     def test_record_error_increments_and_fails_at_max(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}

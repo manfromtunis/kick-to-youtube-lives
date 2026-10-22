@@ -13,7 +13,8 @@ import sys
 import time
 from typing import Callable
 
-from . import config, db, kick, media, youtube
+from . import config, db, kick, media, segment, youtube
+from .kick import probe_duration
 
 logger = logging.getLogger("k2y")
 _logging_configured = False
@@ -24,7 +25,7 @@ class StopRun(Exception):
 
 
 def setup_logging(work_dir: Path) -> None:
-    """Configure stdlib logging to stderr and a RotatingFileHandler at work_dir/k2y.log.
+    """Configure stdlib logging to stderr (if TTY) and a RotatingFileHandler at work_dir/k2y.log.
 
     5 MB max size, 3 backups, format '%(asctime)s %(levelname)s %(message)s'.
     Idempotent (configures once).
@@ -39,8 +40,13 @@ def setup_logging(work_dir: Path) -> None:
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if sys.stderr and hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        root_logger.addHandler(stderr_handler)
 
     file_handler = RotatingFileHandler(
         log_file,
@@ -49,10 +55,6 @@ def setup_logging(work_dir: Path) -> None:
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(stderr_handler)
     root_logger.addHandler(file_handler)
 
     _logging_configured = True
@@ -68,10 +70,17 @@ def _thumb_moment_for_part(part: dict) -> int:
     return int(part.get("start_s", 0)) + 60
 
 
+def expected_upload_count(plan: list) -> int:
+    """Compute expected number of upload rows from a plan."""
+    return len(plan) + 1 if len(plan) >= 2 else 1
+
+
 def step_download(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     dest = cfg.vod_dir(vod_id) / "source.mp4"
     kick.download(dict(vod), dest)
+    dur = int(kick.probe_duration(dest))
+    db.set_duration(conn, vod_id, dur)
     return "downloaded"
 
 
@@ -80,7 +89,8 @@ def step_plan(conn, cfg: config.Config, vod) -> str:
     src = cfg.vod_dir(vod_id) / "source.mp4"
     if not src.exists():
         return "new"
-    from k2y import segment
+    if vod["plan_json"]:
+        return "planned"
     plan = segment.plan(
         src,
         cfg.vod_dir(vod_id),
@@ -88,6 +98,7 @@ def step_plan(conn, cfg: config.Config, vod) -> str:
         int(cfg.min_part_minutes),
         str(cfg.model),
     )
+    db.delete_uploads(conn, vod_id)
     db.save_plan(conn, vod_id, plan)
     return "planned"
 
@@ -146,26 +157,56 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
 
 def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
+    src = cfg.vod_dir(vod_id) / "source.mp4"
+    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
-    for u in ups:
-        if u["file"] and not Path(u["file"]).exists():
+    indices = {u["idx"] for u in ups}
+
+    needs_cutting = False
+    if indices != set(range(expected)):
+        needs_cutting = True
+    else:
+        for u in ups:
+            if u["file"] and not Path(u["file"]).exists():
+                needs_cutting = True
+                break
+            if u["thumb"] and not Path(u["thumb"]).exists():
+                needs_cutting = True
+                break
+
+    if needs_cutting:
+        if not src.exists():
             return "new"
-        if u["thumb"] and not Path(u["thumb"]).exists():
-            return "new"
+        return "planned"
+
     return "uploading"
 
 
 def step_upload(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
+    src = cfg.vod_dir(vod_id) / "source.mp4"
+    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
-    if not ups:
-        return "planned"
+    indices = {u["idx"] for u in ups}
 
-    for u in ups:
-        if not u["youtube_id"] and u["file"] and not Path(u["file"]).exists():
+    needs_cutting = False
+    if indices != set(range(expected)):
+        needs_cutting = True
+    else:
+        for u in ups:
+            if not u["youtube_id"] and u["file"] and not Path(u["file"]).exists():
+                needs_cutting = True
+                break
+            if not u["thumb_done"] and u["thumb"] and not Path(u["thumb"]).exists():
+                needs_cutting = True
+                break
+
+    if needs_cutting:
+        if not src.exists():
             return "new"
-        if not u["thumb_done"] and u["thumb"] and not Path(u["thumb"]).exists():
-            return "new"
+        return "planned"
 
     non_game_categories = {
         "Just Chatting",
@@ -184,8 +225,6 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
 
     row_0 = next((u for u in ups if u["idx"] == 0), None)
     full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
-
-    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
 
     for row in ups:
         video_id = row["youtube_id"]
@@ -220,7 +259,12 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
             youtube.set_thumbnail(video_id, Path(row["thumb"]))
             db.update_upload(conn, vod_id, row["idx"], thumb_done=1)
 
-    shutil.rmtree(cfg.vod_dir(vod_id), ignore_errors=True)
+    vod_dir = cfg.vod_dir(vod_id)
+    if vod_dir.exists():
+        try:
+            shutil.rmtree(vod_dir)
+        except Exception as e:
+            logger.warning(f"Failed to remove VOD directory {vod_dir}: {e}")
     return "done"
 
 
@@ -247,18 +291,11 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
         except StopRun:
             raise
         except Exception as e:
-            if isinstance(e, config.MissingSecret):
-                logger.error(str(e))
+            if isinstance(e, (config.MissingSecret, youtube.AuthRequired)):
+                logger.error(f"{e} - run `py -m k2y auth`")
                 raise StopRun(str(e)) from e
 
-            daily_quota_cls = None
-            if "k2y.segment" in sys.modules:
-                daily_quota_cls = getattr(sys.modules["k2y.segment"], "DailyQuota", None)
-            is_daily_quota = (
-                (daily_quota_cls is not None and isinstance(e, daily_quota_cls))
-                or (type(e).__name__ == "DailyQuota")
-            )
-            if isinstance(e, youtube.QuotaExceeded) or is_daily_quota:
+            if isinstance(e, (youtube.QuotaExceeded, segment.DailyQuota)):
                 raise StopRun(str(e)) from e
 
             err_msg = f"{type(e).__name__}: {e}"
@@ -271,16 +308,14 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
             logger.info(f"vod {vod_id}: {state} -> {next_state}")
 
 
-def _is_pid_running(pid: int) -> bool:
+def _is_pid_running(pid: int) -> bool | None:
     """Check if process with pid is running.
 
-    On POSIX, uses os.kill(pid, 0).
-    On Windows, uses ctypes OpenProcess and GetExitCodeProcess.
+    Returns True if alive, False if dead, None if cannot be determined.
     """
     if pid <= 0:
         return False
     if os.name == "nt":
-        # On Windows, query process status via OpenProcess and GetExitCodeProcess.
         import ctypes
         from ctypes import wintypes
         process_query_limited_information = 0x1000
@@ -288,11 +323,18 @@ def _is_pid_running(pid: int) -> bool:
         kernel32 = ctypes.windll.kernel32
         h_process = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not h_process:
-            return False
+            err = kernel32.GetLastError()
+            if err == 5:  # ERROR_ACCESS_DENIED
+                return True
+            if err == 87:  # ERROR_INVALID_PARAMETER
+                return False
+            return None
         try:
             exit_code = wintypes.DWORD()
             success = kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
-            return bool(success and exit_code.value == still_active)
+            if success:
+                return bool(exit_code.value == still_active)
+            return None
         finally:
             kernel32.CloseHandle(h_process)
     else:
@@ -304,14 +346,18 @@ def _is_pid_running(pid: int) -> bool:
         except PermissionError:
             return True
         except OSError:
-            return False
+            return None
 
 
 def _acquire_lock(lock_path: Path) -> bool:
     """Acquire run lock via os.open(lock, O_CREAT|O_EXCL|O_WRONLY).
 
-    Writes '<pid> <unix time>'. If the lock exists and is older than 8 hours
-    or its PID is not running, replace it.
+    Writes '<pid> <unix time>'.
+    A lock whose PID is alive is NEVER stale, whatever its age.
+    Age-based staleness (8h) applies only when the PID cannot be checked.
+    An empty/unparseable lock file is stale only if older than 60 s.
+    Steal a stale lock atomically: os.replace a freshly written temp lock over it,
+    then re-read and verify it holds our PID; if not, give up.
     """
     now = int(time.time())
     pid = os.getpid()
@@ -326,7 +372,6 @@ def _acquire_lock(lock_path: Path) -> bool:
                 os.close(fd)
             return True
         except FileExistsError:
-            # Check if stale
             stale = False
             try:
                 raw = lock_path.read_text(encoding="utf-8").strip()
@@ -334,21 +379,55 @@ def _acquire_lock(lock_path: Path) -> bool:
                 if len(parts) >= 2:
                     lock_pid = int(parts[0])
                     lock_time = int(parts[1])
-                    if (now - lock_time > 8 * 3600) or not _is_pid_running(lock_pid):
+                    pid_alive = _is_pid_running(lock_pid)
+                    if pid_alive is True:
+                        stale = False
+                    elif pid_alive is False:
                         stale = True
+                    else:
+                        stale = (now - lock_time > 8 * 3600)
                 else:
-                    stale = True
+                    mtime = lock_path.stat().st_mtime
+                    stale = (now - mtime > 60)
             except Exception:
-                stale = True
+                try:
+                    mtime = lock_path.stat().st_mtime
+                    stale = (now - mtime > 60)
+                except OSError:
+                    stale = False
 
             if stale:
+                temp_lock = lock_path.parent / f"k2y.lock.{pid}.{now}.tmp"
                 try:
-                    lock_path.unlink()
-                except OSError:
+                    temp_lock.write_text(f"{pid} {now}\n", encoding="utf-8")
+                    os.replace(temp_lock, lock_path)
+                    content = lock_path.read_text(encoding="utf-8").strip().split()
+                    if content and content[0] == str(pid):
+                        return True
+                except Exception:
                     pass
-                continue
+                finally:
+                    try:
+                        temp_lock.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return False
             return False
     return False
+
+
+def _release_lock(lock_path: Path) -> None:
+    try:
+        if lock_path.exists():
+            text = lock_path.read_text(encoding="utf-8").strip().split()
+            if not text or text[0] == str(os.getpid()):
+                lock_path.unlink()
+    except OSError:
+        pass
+
+
+acquire_lock = _acquire_lock
+release_lock = _release_lock
 
 
 def run(cfg: config.Config | None = None) -> int:
@@ -360,7 +439,7 @@ def run(cfg: config.Config | None = None) -> int:
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.work_dir / "k2y.lock"
 
-    if not _acquire_lock(lock_path):
+    if not acquire_lock(lock_path):
         logger.info("another run in progress")
         return 0
 
@@ -387,10 +466,4 @@ def run(cfg: config.Config | None = None) -> int:
 
         return 0
     finally:
-        try:
-            if lock_path.exists():
-                text = lock_path.read_text(encoding="utf-8").strip().split()
-                if not text or text[0] == str(os.getpid()):
-                    lock_path.unlink()
-        except OSError:
-            pass
+        release_lock(lock_path)
