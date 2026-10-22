@@ -21,7 +21,8 @@ Ready-to-use short clips are a later goal (non-goal for v1, section 3).
    descriptions and thumbnails, and uploaded **private** to YouTube.
 3. Nothing is processed twice; a crash, sleep or reboot resumes where it stopped.
 4. A `k2y` CLI shows status and lets an agent or Melek retry, re-plan or skip a VOD.
-5. Runs unattended on the laptop through a systemd **user** timer.
+5. Runs unattended on Melek's **Windows** laptop through a Windows Task Scheduler task
+   (every 10 minutes). The same code runs on Linux (used for the end-to-end test on the VM).
 
 ## 3. Non-goals and anti-goals
 
@@ -54,7 +55,10 @@ Anti-goals (a failure even if it "works"):
   project. Matches our private-only rule.
 - **Videos over 15 minutes** and **custom thumbnails** need a phone-verified YouTube
   channel. Melek's to do once; the uploader reports a clear error if it is missing.
-- **Machine**: Linux laptop, Python 3.12, ffmpeg 6.1, no GPU. 152 GB free.
+- **Machine**: Melek's **Windows** laptop (Python 3.12 + ffmpeg via
+  `winget install Python.Python.3.12 Gyan.FFmpeg`). Development and the end-to-end test run on
+  the Linux VM where T3 runs (Python 3.12, ffmpeg 6.1). All code must work on both:
+  `pathlib` everywhere, no `fcntl`, no POSIX-only calls, ffmpeg found on PATH.
 - **Stack (decided)**: Python **stdlib only** + `ffmpeg`/`ffprobe` binaries. No pip deps.
   OAuth, HTTP, multipart upload, SQLite all through stdlib.
 
@@ -86,7 +90,6 @@ k2y/
   youtube.py    # OAuth (loopback + PKCE), resumable upload, thumbnails.set
   pipeline.py   # one step at a time per VOD, state machine
   config.py     # paths, config.json, secrets loading
-systemd/k2y.service, systemd/k2y.timer
 tests/          # unittest, stdlib only, no network
 ```
 
@@ -186,7 +189,8 @@ k2y retry <vod_id>         # clear error/attempts, failed -> previous state
 k2y skip <vod_id>          # never process this VOD
 k2y backfill <vod_id>      # add an old VOD (before `since`)
 k2y auth                   # OAuth loopback flow in the browser, writes the token
-k2y install-timer          # copy systemd units to ~/.config/systemd/user, enable
+k2y install-timer          # Windows: create the 'k2y' Task Scheduler task (schtasks)
+k2y auth --paste           # headless auth: paste the redirected URL instead of a local server
 ```
 
 Exit codes: 0 ok, 1 error, 2 bad usage. `--json` on `status` for agents.
@@ -199,11 +203,27 @@ Installed-app flow: start `http.server` on `127.0.0.1:<free port>`, open the con
 receive the code, exchange it at `https://oauth2.googleapis.com/token`, store the refresh
 token. Refresh the access token before each run. Print the URL too, for headless use.
 
-### 6.7 systemd
+### 6.7 Scheduling and portability
 
-User units. `k2y.timer`: `OnBootSec=2min`, `OnUnitActiveSec=10min`, `Persistent=true`.
-`k2y.service`: `Type=oneshot`, `ExecStart=/usr/bin/python3 -m k2y run`,
-`WorkingDirectory=<repo>`, `Nice=10`. Logs go to the journal (`journalctl --user -u k2y`).
+- **Windows (target).** `k2y install-timer` runs
+  `schtasks /Create /F /SC MINUTE /MO 10 /TN k2y /TR "\"<pythonw.exe>\" -m k2y run"` with the
+  repo as working directory (wrap in a small `k2y-run.cmd` that `cd`s to the repo and appends
+  output to `work_dir/k2y.log`, since pythonw has no console). Uses `sys.executable` to find
+  Python (`pythonw.exe` next to it if present). Prints how to check it
+  (`schtasks /Query /TN k2y`) and how to remove it (`schtasks /Delete /TN k2y /F`).
+  The task runs only while Melek is logged in; that is acceptable.
+- **Linux (VM, tests).** `install-timer` on Linux prints the equivalent crontab line
+  instead of installing anything.
+- **Run lock:** a lock file opened with `os.open(path, O_CREAT|O_EXCL)` holding the PID and
+  start time; a lock older than 8 hours or whose PID is gone is stale and replaced.
+- **ffmpeg filter paths:** on Windows, drawtext `fontfile`/`textfile` paths must use forward
+  slashes and escape the drive colon (`C\:/Windows/Fonts/arialbd.ttf`). Font: DejaVu Sans
+  Bold on Linux, Arial Bold (`arialbd.ttf`) on Windows, first one that exists.
+- **Logging:** stdlib `logging` to stderr and to `work_dir/k2y.log` (rotating, 5 MB x 3).
+- **Headless OAuth:** `k2y auth --paste` prints the consent URL (redirect
+  `http://127.0.0.1:8765`), the user approves in any browser, the browser fails to load the
+  redirect, and the user pastes that full URL back; the CLI checks `state` and exchanges the
+  code with the PKCE verifier.
 
 ## 7. Testing
 
