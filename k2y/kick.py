@@ -10,12 +10,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .media import FFMPEG
-
 logger = logging.getLogger("k2y")
 logger.addHandler(logging.NullHandler())
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)"
+FFMPEG = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
 
 class KickError(Exception):
@@ -64,7 +63,26 @@ def list_vods(channel: str) -> list[dict]:
             logger.warning(f"skipping malformed Kick item {item_id}: missing required key '{missing_keys[0]}'")
             continue
 
-        duration = item.get("duration")
+        item_id_val = item["id"]
+        if isinstance(item_id_val, bool) or not isinstance(item_id_val, int):
+            logger.warning(f"skipping malformed Kick item {item_id}: id must be an int ({item_id_val!r})")
+            continue
+        item_id = item_id_val
+
+        str_err = False
+        for str_key in ("session_title", "start_time", "source"):
+            val = item[str_key]
+            if not isinstance(val, str) or not val.strip():
+                logger.warning(f"skipping malformed Kick item {item_id}: {str_key} must be a non-empty str ({val!r})")
+                str_err = True
+                break
+        if str_err:
+            continue
+
+        if item.get("is_live"):
+            continue
+
+        duration = item["duration"]
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
             logger.warning(f"skipping malformed Kick item {item_id}: duration is not a positive number ({duration})")
             continue

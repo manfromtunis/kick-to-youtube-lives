@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 import subprocess
 import textwrap
+
+from .kick import FFMPEG, probe_duration
 
 FONT_CANDIDATES = [
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
@@ -12,34 +15,15 @@ FONT_CANDIDATES = [
     Path("C:/Windows/Fonts/arial.ttf"),
 ]
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
-FFMPEG = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
 
-def probe_duration(path: Path) -> float:
-    """Return container duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "csv=p=0",
-        str(path),
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"ffprobe timed out after 120 seconds for {path}")
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffprobe failed for {path}: {proc.stderr.strip()}")
-    try:
-        return float(proc.stdout.strip())
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse duration from ffprobe output: {proc.stdout}") from e
-
-
-def _filter_path(p: Path) -> str:
-    """Convert path to forward slashes, escaping colons and single quotes for unquoted ffmpeg filter syntax."""
+def _escape_font_path(p: Path) -> str:
+    """Convert path to forward slashes, escaping colons and single quotes for ffmpeg filter syntax."""
     s = str(p).replace("\\", "/")
-    return s.replace(":", r"\:").replace("'", r"\\\'")
+    return s.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+
+
+_filter_path = _escape_font_path
 
 
 def _find_font() -> Path | None:
@@ -125,8 +109,8 @@ def wrap_title(title: str) -> str:
 
 def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
     """Grab frame at at_s, scale/pad to 1280x720, overlay title with drawtext, output JPEG < 2MB."""
-    src = Path(src)
-    dest = Path(dest)
+    src = Path(src).resolve()
+    dest = Path(dest).resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     dur = probe_duration(src)
@@ -135,16 +119,18 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
 
     wrapped = wrap_title(title)
 
-    # Use a file next to dest with an ASCII name for drawtext
-    tf_path = dest.with_suffix(".txt")
+    # Sanitize dest stem to ASCII [A-Za-z0-9_-] for safe relative text file name
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", dest.stem) or "thumb"
+    tf_name = f"{safe_stem}.txt"
+    tf_path = dest.parent / tf_name
     tf_path.write_text(wrapped, encoding="utf-8")
 
     try:
         font_file = _find_font()
-        font_arg = f"fontfile={_filter_path(font_file)}:" if font_file else ""
+        font_arg = f"fontfile='{_escape_font_path(font_file)}':" if font_file else ""
         vf = (
             "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext={font_arg}textfile={_filter_path(tf_path)}:"
+            f"drawtext={font_arg}textfile={tf_name}:"
             "fontcolor=white:borderw=6:bordercolor=black:fontsize=72:text_align=center:"
             "x=(w-text_w)/2:y=h*2/3+(h/3-text_h)/2:expansion=none"
         )
@@ -158,7 +144,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
             str(dest),
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            res = subprocess.run(cmd, cwd=dest.parent, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
             dest.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg thumbnail timed out after 120 seconds for {dest}")
@@ -185,7 +171,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
                 str(tmp_dest),
             ]
             try:
-                re_res = subprocess.run(cmd_reencode, capture_output=True, text=True, timeout=120)
+                re_res = subprocess.run(cmd_reencode, cwd=dest.parent, capture_output=True, text=True, timeout=120)
             except subprocess.TimeoutExpired:
                 tmp_dest.unlink(missing_ok=True)
                 dest.unlink(missing_ok=True)
@@ -255,6 +241,8 @@ def part_description(part: dict, full_video_id: str | None, channel: str) -> str
     has_zero = False
     for km in raw_kms:
         at_s = int(km.get("at_s", 0))
+        if part_end_s > part_start_s and not (part_start_s <= at_s < part_end_s):
+            continue
         rel_s = at_s - part_start_s
         if rel_s == 0:
             has_zero = True

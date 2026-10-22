@@ -191,6 +191,37 @@ class TestYouTube(unittest.TestCase):
         self.assertIn("YouTube authorization expired or missing: run `py -m k2y auth`", str(ctx.exception))
         self.assertNotIn("secret_refresh_token_123", str(ctx.exception))
 
+    @patch("urllib.request.urlopen")
+    def test_auth_required_on_invalid_client_and_unauthorized_client(self, mock_urlopen: MagicMock) -> None:
+        expired_token_data = {
+            "refresh_token": "secret_refresh_token_123",
+            "access_token": "expired_token",
+            "expires_at": int(time.time()) - 100,
+        }
+        config.write_secret("youtube_token.json", json.dumps(expired_token_data))
+
+        # invalid_client
+        invalid_client_body = json.dumps({
+            "error": "invalid_client",
+            "error_description": "The OAuth client was not found.",
+        }).encode("utf-8")
+        mock_urlopen.side_effect = _make_http_error(401, "Unauthorized", invalid_client_body)
+
+        with self.assertRaises(youtube.AuthRequired) as ctx:
+            youtube.access_token()
+        self.assertIn("YouTube authorization expired or missing: run `py -m k2y auth`", str(ctx.exception))
+
+        # unauthorized_client
+        unauthorized_client_body = json.dumps({
+            "error": "unauthorized_client",
+            "error_description": "The client is not authorized.",
+        }).encode("utf-8")
+        mock_urlopen.side_effect = _make_http_error(400, "Bad Request", unauthorized_client_body)
+
+        with self.assertRaises(youtube.AuthRequired) as ctx:
+            youtube.access_token()
+        self.assertIn("YouTube authorization expired or missing: run `py -m k2y auth`", str(ctx.exception))
+
     # 2. privacyStatus is private in the init request body
     @patch("urllib.request.urlopen")
     def test_privacy_status_is_private_in_init_request_body(
@@ -418,7 +449,7 @@ class TestYouTube(unittest.TestCase):
         self.assertEqual(tok, "valid_token_abc")
         mock_urlopen.assert_not_called()
 
-    # 7. thumbnail forbidden message
+    # 7. thumbnail forbidden raises ThumbnailsForbidden
     @patch("urllib.request.urlopen")
     def test_thumbnail_forbidden_message(self, mock_urlopen: MagicMock) -> None:
         dummy_jpeg = self.config_dir / "thumb.jpg"
@@ -439,7 +470,7 @@ class TestYouTube(unittest.TestCase):
         }).encode("utf-8")
         mock_urlopen.side_effect = _make_http_error(403, "Forbidden", err_body)
 
-        with self.assertRaises(youtube.YouTubeError) as ctx:
+        with self.assertRaises(youtube.ThumbnailsForbidden) as ctx:
             youtube.set_thumbnail("vid_123", dummy_jpeg)
 
         self.assertEqual(
@@ -565,38 +596,68 @@ class TestYouTube(unittest.TestCase):
         self.assertEqual(vid, "vid_5xx_ok")
         self.mock_sleep.assert_called_once_with(5)
 
-    # 11. 404/410 on session creates a new session
+    # 11. Restored session returning 404 on status query does NOT restart session
     @patch("urllib.request.urlopen")
-    def test_404_session_expired_restarts_session(self, mock_urlopen: MagicMock) -> None:
+    def test_restored_session_404_raises_youtube_error(self, mock_urlopen: MagicMock) -> None:
         dummy_video = self.config_dir / "video.mp4"
         dummy_video.write_bytes(b"G" * 300)
-
-        sessions: list[str] = []
 
         def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
             if "expired_session" in req.full_url:
                 raise _make_http_error(404, "Not Found", b"Session expired")
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        with self.assertRaises(youtube.YouTubeError) as ctx:
+            youtube.upload(
+                dummy_video,
+                {"title": "My Stream Title"},
+                session_url="https://upload.youtube.com/expired_session",
+                on_session=lambda _: None,
+            )
+        self.assertIn(
+            "upload session expired; check YouTube Studio for a finished duplicate of 'My Stream Title', "
+            "then run `py -m k2y retry <vod>`",
+            str(ctx.exception),
+        )
+
+    # Fresh session created inside upload() returning 404 during upload restarts session
+    @patch("urllib.request.urlopen")
+    def test_fresh_session_404_during_upload_restarts_session(self, mock_urlopen: MagicMock) -> None:
+        dummy_video = self.config_dir / "video.mp4"
+        dummy_video.write_bytes(b"G" * 300)
+
+        sessions: list[str] = []
+        calls = 0
+
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 300) -> MockResponse:
+            nonlocal calls
+            calls += 1
             if "uploadType=resumable" in req.full_url:
                 return MockResponse(
                     200,
-                    {"Location": "https://upload.youtube.com/new_fresh_session"},
+                    {"Location": f"https://upload.youtube.com/fresh_session_{calls}"},
                     b"",
                 )
-            if "new_fresh_session" in req.full_url:
-                return MockResponse(200, {}, json.dumps({"id": "vid_fresh"}).encode("utf-8"))
+            if "fresh_session_1" in req.full_url:
+                raise _make_http_error(404, "Not Found", b"Session expired")
+            if "fresh_session_" in req.full_url:
+                return MockResponse(200, {}, json.dumps({"id": "vid_fresh_ok"}).encode("utf-8"))
             return MockResponse(200, {}, b"{}")
 
         mock_urlopen.side_effect = fake_urlopen
         vid = youtube.upload(
             dummy_video,
             {"title": "Title"},
-            session_url="https://upload.youtube.com/expired_session",
+            session_url=None,
             on_session=sessions.append,
         )
-        self.assertEqual(vid, "vid_fresh")
-        self.assertIn("https://upload.youtube.com/new_fresh_session", sessions)
+        self.assertEqual(vid, "vid_fresh_ok")
+        self.assertEqual(len(sessions), 2)
+        self.assertIn("https://upload.youtube.com/fresh_session_1", sessions)
+        self.assertIn("https://upload.youtube.com/fresh_session_3", sessions)
 
-    # Session restart cap at 2
+    # Session restart cap at 2 for fresh sessions
     @patch("urllib.request.urlopen")
     def test_upload_caps_session_restarts_at_2(self, mock_urlopen: MagicMock) -> None:
         dummy_video = self.config_dir / "video.mp4"
@@ -609,8 +670,8 @@ class TestYouTube(unittest.TestCase):
             if "uploadType=resumable" in req.full_url:
                 session_counter += 1
                 return MockResponse(200, {"Location": f"https://upload.youtube.com/sess_{session_counter}"}, b"")
-            if "sess_" in req.full_url or "expired" in req.full_url:
-                # Every session query/upload returns 404 expired
+            if "sess_" in req.full_url:
+                # Every session chunk upload returns 404 expired
                 raise _make_http_error(404, "Not Found", b"Expired")
             return MockResponse(200, {}, b"{}")
 
@@ -619,11 +680,12 @@ class TestYouTube(unittest.TestCase):
             youtube.upload(
                 dummy_video,
                 {"title": "Title"},
-                session_url="https://upload.youtube.com/expired_first",
+                session_url=None,
                 on_session=lambda _: None,
             )
         self.assertIn("max 2 restarts", str(ctx.exception))
-        self.assertEqual(session_counter, 2)
+        # Initial session + 2 restarts = 3 sessions initialized
+        self.assertEqual(session_counter, 3)
 
     # 12. OAuth auth() loopback flow and PKCE
     @patch("http.server.HTTPServer")
@@ -781,7 +843,7 @@ class TestYouTube(unittest.TestCase):
         # Contains < and >, exceeds 100 chars
         long_title = "<Cool> " + ("T" * 150)
         # Multibyte arabic chars (2 bytes each), exceeding 5000 bytes
-        long_desc = "<Desc> " + ("م" * 3000)
+        long_desc = "<Desc> " + ("\u0645" * 3000)
         vid = youtube.upload(
             dummy_video,
             {"title": long_title, "description": long_desc},

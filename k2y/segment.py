@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -189,8 +190,6 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
 
         candidates = [m for m in models if m in active and m not in per_day_models]
         if not candidates:
-            if active and active <= per_day_models:
-                raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
             raise SegmentError("All candidate models exhausted or unavailable")
 
         model = candidates[attempt % len(candidates)]
@@ -249,19 +248,12 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
             if e.code == 404:
                 skipped_models.add(model)
                 logger.warning(f"{model}: HTTP {e.code}")
-                active = set(models) - skipped_models
-                if not active:
-                    raise SegmentError("All candidate models returned 404")
-                if active <= per_day_models:
-                    raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
                 continue
             elif e.code == 429:
                 err_body = e.read()
                 if _is_daily_quota_error(err_body):
                     per_day_models.add(model)
-                    active = set(models) - skipped_models
-                    if active and active <= per_day_models:
-                        raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
+                    continue
                 logger.warning(f"{model}: HTTP {e.code}")
             elif e.code not in (500, 503):
                 raise SegmentError(f"Gemini API HTTP error {e.code}: {e.reason}")
@@ -550,16 +542,27 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
             parts = [{
                 "start_s": 0,
                 "end_s": duration_s,
-                "title": "Partie 1",
+                "title": "Stream complet",
                 "description": "",
                 "key_moments": [],
             }]
             return repair(parts, duration_s, [0], min_part_s=min_part_minutes * 60)
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        failed_event = threading.Event()
+
+        def _describe(i: int, cp: Path) -> dict:
+            if failed_event.is_set():
+                return None
+            try:
+                return describe_chunk(i, cp, 600, models)
+            except Exception:
+                failed_event.set()
+                raise
+
         try:
             future_to_idx = {
-                executor.submit(describe_chunk, i, cp, 600, models): i
+                executor.submit(_describe, i, cp): i
                 for i, cp in enumerate(chunk_paths)
             }
             chunks_by_idx = {}
@@ -596,13 +599,10 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
 
         if parts is None:
             logger.warning(f"Merge failed twice, falling back to single part: {last_merge_err}")
-            first_topic = "Partie 1"
-            if chunks and chunks[0].get("segments"):
-                first_topic = chunks[0]["segments"][0].get("topic", "Partie 1")
             parts = [{
                 "start_s": 0,
                 "end_s": duration_s,
-                "title": first_topic,
+                "title": "Stream complet",
                 "description": "",
                 "key_moments": [],
             }]

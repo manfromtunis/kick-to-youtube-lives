@@ -81,7 +81,8 @@ https://cdn.example.com/stream/100k.m3u8
         mock_urlopen.return_value = mock_resp
 
         vods = list_vods("testchannel")
-        self.assertEqual(len(vods), 2)
+        # Item 43 is skipped because is_live is True (skipped silently before duration check)
+        self.assertEqual(len(vods), 1)
         self.assertEqual(vods[0]["id"], 42)
         self.assertEqual(vods[0]["title"], "Gaming Night")
         self.assertEqual(vods[0]["started_at"], "2026-10-22T20:00:00Z")
@@ -89,10 +90,6 @@ https://cdn.example.com/stream/100k.m3u8
         self.assertEqual(vods[0]["source_url"], "https://stream.kick.com/42/master.m3u8")
         self.assertEqual(vods[0]["category"], "Grand Theft Auto V")
         self.assertFalse(vods[0]["is_live"])
-
-        self.assertIsNone(vods[1]["category"])
-        self.assertTrue(vods[1]["is_live"])
-        self.assertEqual(vods[1]["duration_s"], 1800)
 
         req = mock_urlopen.call_args[0][0]
         self.assertIn("Mozilla", req.headers["User-agent"])
@@ -188,6 +185,136 @@ https://cdn.example.com/stream/100k.m3u8
 
         with self.assertRaises(KickError):
             list_vods("testchannel")
+
+    @patch("urllib.request.urlopen")
+    def test_list_vods_skips_live_silently_before_duration_check(self, mock_urlopen):
+        # A live stream has duration 0 and is_live True. It must be skipped silently without warning.
+        payload = [
+            {
+                "id": 99,
+                "session_title": "Currently Live",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 0,
+                "source": "https://stream.kick.com/99/master.m3u8",
+                "is_live": True,
+            },
+            {
+                "id": 100,
+                "session_title": "Finished VOD",
+                "start_time": "2026-10-22T21:00:00Z",
+                "duration": 5000000,
+                "source": "https://stream.kick.com/100/master.m3u8",
+                "is_live": False,
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            # We log an unrelated warning to ensure assertLogs does not fail due to empty log
+            kick.logger.warning("sentinel")
+            vods = list_vods("testchannel")
+
+        self.assertEqual(len(vods), 1)
+        self.assertEqual(vods[0]["id"], 100)
+        # Verify no warning was logged for item 99
+        self.assertFalse(any("99" in m for m in cm.output))
+
+    @patch("urllib.request.urlopen")
+    def test_list_vods_type_validation(self, mock_urlopen):
+        payload = [
+            # id is bool
+            {
+                "id": True,
+                "session_title": "Bool ID",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/1/master.m3u8",
+                "is_live": False,
+            },
+            # id is str
+            {
+                "id": "123",
+                "session_title": "Str ID",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/1/master.m3u8",
+                "is_live": False,
+            },
+            # session_title is empty
+            {
+                "id": 1,
+                "session_title": "",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/1/master.m3u8",
+                "is_live": False,
+            },
+            # session_title is not str (None)
+            {
+                "id": 2,
+                "session_title": None,
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": "https://stream.kick.com/2/master.m3u8",
+                "is_live": False,
+            },
+            # start_time is whitespace
+            {
+                "id": 3,
+                "session_title": "Good title",
+                "start_time": "   ",
+                "duration": 1000,
+                "source": "https://stream.kick.com/3/master.m3u8",
+                "is_live": False,
+            },
+            # source is not str
+            {
+                "id": 4,
+                "session_title": "Good title",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 1000,
+                "source": 12345,
+                "is_live": False,
+            },
+            # duration is bool
+            {
+                "id": 5,
+                "session_title": "Good title",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": True,
+                "source": "https://stream.kick.com/5/master.m3u8",
+                "is_live": False,
+            },
+            # Valid item
+            {
+                "id": 6,
+                "session_title": "Valid Stream",
+                "start_time": "2026-10-22T20:00:00Z",
+                "duration": 3600000,
+                "source": "https://stream.kick.com/6/master.m3u8",
+                "is_live": False,
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            vods = list_vods("testchannel")
+
+        self.assertEqual(len(vods), 1)
+        self.assertEqual(vods[0]["id"], 6)
+        self.assertTrue(any("id must be an int" in m for m in cm.output))
+        self.assertTrue(any("session_title must be a non-empty str" in m for m in cm.output))
+        self.assertTrue(any("start_time must be a non-empty str" in m for m in cm.output))
+        self.assertTrue(any("source must be a non-empty str" in m for m in cm.output))
+        self.assertTrue(any("duration is not a positive number" in m for m in cm.output))
 
     @patch("urllib.request.urlopen")
     def test_list_vods_skips_malformed_items(self, mock_urlopen):

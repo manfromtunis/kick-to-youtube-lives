@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, call, patch
@@ -26,9 +27,9 @@ class TestDocstring(unittest.TestCase):
 class TestRepair(unittest.TestCase):
     def test_repair_short_vod_returns_one_part(self):
         duration_s = 18 * 60  # 18 minutes < 20 minutes
-        parts = [\
-            {"start_s": 0, "title": "Intro", "description": "Intro desc", "key_moments": []},\
-            {"start_s": 600, "title": "Gaming", "description": "Gaming desc", "key_moments": [{"at_s": 700, "what": "Play"}]},\
+        parts = [
+            {"start_s": 0, "title": "Intro", "description": "Intro desc", "key_moments": []},
+            {"start_s": 600, "title": "Gaming", "description": "Gaming desc", "key_moments": [{"at_s": 700, "what": "Play"}]},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 600, 700], min_part_s=900)
         self.assertEqual(len(res), 1)
@@ -48,9 +49,9 @@ class TestRepair(unittest.TestCase):
 
     def test_repair_start_not_at_0_forced_to_0(self):
         duration_s = 3600
-        parts = [\
-            {"start_s": 300, "end_s": 1800, "title": "Part 1", "description": "D1", "key_moments": []},\
-            {"start_s": 1800, "end_s": 3600, "title": "Part 2", "description": "D2", "key_moments": []},\
+        parts = [
+            {"start_s": 300, "end_s": 1800, "title": "Part 1", "description": "D1", "key_moments": []},
+            {"start_s": 1800, "end_s": 3600, "title": "Part 2", "description": "D2", "key_moments": []},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 300, 1800], min_part_s=600)
         self.assertEqual(len(res), 2)
@@ -62,10 +63,10 @@ class TestRepair(unittest.TestCase):
     def test_repair_gap_overlap_unsorted(self):
         duration_s = 3600
         # Unsorted, overlapping and gaps
-        parts = [\
-            {"start_s": 2000, "end_s": 2500, "title": "Part 3", "description": "D3", "key_moments": []},\
-            {"start_s": 0, "end_s": 800, "title": "Part 1", "description": "D1", "key_moments": []},\
-            {"start_s": 1000, "end_s": 1500, "title": "Part 2", "description": "D2", "key_moments": []},\
+        parts = [
+            {"start_s": 2000, "end_s": 2500, "title": "Part 3", "description": "D3", "key_moments": []},
+            {"start_s": 0, "end_s": 800, "title": "Part 1", "description": "D1", "key_moments": []},
+            {"start_s": 1000, "end_s": 1500, "title": "Part 2", "description": "D2", "key_moments": []},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 1000, 2000], min_part_s=300)
         self.assertEqual(len(res), 3)
@@ -79,9 +80,9 @@ class TestRepair(unittest.TestCase):
     def test_repair_snapping_to_allowed_values(self):
         duration_s = 3600
         allowed_s = [0, 600, 1200, 1800, 2400]
-        parts = [\
-            {"start_s": 50, "key_moments": [{"at_s": 590, "what": "k1"}]},\
-            {"start_s": 1250, "key_moments": [{"at_s": 1790, "what": "k2"}]},\
+        parts = [
+            {"start_s": 50, "key_moments": [{"at_s": 590, "what": "k1"}]},
+            {"start_s": 1250, "key_moments": [{"at_s": 1790, "what": "k2"}]},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=allowed_s, min_part_s=300)
         self.assertEqual(res[0]["start_s"], 0)  # 50 snaps to 0, forced to 0
@@ -92,10 +93,10 @@ class TestRepair(unittest.TestCase):
     def test_repair_part_shorter_than_min_gets_merged(self):
         duration_s = 4000
         min_part_s = 900
-        parts = [\
-            {"start_s": 0, "title": "Part 1", "description": "D1", "key_moments": []},\
-            {"start_s": 2000, "title": "Short Part", "description": "DS", "key_moments": [{"at_s": 2100, "what": "s1"}]},\
-            {"start_s": 2200, "title": "Part 3", "description": "D3", "key_moments": [{"at_s": 3000, "what": "s2"}]},\
+        parts = [
+            {"start_s": 0, "title": "Part 1", "description": "D1", "key_moments": []},
+            {"start_s": 2000, "title": "Short Part", "description": "DS", "key_moments": [{"at_s": 2100, "what": "s1"}]},
+            {"start_s": 2200, "title": "Part 3", "description": "D3", "key_moments": [{"at_s": 3000, "what": "s2"}]},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 2000, 2100, 2200, 3000, 4000], min_part_s=min_part_s)
         self.assertEqual(len(res), 2)
@@ -111,8 +112,8 @@ class TestRepair(unittest.TestCase):
 
     def test_repair_last_end_s_equals_duration(self):
         duration_s = 5000
-        parts = [\
-            {"start_s": 0, "title": "Only Part", "description": "", "key_moments": []},\
+        parts = [
+            {"start_s": 0, "title": "Only Part", "description": "", "key_moments": []},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0], min_part_s=600)
         self.assertEqual(res[-1]["end_s"], duration_s)
@@ -120,24 +121,24 @@ class TestRepair(unittest.TestCase):
     def test_repair_key_moments_capped_at_3(self):
         duration_s = 3000
         min_part_s = 900
-        parts = [\
-            {\
-                "start_s": 0,\
-                "title": "Short Part",\
-                "key_moments": [\
-                    {"at_s": 100, "what": "km1"},\
-                    {"at_s": 200, "what": "km2"},\
-                ],\
-            },\
-            {\
-                "start_s": 300,\
-                "title": "Long Part",\
-                "key_moments": [\
-                    {"at_s": 400, "what": "km3"},\
-                    {"at_s": 500, "what": "km4"},\
-                    {"at_s": 600, "what": "km5"},\
-                ],\
-            },\
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Short Part",
+                "key_moments": [
+                    {"at_s": 100, "what": "km1"},
+                    {"at_s": 200, "what": "km2"},
+                ],
+            },
+            {
+                "start_s": 300,
+                "title": "Long Part",
+                "key_moments": [
+                    {"at_s": 400, "what": "km3"},
+                    {"at_s": 500, "what": "km4"},
+                    {"at_s": 600, "what": "km5"},
+                ],
+            },
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 100, 200, 300, 400, 500, 600], min_part_s=min_part_s)
         self.assertEqual(len(res), 1)
@@ -148,25 +149,25 @@ class TestRepair(unittest.TestCase):
     def test_repair_drops_key_moments_outside_part_range(self):
         duration_s = 3600
         allowed_s = [0, 100, 1500, 1800, 2000, 2100, 3600]
-        parts = [\
-            {\
-                "start_s": 0,\
-                "title": "Part 1",\
-                "key_moments": [\
-                    {"at_s": 100, "what": "valid in part 1"},\
-                    {"at_s": 1800, "what": "falls on end boundary, out of part 1"},\
-                    {"at_s": 2000, "what": "falls into part 2, out of part 1"},\
-                ],\
-            },\
-            {\
-                "start_s": 1800,\
-                "title": "Part 2",\
-                "key_moments": [\
-                    {"at_s": 1500, "what": "before part 2 start"},\
-                    {"at_s": 2100, "what": "valid in part 2"},\
-                    {"at_s": 3600, "what": "at duration end, out of part 2"},\
-                ],\
-            },\
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Part 1",
+                "key_moments": [
+                    {"at_s": 100, "what": "valid in part 1"},
+                    {"at_s": 1800, "what": "falls on end boundary, out of part 1"},
+                    {"at_s": 2000, "what": "falls into part 2, out of part 1"},
+                ],
+            },
+            {
+                "start_s": 1800,
+                "title": "Part 2",
+                "key_moments": [
+                    {"at_s": 1500, "what": "before part 2 start"},
+                    {"at_s": 2100, "what": "valid in part 2"},
+                    {"at_s": 3600, "what": "at duration end, out of part 2"},
+                ],
+            },
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=allowed_s, min_part_s=600)
         self.assertEqual(len(res), 2)
@@ -181,16 +182,16 @@ class TestRepair(unittest.TestCase):
     def test_repair_short_vod_drops_out_of_range_key_moments(self):
         duration_s = 15 * 60  # 900s
         allowed_s = [0, 200, 900, 1000]
-        parts = [\
-            {\
-                "start_s": 0,\
-                "title": "Short VOD",\
-                "key_moments": [\
-                    {"at_s": 200, "what": "valid"},\
-                    {"at_s": 900, "what": "at duration_s boundary"},\
-                    {"at_s": 1000, "what": "beyond duration_s"},\
-                ],\
-            }\
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Short VOD",
+                "key_moments": [
+                    {"at_s": 200, "what": "valid"},
+                    {"at_s": 900, "what": "at duration_s boundary"},
+                    {"at_s": 1000, "what": "beyond duration_s"},
+                ],
+            }
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=allowed_s, min_part_s=900)
         self.assertEqual(len(res), 1)
@@ -200,9 +201,9 @@ class TestRepair(unittest.TestCase):
 
     def test_repair_empty_title_fallback(self):
         duration_s = 3600
-        parts = [\
-            {"start_s": 0, "title": ""},\
-            {"start_s": 1800, "title": "   "},\
+        parts = [
+            {"start_s": 0, "title": ""},
+            {"start_s": 1800, "title": "   "},
         ]
         res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 1800], min_part_s=600)
         self.assertEqual(res[0]["title"], "Partie 1")
@@ -623,7 +624,7 @@ class TestPlan(unittest.TestCase):
             self.assertEqual(len(res), 1)
             self.assertEqual(res[0]["start_s"], 0)
             self.assertEqual(res[0]["end_s"], duration_s)
-            self.assertEqual(res[0]["title"], "Kick streaming live")
+            self.assertEqual(res[0]["title"], "Stream complet")
             self.assertEqual(res[0]["description"], "")
             self.assertFalse(chunk_file.exists())
 
@@ -690,11 +691,28 @@ class TestPlan(unittest.TestCase):
             tmp_path = Path(tmpdir)
             c0 = tmp_path / "c000.ogg"
             c1 = tmp_path / "c001.ogg"
+            c2 = tmp_path / "c002.ogg"
             c0.write_bytes(b"0")
             c1.write_bytes(b"1")
-            mock_chunk_audio.return_value = [c0, c1]
+            c2.write_bytes(b"2")
+            mock_chunk_audio.return_value = [c0, c1, c2]
 
-            mock_describe_chunk.side_effect = segment.SegmentError("Chunk failure")
+            chunk_0_failed = threading.Event()
+            chunk_2_ran = False
+
+            def fake_describe(i, path, chunk_s, models):
+                nonlocal chunk_2_ran
+                if i == 0:
+                    chunk_0_failed.set()
+                    raise segment.SegmentError("Chunk 0 failed")
+                elif i == 1:
+                    chunk_0_failed.wait(timeout=5)
+                    return {"start_s": 600, "summary_en": "", "activity": "", "segments": []}
+                elif i == 2:
+                    chunk_2_ran = True
+                    return {"start_s": 1200, "summary_en": "", "activity": "", "segments": []}
+
+            mock_describe_chunk.side_effect = fake_describe
             with self.assertRaises(segment.SegmentError):
                 segment.plan(
                     src=Path("test.mp4"),
@@ -703,6 +721,7 @@ class TestPlan(unittest.TestCase):
                     min_part_minutes=15,
                     model="gemini-3.8-flash",
                 )
+            self.assertFalse(chunk_2_ran)
 
 
 if __name__ == "__main__":

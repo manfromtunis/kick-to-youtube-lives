@@ -48,6 +48,11 @@ class YouTubeError(Exception):
     pass
 
 
+class ThumbnailsForbidden(Exception):
+    """Raised when custom thumbnails cannot be set because channel is not phone-verified."""
+    pass
+
+
 class _SessionExpired(Exception):
     """Internal sentinel raised when an upload session is 404/410."""
     pass
@@ -63,8 +68,9 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
         raw = raw_body if raw_body is not None else e.read().decode("utf-8", errors="replace")
         data = json.loads(raw)
         if isinstance(data, dict):
-            # Check for invalid_grant on 400/401
-            if code in (400, 401) and data.get("error") == "invalid_grant":
+            AUTH_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client"}
+            err_val = data.get("error")
+            if code in (400, 401) and isinstance(err_val, str) and err_val in AUTH_ERRORS:
                 return AuthRequired(AUTH_REQUIRED_MSG)
 
             if "error" in data:
@@ -86,7 +92,7 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
                     if reasons:
                         reason = ", ".join(reasons)
                 elif isinstance(err, str):
-                    if code in (400, 401) and err == "invalid_grant":
+                    if code in (400, 401) and err in AUTH_ERRORS:
                         return AuthRequired(AUTH_REQUIRED_MSG)
                     reason = err
                     msg = data.get("error_description", "")
@@ -130,8 +136,6 @@ def _token_request(token_uri: str, fields: dict, what: str) -> dict:
         raw_body = e.read().decode("utf-8", errors="replace")
         raise _parse_youtube_error(e, raw_body=raw_body)
     except Exception as e:
-        if isinstance(e, AuthRequired):
-            raise
         raise YouTubeError(f"{what} failed: {e}")
 
 
@@ -330,7 +334,7 @@ def access_token(force_refresh: bool = False) -> str:
     return new_token
 
 
-def _authed(send: Callable[[str], object]) -> object:
+def _authed(send: Callable[[str], None]) -> object:
     try:
         return send(access_token())
     except urllib.error.HTTPError as e:
@@ -481,8 +485,11 @@ def upload(
                     return video_id
                 break
             except _SessionExpired:
-                session_url, offset = _restart_session()
-                break
+                title = meta.get("title", "")
+                raise YouTubeError(
+                    f"upload session expired; check YouTube Studio for a finished duplicate of '{title}', "
+                    "then run `py -m k2y retry <vod>`"
+                )
             except _RETRYABLE as e:
                 attempts += 1
                 if attempts > 5:
@@ -548,10 +555,10 @@ def set_thumbnail(video_id: str, jpeg: Path) -> None:
                 if isinstance(item, dict) and "reason" in item
             ]
             if e.code == 403 and "forbidden" in reasons:
-                raise YouTubeError(
+                raise ThumbnailsForbidden(
                     "custom thumbnails need a phone-verified channel: https://www.youtube.com/verify"
                 )
-        except YouTubeError:
+        except ThumbnailsForbidden:
             raise
         except Exception:
             pass

@@ -1,12 +1,15 @@
 """Tests for k2y/media.py."""
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from k2y.kick import KickError
 from k2y.media import (
+    _escape_font_path,
     _filter_path,
     chapters,
     cut,
@@ -183,6 +186,26 @@ class TestDescriptions(unittest.TestCase):
         expected = "Just playing.\n\nStream complet: https://youtu.be/vid456\nLive sur https://kick.com/randomguy42"
         self.assertEqual(desc, expected)
 
+    def test_part_description_ignores_out_of_range_key_moments(self):
+        part = {
+            "start_s": 100,
+            "end_s": 300,
+            "title": "Exploration",
+            "description": "Exploring open world.",
+            "key_moments": [
+                {"at_s": 50, "what": "Before start - out of range"},
+                {"at_s": 130, "what": "Found a chest"},
+                {"at_s": 200, "what": "Fought wolves"},
+                {"at_s": 300, "what": "At end_s boundary - out of range"},
+                {"at_s": 350, "what": "After end_s - out of range"},
+            ],
+        }
+        desc = part_description(part, "abc123xyz", "randomguy42")
+        expected_chaps = "0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
+        expected_links = "Stream complet: https://youtu.be/abc123xyz\nLive sur https://kick.com/randomguy42"
+        expected = f"Exploring open world.\n\n{expected_chaps}\n\n{expected_links}"
+        self.assertEqual(desc, expected)
+
 
 class TestWrapTitle(unittest.TestCase):
     def test_wrap_short_title(self):
@@ -209,13 +232,13 @@ class TestWrapTitle(unittest.TestCase):
 class TestFilterPath(unittest.TestCase):
     def test_windows_path_conversion_and_escaping(self):
         p = Path(r"C:\Windows\Fonts\arialbd.ttf")
-        filtered = _filter_path(p)
+        filtered = _escape_font_path(p)
         self.assertEqual(filtered, r"C\:/Windows/Fonts/arialbd.ttf")
 
     def test_windows_path_with_single_quote(self):
         p = Path(r"C:\Users\Melek's Files\font.ttf")
-        filtered = _filter_path(p)
-        self.assertEqual(filtered, r"C\:/Users/Melek\\\'s Files/font.ttf")
+        filtered = _escape_font_path(p)
+        self.assertEqual(filtered, r"C\:/Users/Melek\'s Files/font.ttf")
 
     def test_font_fallback_omits_fontfile(self):
         with patch("k2y.media._find_font", return_value=None), \
@@ -232,6 +255,9 @@ class TestFilterPath(unittest.TestCase):
                 vf_str = args[vf_idx + 1]
                 self.assertNotIn("fontfile=", vf_str)
                 self.assertIn("textfile=", vf_str)
+                # Verify textfile is a relative name, not a full path
+                self.assertIn("textfile=" + Path(dst.name).stem + ".txt:", vf_str)
+                self.assertEqual(mock_run.call_args.kwargs.get("cwd"), Path(dst.name).resolve().parent)
 
 
 class TestMediaTimeouts(unittest.TestCase):
@@ -249,7 +275,7 @@ class TestMediaTimeouts(unittest.TestCase):
     @patch("subprocess.run")
     def test_probe_duration_timeout(self, mock_run):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffprobe", timeout=120)
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(KickError) as ctx:
             probe_duration(Path("src.mp4"))
         self.assertIn("timed out after 120 seconds", str(ctx.exception))
 
@@ -361,18 +387,59 @@ class TestMediaFFmpeg(unittest.TestCase):
                 thumbnail(self.synthetic_video, 5, "Title", dest)
             self.assertIn("missing or empty", str(ctx.exception))
 
-    def test_thumbnail_real_ffmpeg_with_apostrophe_and_space_in_dir(self):
-        # Real ffmpeg run verifying drawtext text file and apostrophe escaping in directory name
-        with tempfile.TemporaryDirectory(dir=self.temp_dir, prefix="test 'dir with space ") as custom_td:
-            custom_dir = Path(custom_td)
-            dest = custom_dir / "thumb.jpg"
-            txt_file = dest.with_suffix(".txt")
-            out_path = thumbnail(self.synthetic_video, at_s=2, title="Melek's 'Special' Stream", dest=dest)
-            self.assertEqual(out_path, dest)
-            self.assertTrue(dest.exists())
-            self.assertGreater(dest.stat().st_size, 0)
-            # Text file created next to dest and deleted afterwards
-            self.assertFalse(txt_file.exists())
+    def test_thumbnail_real_ffmpeg_with_special_font_and_dest_paths(self):
+        # 1. Test font path containing colon, comma, brackets, apostrophe, space: "C:fonts, [x] o'k"
+        dejavu = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+        if not dejavu.exists():
+            self.skipTest("DejaVuSans-Bold.ttf not found on system")
+
+        font_dir = self.temp_dir / "C:fonts, [x] o'k"
+        font_dir.mkdir(parents=True, exist_ok=True)
+        font_copy = font_dir / "custom_font.ttf"
+        shutil.copy(dejavu, font_copy)
+
+        dest1 = self.temp_dir / "thumb_font_test.jpg"
+        txt1 = dest1.parent / f"{dest1.stem}.txt"
+
+        with patch("k2y.media._find_font", return_value=font_copy):
+            out1 = thumbnail(self.synthetic_video, at_s=2, title="Font Path Test", dest=dest1)
+        self.assertEqual(out1, dest1)
+        self.assertTrue(dest1.exists())
+        self.assertFalse(txt1.exists())
+
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name",
+            "-of", "json",
+            str(dest1),
+        ]
+        info1 = json.loads(subprocess.run(probe_cmd, check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(info1["streams"][0]["codec_name"], "mjpeg")
+        self.assertEqual(info1["streams"][0]["width"], 1280)
+        self.assertEqual(info1["streams"][0]["height"], 720)
+
+        # 2. Test dest folder named "out, [y] l'a"
+        out_dir = self.temp_dir / "out, [y] l'a"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest2 = out_dir / "thumb_dest_test.jpg"
+        txt2 = dest2.parent / f"{dest2.stem}.txt"
+
+        out2 = thumbnail(self.synthetic_video, at_s=2, title="Dest Path Test", dest=dest2)
+        self.assertEqual(out2, dest2)
+        self.assertTrue(dest2.exists())
+        self.assertFalse(txt2.exists())
+
+        info2 = json.loads(subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name",
+            "-of", "json",
+            str(dest2),
+        ], check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(info2["streams"][0]["codec_name"], "mjpeg")
+        self.assertEqual(info2["streams"][0]["width"], 1280)
+        self.assertEqual(info2["streams"][0]["height"], 720)
 
 
 if __name__ == "__main__":
