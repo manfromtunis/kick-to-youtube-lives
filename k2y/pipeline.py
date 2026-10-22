@@ -58,29 +58,12 @@ def setup_logging(work_dir: Path) -> None:
     _logging_configured = True
 
 
-def _ensure_since(cfg: config.Config) -> config.Config:
-    if cfg.since is not None:
-        return cfg
-    p = config.CONFIG_DIR / "config.json"
-    raw = {}
-    if p.exists():
-        try:
-            raw = json.loads(p.read_text())
-        except Exception:
-            raw = {}
-    stored_since = raw.get("since")
-    if stored_since:
-        return dataclasses.replace(cfg, since=str(stored_since))
-    today = datetime.now(timezone.utc).date().isoformat()
-    raw["since"] = today
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(raw, indent=2))
-    return dataclasses.replace(cfg, since=today)
+_ensure_since = config.ensure_since
 
 
 def _thumb_moment_for_part(part: dict) -> int:
     km = part.get("key_moments") or []
-    if km and len(km) > 0 and "at_s" in km[0]:
+    if km and "at_s" in km[0]:
         return int(km[0]["at_s"])
     return int(part.get("start_s", 0)) + 60
 
@@ -196,7 +179,7 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
         None,
         "",
     }
-    cat = vod["category"] if "category" in vod.keys() else None
+    cat = vod["category"]
     category_id = "22" if cat in non_game_categories else "20"
 
     row_0 = next((u for u in ups if u["idx"] == 0), None)
@@ -208,7 +191,7 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
         video_id = row["youtube_id"]
         if not video_id:
             if row["idx"] == 0:
-                desc = media.full_description(vod["title"], plan, cfg.channel)
+                desc = media.full_description(plan, cfg.channel)
             else:
                 part_idx = row["idx"] - 1
                 part_dict = plan[part_idx] if part_idx < len(plan) else {}
@@ -253,7 +236,7 @@ STEPS: dict[str, Callable] = {
 def advance(conn, cfg: config.Config, vod_id: int) -> None:
     while True:
         vod = db.get_vod(conn, vod_id)
-        if vod is None or vod["state"] in ("done", "failed", "skipped"):
+        if vod is None:
             break
         state = vod["state"]
         step_fn = STEPS.get(state)
@@ -264,6 +247,10 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
         except StopRun:
             raise
         except Exception as e:
+            if isinstance(e, config.MissingSecret):
+                logger.error(str(e))
+                raise StopRun(str(e)) from e
+
             daily_quota_cls = None
             if "k2y.segment" in sys.modules:
                 daily_quota_cls = getattr(sys.modules["k2y.segment"], "DailyQuota", None)
@@ -282,8 +269,6 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
         if next_state:
             db.set_state(conn, vod_id, next_state)
             logger.info(f"vod {vod_id}: {state} -> {next_state}")
-            if next_state == "done":
-                break
 
 
 def _is_pid_running(pid: int) -> bool:
@@ -380,7 +365,7 @@ def run(cfg: config.Config | None = None) -> int:
         return 0
 
     try:
-        cfg = _ensure_since(cfg)
+        cfg = config.ensure_since(cfg)
         conn = db.connect(cfg.db_path)
 
         try:
@@ -399,7 +384,6 @@ def run(cfg: config.Config | None = None) -> int:
                 advance(conn, cfg, row["id"])
         except StopRun as e:
             logger.info(f"Run stopped: {e}")
-            return 0
 
         return 0
     finally:

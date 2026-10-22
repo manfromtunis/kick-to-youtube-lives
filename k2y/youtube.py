@@ -45,6 +45,8 @@ class _SessionExpired(Exception):
     """Internal sentinel raised when an upload session is 404/410."""
     pass
 
+_RETRYABLE = (OSError, http.client.HTTPException)
+
 
 def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None) -> Exception:
     code = e.code
@@ -98,23 +100,8 @@ def _load_client_secret() -> tuple[str, str, str, str]:
     return client_id, client_secret, auth_uri, token_uri
 
 
-def _exchange_and_save_token(
-    client_id: str,
-    client_secret: str,
-    token_uri: str,
-    code: str,
-    redirect_uri: str,
-    code_verifier: str,
-) -> None:
-    post_data = urllib.parse.urlencode({
-        "code": code,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "grant_type": "authorization_code",
-        "code_verifier": code_verifier,
-    }).encode("utf-8")
-
+def _token_request(token_uri: str, fields: dict, what: str) -> dict:
+    post_data = urllib.parse.urlencode(fields).encode("utf-8")
     req = urllib.request.Request(
         token_uri,
         data=post_data,
@@ -123,11 +110,30 @@ def _exchange_and_save_token(
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            token_resp = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise _parse_youtube_error(e)
     except Exception as e:
-        raise YouTubeError(f"Token exchange failed: {e}")
+        raise YouTubeError(f"{what} failed: {e}")
+
+
+def _exchange_and_save_token(
+    client_id: str,
+    client_secret: str,
+    token_uri: str,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+) -> None:
+    fields = {
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+        "code_verifier": code_verifier,
+    }
+    token_resp = _token_request(token_uri, fields, "Token exchange")
 
     refresh_token = token_resp.get("refresh_token")
     if not refresh_token:
@@ -141,6 +147,21 @@ def _exchange_and_save_token(
     config.write_secret("youtube_token.json", json.dumps(token_data, indent=2))
 
 
+def _auth_url(auth_uri: str, client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": OAUTH_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    return f"{auth_uri}?{urllib.parse.urlencode(params)}"
+
+
 def auth(paste: bool = False) -> None:
     client_id, client_secret, auth_uri, token_uri = _load_client_secret()
 
@@ -151,18 +172,7 @@ def auth(paste: bool = False) -> None:
 
     if paste:
         redirect_uri = "http://127.0.0.1:8765"
-        params = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": OAUTH_SCOPES,
-            "access_type": "offline",
-            "prompt": "consent",
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-        }
-        auth_url = f"{auth_uri}?{urllib.parse.urlencode(params)}"
+        auth_url = _auth_url(auth_uri, client_id, redirect_uri, state, code_challenge)
         print(f"Open this URL to authorize k2y:\n{auth_url}")
         print("approve, your browser will fail to open 127.0.0.1, copy the full address from the address bar")
         pasted = input("Paste the redirected URL: ").strip()
@@ -187,6 +197,12 @@ def auth(paste: bool = False) -> None:
         auth_error: str | None = None
 
         class OAuthHandler(http.server.BaseHTTPRequestHandler):
+            def _reply(self, code: int, ctype: str, body: bytes) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self) -> None:
                 nonlocal auth_code, auth_error
                 parsed = urllib.parse.urlparse(self.path)
@@ -195,34 +211,22 @@ def auth(paste: bool = False) -> None:
                 req_state = qs.get("state", [None])[0]
                 if req_state != state:
                     auth_error = "state mismatch"
-                    self.send_response(400)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(b"State mismatch")
+                    self._reply(400, "text/plain; charset=utf-8", b"State mismatch")
                     return
 
                 if "error" in qs:
                     auth_error = qs["error"][0]
-                    self.send_response(400)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(b"Authentication error")
+                    self._reply(400, "text/plain; charset=utf-8", b"Authentication error")
                     return
 
                 codes = qs.get("code")
                 if not codes:
                     auth_error = "no code received"
-                    self.send_response(400)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(b"Missing code")
+                    self._reply(400, "text/plain; charset=utf-8", b"Missing code")
                     return
 
                 auth_code = codes[0]
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"<html><body><h1>k2y: you can close this tab</h1></body></html>")
+                self._reply(200, "text/html; charset=utf-8", b"<html><body><h1>k2y: you can close this tab</h1></body></html>")
 
             def log_message(self, format: str, *args: object) -> None:
                 # Silence server logging to prevent auth code leakage
@@ -232,18 +236,7 @@ def auth(paste: bool = False) -> None:
         port = server.server_port
         redirect_uri = f"http://127.0.0.1:{port}"
 
-        params = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": OAUTH_SCOPES,
-            "access_type": "offline",
-            "prompt": "consent",
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-        }
-        auth_url = f"{auth_uri}?{urllib.parse.urlencode(params)}"
+        auth_url = _auth_url(auth_uri, client_id, redirect_uri, state, code_challenge)
         print(f"Open this URL to authorize k2y:\n{auth_url}")
         try:
             webbrowser.open(auth_url)
@@ -288,25 +281,13 @@ def access_token(force_refresh: bool = False) -> str:
         return current_token
 
     client_id, client_secret, _, token_uri = _load_client_secret()
-    data = urllib.parse.urlencode({
+    fields = {
         "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": refresh_token,
         "grant_type": "refresh_token",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        token_uri,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise _parse_youtube_error(e)
-    except Exception as e:
-        raise YouTubeError(f"Token refresh failed: {e}")
+    }
+    resp_data = _token_request(token_uri, fields, "Token refresh")
 
     new_token = resp_data.get("access_token")
     if not new_token:
@@ -319,6 +300,15 @@ def access_token(force_refresh: bool = False) -> str:
 
     config.write_secret("youtube_token.json", json.dumps(token_data, indent=2))
     return new_token
+
+
+def _authed(send: Callable[[str], object]) -> object:
+    try:
+        return send(access_token())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return send(access_token(force_refresh=True))
+        raise
 
 
 def _init_upload_session(total_size: int, meta: dict) -> str:
@@ -356,16 +346,9 @@ def _init_upload_session(total_size: int, meta: dict) -> str:
                 raise YouTubeError("Upload init missing Location header")
             return loc
 
-    tok = access_token()
     try:
-        return _post(tok)
+        return _authed(_post)
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            tok = access_token(force_refresh=True)
-            try:
-                return _post(tok)
-            except urllib.error.HTTPError as e2:
-                raise _parse_youtube_error(e2)
         raise _parse_youtube_error(e)
 
 
@@ -379,12 +362,9 @@ def _parse_range_next_byte(headers: object) -> int:
     return 0
 
 
-def _query_status_once(session_url: str, total_size: int) -> tuple[int, str | None]:
-    headers = {
-        "Content-Range": f"bytes */{total_size}",
-        "Content-Length": "0",
-    }
-    req = urllib.request.Request(session_url, data=b"", headers=headers, method="PUT")
+def _send_resumable(
+    req: urllib.request.Request, total_size: int, what: str
+) -> tuple[int, str | None]:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             code = getattr(resp, "status", getattr(resp, "code", 200))
@@ -393,7 +373,7 @@ def _query_status_once(session_url: str, total_size: int) -> tuple[int, str | No
                 return total_size, json.loads(body)["id"]
             if code == 308:
                 return _parse_range_next_byte(resp.headers), None
-            raise YouTubeError(f"Unexpected status response: HTTP {code}")
+            raise YouTubeError(f"Unexpected {what} response: HTTP {code}")
     except urllib.error.HTTPError as e:
         if e.code == 308:
             return _parse_range_next_byte(e.headers), None
@@ -402,11 +382,18 @@ def _query_status_once(session_url: str, total_size: int) -> tuple[int, str | No
             return total_size, json.loads(body)["id"]
         if e.code in (404, 410):
             raise _SessionExpired()
-        if e.code == 403:
-            raise _parse_youtube_error(e)
         if 500 <= e.code < 600:
             raise
         raise _parse_youtube_error(e)
+
+
+def _query_status_once(session_url: str, total_size: int) -> tuple[int, str | None]:
+    headers = {
+        "Content-Range": f"bytes */{total_size}",
+        "Content-Length": "0",
+    }
+    req = urllib.request.Request(session_url, data=b"", headers=headers, method="PUT")
+    return _send_resumable(req, total_size, "status")
 
 
 def _upload_chunk_once(
@@ -420,28 +407,7 @@ def _upload_chunk_once(
         "Content-Type": "video/*",
     }
     req = urllib.request.Request(session_url, data=chunk_data, headers=headers, method="PUT")
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            code = getattr(resp, "status", getattr(resp, "code", 200))
-            if code in (200, 201):
-                body = resp.read().decode("utf-8")
-                return total_size, json.loads(body)["id"]
-            if code == 308:
-                return _parse_range_next_byte(resp.headers), None
-            raise YouTubeError(f"Unexpected upload response: HTTP {code}")
-    except urllib.error.HTTPError as e:
-        if e.code == 308:
-            return _parse_range_next_byte(e.headers), None
-        if e.code in (200, 201):
-            body = e.read().decode("utf-8")
-            return total_size, json.loads(body)["id"]
-        if e.code in (404, 410):
-            raise _SessionExpired()
-        if e.code == 403:
-            raise _parse_youtube_error(e)
-        if 500 <= e.code < 600:
-            raise
-        raise _parse_youtube_error(e)
+    return _send_resumable(req, total_size, "upload")
 
 
 def upload(
@@ -470,13 +436,7 @@ def upload(
                 on_session(session_url)
                 offset = 0
                 break
-            except (
-                urllib.error.HTTPError,
-                urllib.error.URLError,
-                ConnectionError,
-                OSError,
-                http.client.HTTPException,
-            ) as e:
+            except _RETRYABLE as e:
                 attempts += 1
                 if attempts > 5:
                     raise YouTubeError(f"Query status failed after 5 retries: {e}")
@@ -502,13 +462,7 @@ def upload(
                 on_session(session_url)
                 offset = 0
                 attempts = 0
-            except (
-                urllib.error.HTTPError,
-                urllib.error.URLError,
-                ConnectionError,
-                OSError,
-                http.client.HTTPException,
-            ) as e:
+            except _RETRYABLE as e:
                 attempts += 1
                 if attempts > 5:
                     raise YouTubeError(f"Upload failed after 5 retries: {e}")
@@ -524,13 +478,7 @@ def upload(
                     on_session(session_url)
                     offset = 0
                     attempts = 0
-                except (
-                    urllib.error.HTTPError,
-                    urllib.error.URLError,
-                    ConnectionError,
-                    OSError,
-                    http.client.HTTPException,
-                ):
+                except _RETRYABLE:
                     pass
 
     _, final_id = _query_status_once(session_url, total_size)
@@ -576,15 +524,7 @@ def set_thumbnail(video_id: str, jpeg: Path) -> None:
         with urllib.request.urlopen(req, timeout=60) as resp:
             pass
 
-    tok = access_token()
     try:
-        _post(tok)
+        _authed(_post)
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            tok = access_token(force_refresh=True)
-            try:
-                _post(tok)
-                return
-            except urllib.error.HTTPError as e2:
-                _handle_err(e2)
         _handle_err(e)

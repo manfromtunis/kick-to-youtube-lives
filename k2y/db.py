@@ -90,21 +90,17 @@ def set_state(conn: sqlite3.Connection, vod_id: int, state: str, error: str | No
 def record_error(conn: sqlite3.Connection, vod_id: int, error: str, max_attempts: int = 3) -> None:
     """Increment attempts and store error; mark 'failed' once max_attempts reached."""
     with conn:
-        row = conn.execute("SELECT attempts FROM vods WHERE id = ?", (vod_id,)).fetchone()
-        if row is None:
-            return
-        attempts = row["attempts"] + 1
-        now = _now_iso()
-        if attempts >= max_attempts:
-            conn.execute(
-                "UPDATE vods SET attempts = ?, error = ?, state = 'failed', updated_at = ? WHERE id = ?",
-                (attempts, error, now, vod_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE vods SET attempts = ?, error = ?, updated_at = ? WHERE id = ?",
-                (attempts, error, now, vod_id),
-            )
+        conn.execute(
+            """
+            UPDATE vods
+            SET attempts = attempts + 1,
+                error = ?,
+                state = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE state END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (error, max_attempts, _now_iso(), vod_id),
+        )
 
 
 def reset(conn: sqlite3.Connection, vod_id: int, state: str) -> None:
@@ -151,6 +147,20 @@ def upsert_upload(
               thumb = coalesce(excluded.thumb, uploads.thumb)
             """,
             (vod_id, idx, title, start_s, end_s, file_str, thumb_str),
+        )
+
+
+def all_vods(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all VODs ordered by started_at ASC."""
+    return conn.execute("SELECT * FROM vods ORDER BY started_at ASC").fetchall()
+
+
+def clear_pending_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
+    """Delete uploads for vod_id where youtube_id IS NULL."""
+    with conn:
+        conn.execute(
+            "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL",
+            (vod_id,),
         )
 
 

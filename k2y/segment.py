@@ -1,3 +1,8 @@
+import logging
+
+logger = logging.getLogger("k2y")
+logger.addHandler(logging.NullHandler())
+from .media import FFMPEG
 """Audio chunking, Gemini thematic segmentation, merge and repair."""
 import base64
 import concurrent.futures
@@ -198,6 +203,7 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
             last_error = e
             if e.code == 404:
                 skipped_models.add(model)
+                logger.warning(f"{model}: HTTP {e.code}")
                 continue
             elif e.code == 429:
                 err_body = e.read()
@@ -205,29 +211,20 @@ def generate(parts: list[dict], schema: dict, models: list[str]) -> dict:
                     per_day_models.add(model)
                     if set(models) <= per_day_models:
                         raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
-                    if attempt < 7:
-                        _sleep(min(5 * (2 ** attempt), 60))
-                    continue
-                else:
-                    if attempt < 7:
-                        _sleep(min(5 * (2 ** attempt), 60))
-                    continue
-            elif e.code in (500, 503):
-                if attempt < 7:
-                    _sleep(min(5 * (2 ** attempt), 60))
-                continue
-            else:
+                logger.warning(f"{model}: HTTP {e.code}")
+            elif e.code not in (500, 503):
                 raise SegmentError(f"Gemini API HTTP error {e.code}: {e.reason}")
+            else:
+                logger.warning(f"{model}: HTTP {e.code}")
         except urllib.error.URLError as e:
             last_error = e
-            if attempt < 7:
-                _sleep(min(5 * (2 ** attempt), 60))
-            continue
+            logger.warning(f"{model}: URLError")
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             raise SegmentError(f"Malformed Gemini response: {e}")
 
-    if set(models) <= per_day_models:
-        raise DailyQuota(f"Daily quota exceeded on all models: {list(per_day_models)}")
+        if attempt < 7:
+            _sleep(min(5 * (2 ** attempt), 60))
+
     raise SegmentError(f"Gemini generation failed after 8 attempts: {last_error}")
 
 
@@ -238,14 +235,11 @@ def chunk_audio(src: Path, workdir: Path, chunk_s: int = 600) -> list[Path]:
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     for old_chunk in chunks_dir.glob("c*.ogg"):
-        try:
-            old_chunk.unlink()
-        except OSError:
-            pass
+        old_chunk.unlink(missing_ok=True)
 
     audio_file = workdir / "audio.ogg"
     extract_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *FFMPEG,
         "-i", str(src),
         "-vn",
         "-ac", "1",
@@ -260,7 +254,7 @@ def chunk_audio(src: Path, workdir: Path, chunk_s: int = 600) -> list[Path]:
         raise SegmentError(f"ffmpeg audio extraction failed (code {e.returncode}): {e.stderr}")
 
     segment_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *FFMPEG,
         "-i", str(audio_file),
         "-f", "segment",
         "-segment_time", str(chunk_s),
@@ -272,11 +266,7 @@ def chunk_audio(src: Path, workdir: Path, chunk_s: int = 600) -> list[Path]:
     except subprocess.CalledProcessError as e:
         raise SegmentError(f"ffmpeg audio segmenting failed (code {e.returncode}): {e.stderr}")
     finally:
-        if audio_file.exists():
-            try:
-                audio_file.unlink()
-            except OSError:
-                pass
+        audio_file.unlink(missing_ok=True)
 
     return sorted(chunks_dir.glob("c*.ogg"))
 
@@ -343,34 +333,42 @@ def merge(chunks: list[dict], duration_s: int, models: list[str]) -> list[dict]:
     raise SegmentError(f"Unexpected merge response format: {type(result)}")
 
 
+def _dedupe(items: list, key: object) -> list:
+    seen = set()
+    out = []
+    for item in items:
+        k = key(item) if callable(key) else item[key]
+        if k not in seen:
+            seen.add(k)
+            out.append(item)
+    return out
+
+
+def _top_moments(kms: list[dict]) -> list[dict]:
+    sorted_kms = sorted(kms, key=lambda m: m["at_s"])
+    return _dedupe(sorted_kms, key=lambda m: m["at_s"])[:3]
+
+
 def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s: int) -> list[dict]:
     if duration_s < 20 * 60:
         first_title = ""
         first_desc = ""
         all_km = []
-        if parts:
-            for p in parts:
-                if not first_title and p.get("title", "").strip():
-                    first_title = p.get("title", "").strip()
-                if not first_desc and p.get("description", "").strip():
-                    first_desc = p.get("description", "").strip()
-                for km in p.get("key_moments", []):
-                    at_s = _snap(km.get("at_s", 0), allowed_s) if allowed_s else km.get("at_s", 0)
-                    if 0 <= at_s < duration_s:
-                        all_km.append({"at_s": at_s, "what": km.get("what", "")})
-        all_km.sort(key=lambda m: m["at_s"])
-        seen_at = set()
-        unique_km = []
-        for km in all_km:
-            if km["at_s"] not in seen_at:
-                seen_at.add(km["at_s"])
-                unique_km.append(km)
+        for p in parts:
+            if not first_title and p.get("title", "").strip():
+                first_title = p.get("title", "").strip()
+            if not first_desc and p.get("description", "").strip():
+                first_desc = p.get("description", "").strip()
+            for km in p.get("key_moments", []):
+                at_s = _snap(km.get("at_s", 0), allowed_s)
+                if 0 <= at_s < duration_s:
+                    all_km.append({"at_s": at_s, "what": km.get("what", "")})
         return [{
             "start_s": 0,
             "end_s": duration_s,
             "title": first_title if first_title else "Partie 1",
             "description": first_desc,
-            "key_moments": unique_km[:3],
+            "key_moments": _top_moments(all_km),
         }]
 
     if not parts:
@@ -384,10 +382,10 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
 
     cleaned = []
     for p in parts:
-        start_s = _snap(p.get("start_s", 0), allowed_s) if allowed_s else p.get("start_s", 0)
+        start_s = _snap(p.get("start_s", 0), allowed_s)
         kms = []
         for km in p.get("key_moments", []):
-            at_s = _snap(km.get("at_s", 0), allowed_s) if allowed_s else km.get("at_s", 0)
+            at_s = _snap(km.get("at_s", 0), allowed_s)
             kms.append({"at_s": at_s, "what": km.get("what", "")})
         cleaned.append({
             "start_s": start_s,
@@ -397,40 +395,18 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
         })
 
     cleaned.sort(key=lambda p: p["start_s"])
-
-    seen_start = set()
-    deduped = []
-    for p in cleaned:
-        if p["start_s"] not in seen_start:
-            seen_start.add(p["start_s"])
-            deduped.append(p)
-    cleaned = deduped
-
     cleaned[0]["start_s"] = 0
 
     for p in cleaned:
         p["start_s"] = max(0, min(p["start_s"], max(0, duration_s - 1)))
 
-    seen_start = set()
-    clamped = []
-    for p in cleaned:
-        if p["start_s"] not in seen_start:
-            seen_start.add(p["start_s"])
-            clamped.append(p)
-    cleaned = clamped
+    cleaned = _dedupe(cleaned, key=lambda p: p["start_s"])
 
     for i in range(len(cleaned)):
         if i + 1 < len(cleaned):
             cleaned[i]["end_s"] = cleaned[i + 1]["start_s"]
         else:
             cleaned[i]["end_s"] = duration_s
-
-        p_start = cleaned[i]["start_s"]
-        p_end = cleaned[i]["end_s"]
-        cleaned[i]["key_moments"] = [
-            km for km in cleaned[i]["key_moments"]
-            if p_start <= km["at_s"] < p_end
-        ]
 
     while len(cleaned) > 1:
         short_idx = None
@@ -469,24 +445,13 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             desc = p_right.get("description") or p_left.get("description") or ""
 
         combined_km = p_left.get("key_moments", []) + p_right.get("key_moments", [])
-        combined_km.sort(key=lambda m: m["at_s"])
-        seen_at = set()
-        unique_km = []
-        for km in combined_km:
-            if km["at_s"] not in seen_at:
-                seen_at.add(km["at_s"])
-                unique_km.append({"at_s": km["at_s"], "what": km.get("what", "")})
-        merged_km = unique_km[:3]
 
         merged_part = {
             "start_s": p_left["start_s"],
             "end_s": p_right["end_s"],
             "title": title,
             "description": desc,
-            "key_moments": [
-                km for km in merged_km
-                if p_left["start_s"] <= km["at_s"] < p_right["end_s"]
-            ],
+            "key_moments": combined_km,
         }
         cleaned[left_idx:right_idx + 1] = [merged_part]
 
@@ -502,21 +467,15 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             m for m in p.get("key_moments", [])
             if p_start <= m["at_s"] < p_end
         ]
-        kms.sort(key=lambda m: m["at_s"])
-        seen_at = set()
-        unique_km = []
-        for km in kms:
-            if km["at_s"] not in seen_at:
-                seen_at.add(km["at_s"])
-                unique_km.append({"at_s": km["at_s"], "what": km.get("what", "")})
         result.append({
             "start_s": p_start,
             "end_s": p_end,
             "title": title,
             "description": desc,
-            "key_moments": unique_km[:3],
+            "key_moments": _top_moments(kms),
         })
     return result
+
 
 
 def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model: str) -> list[dict]:
@@ -555,14 +514,16 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
         allowed_s = sorted(set(allowed_s))
 
         parts = None
+        last_merge_err = None
         for attempt in range(2):
             try:
                 parts = merge(chunks, duration_s, models)
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                last_merge_err = e
 
         if parts is None:
+            logger.warning(f"Merge failed twice, falling back to single part: {last_merge_err}")
             first_topic = "Partie 1"
             if chunks and chunks[0].get("segments"):
                 first_topic = chunks[0]["segments"][0].get("topic", "Partie 1")
@@ -570,7 +531,7 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
                 "start_s": 0,
                 "end_s": duration_s,
                 "title": first_topic,
-                "description": chunks[0].get("summary_en", "") if chunks else "",
+                "description": "",
                 "key_moments": [],
             }]
 

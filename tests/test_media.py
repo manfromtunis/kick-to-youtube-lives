@@ -114,7 +114,7 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 60, "title": "Part 2: Gameplay"},
             {"start_s": 120, "title": "Part 3: Boss fight"},
         ]
-        desc = full_description("Stream Title", parts, "randomguy42")
+        desc = full_description(parts, "randomguy42")
         expected_chapters = "0:00 Part 1: Setup\n1:00 Part 2: Gameplay\n2:00 Part 3: Boss fight"
         expected = f"{expected_chapters}\n\nLive sur https://kick.com/randomguy42"
         self.assertEqual(desc, expected)
@@ -123,7 +123,7 @@ class TestDescriptions(unittest.TestCase):
         parts = [
             {"start_s": 0, "title": "Part 1: Setup"},
         ]
-        desc = full_description("Stream Title", parts, "randomguy42")
+        desc = full_description(parts, "randomguy42")
         self.assertEqual(desc, "Live sur https://kick.com/randomguy42")
 
     def test_full_description_truncation(self):
@@ -133,7 +133,7 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 40, "title": "P2"},
         ]
         # Extremely long channel name to trigger 5000 max chars
-        desc = full_description("Title", parts, "x" * 6000)
+        desc = full_description(parts, "x" * 6000)
         self.assertLessEqual(len(desc), 5000)
 
     def test_part_description_with_full_video_id(self):

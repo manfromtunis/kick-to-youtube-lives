@@ -13,6 +13,15 @@ from . import config, db, kick, pipeline, youtube
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
+def _vod_or_err(cfg: config.Config, vod_id: int):
+    conn = db.connect(cfg.db_path)
+    vod = db.get_vod(conn, vod_id)
+    if not vod:
+        print(f"VOD {vod_id} not found in database", file=sys.stderr)
+        return conn, None
+    return conn, vod
+
+
 def _is_windows() -> bool:
     return os.name == "nt"
 
@@ -62,49 +71,37 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(file=sys.stderr)
         return 2
 
-    cfg = config.load()
-
     try:
+        cfg = config.load()
         if args.command == "run":
             return pipeline.run(cfg)
 
         elif args.command == "status":
             conn = db.connect(cfg.db_path)
-            cur = conn.execute("SELECT * FROM vods ORDER BY started_at ASC")
-            vods = cur.fetchall()
+            rows = []
+            for v in db.all_vods(conn):
+                ups = db.uploads(conn, v["id"])
+                done = sum(1 for u in ups if u["youtube_id"])
+                rows.append({
+                    "id": v["id"],
+                    "date": str(v["started_at"])[:10],
+                    "title": str(v["title"])[:40],
+                    "state": v["state"],
+                    "uploads": f"{done}/{len(ups)}",
+                    "attempts": v["attempts"],
+                    "error": str(v["error"] or "")[:60],
+                })
             if args.json:
-                out = []
-                for v in vods:
-                    ups = db.uploads(conn, v["id"])
-                    total = len(ups)
-                    done = sum(1 for u in ups if u["youtube_id"])
-                    out.append({
-                        "id": v["id"],
-                        "date": str(v["started_at"])[:10],
-                        "title": str(v["title"])[:40],
-                        "state": v["state"],
-                        "uploads": f"{done}/{total}",
-                        "attempts": v["attempts"],
-                        "error": str(v["error"] or "")[:60],
-                    })
-                print(json.dumps(out, indent=2))
+                print(json.dumps(rows, indent=2))
             else:
                 print(f"{'ID':<12} {'Date':<10} {'Title':<40} {'State':<12} {'Uploads':<10} {'Attempts':<8} {'Error':<60}")
-                for v in vods:
-                    ups = db.uploads(conn, v["id"])
-                    total = len(ups)
-                    done = sum(1 for u in ups if u["youtube_id"])
-                    date_str = str(v["started_at"])[:10]
-                    title_str = str(v["title"])[:40]
-                    err_str = str(v["error"] or "")[:60]
-                    print(f"{v['id']:<12} {date_str:<10} {title_str:<40} {v['state']:<12} {f'{done}/{total}':<10} {v['attempts']:<8} {err_str:<60}")
+                for r in rows:
+                    print(f"{r['id']:<12} {r['date']:<10} {r['title']:<40} {r['state']:<12} {r['uploads']:<10} {r['attempts']:<8} {r['error']:<60}")
             return 0
 
         elif args.command == "plan":
-            conn = db.connect(cfg.db_path)
-            vod = db.get_vod(conn, args.vod_id)
+            conn, vod = _vod_or_err(cfg, args.vod_id)
             if not vod:
-                print(f"VOD {args.vod_id} not found in database", file=sys.stderr)
                 return 1
 
             source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
@@ -131,18 +128,12 @@ def main(argv: list[str] | None = None) -> int:
 
             db.save_plan(conn, args.vod_id, parts)
             db.set_state(conn, args.vod_id, "planned")
-            with conn:
-                conn.execute(
-                    "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL",
-                    (args.vod_id,),
-                )
+            db.clear_pending_uploads(conn, args.vod_id)
             return 0
 
         elif args.command == "retry":
-            conn = db.connect(cfg.db_path)
-            vod = db.get_vod(conn, args.vod_id)
+            conn, vod = _vod_or_err(cfg, args.vod_id)
             if not vod:
-                print(f"VOD {args.vod_id} not found in database", file=sys.stderr)
                 return 1
 
             if vod["state"] == "failed":
@@ -162,10 +153,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "skip":
-            conn = db.connect(cfg.db_path)
-            vod = db.get_vod(conn, args.vod_id)
+            conn, vod = _vod_or_err(cfg, args.vod_id)
             if not vod:
-                print(f"VOD {args.vod_id} not found in database", file=sys.stderr)
                 return 1
             db.set_state(conn, args.vod_id, "skipped")
             return 0
@@ -182,17 +171,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "auth":
-            youtube.auth(paste=bool(getattr(args, "paste", False)))
+            youtube.auth(paste=args.paste)
             return 0
 
         elif args.command == "install-timer":
-            repo_dir = REPO_DIR
             python_exe = sys.executable
+            log_path = cfg.work_dir / "k2y.log"
             if _is_windows():
                 cfg.work_dir.mkdir(parents=True, exist_ok=True)
                 cmd_path = cfg.work_dir / "k2y-run.cmd"
-                log_path = cfg.work_dir / "k2y.log"
-                cmd_content = f'cd /d "{repo_dir}"\n"{python_exe}" -m k2y run >> "{log_path}" 2>&1\n'
+                cmd_content = f'cd /d "{REPO_DIR}"\n"{python_exe}" -m k2y run >> "{log_path}" 2>&1\n'
                 cmd_path.write_text(cmd_content, encoding="utf-8")
                 subprocess.run(
                     ["schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", "10", "/TN", "k2y", "/TR", str(cmd_path)],
@@ -202,10 +190,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("To check: schtasks /Query /TN k2y")
                 print("To remove: schtasks /Delete /TN k2y /F")
             else:
-                log_path = cfg.work_dir / "k2y.log"
-                print(f"*/10 * * * * cd {repo_dir} && {python_exe} -m k2y run >> {log_path} 2>&1")
+                print(f"*/10 * * * * cd {REPO_DIR} && {python_exe} -m k2y run >> {log_path} 2>&1")
             return 0
 
+    except config.MissingSecret as e:
+        print(e, file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

@@ -36,6 +36,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(loaded.model, "custom_model")
         self.assertFalse(hasattr(loaded, "unknown_extra_key_1"))
 
+    def test_read_secret_missing_raises_missing_secret(self):
+        with self.assertRaises(config.MissingSecret) as ctx:
+            config.read_secret("nonexistent.key")
+        self.assertIn("missing secret", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

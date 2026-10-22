@@ -1,3 +1,4 @@
+from .media import FFMPEG
 """Kick VOD discovery, HLS rendition resolution, and video downloading."""
 import json
 from pathlib import Path
@@ -21,16 +22,12 @@ def list_vods(channel: str) -> list[dict]:
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status != 200:
-                raise KickError(f"Kick API returned HTTP status {resp.status}")
             raw = resp.read()
     except urllib.error.HTTPError as e:
         raise KickError(f"Kick API HTTP error {e.code}: {e.reason}") from e
     except urllib.error.URLError as e:
         raise KickError(f"Kick API network error: {e.reason}") from e
     except Exception as e:
-        if isinstance(e, KickError):
-            raise
         raise KickError(f"Failed to fetch Kick VODs: {e}") from e
 
     try:
@@ -124,32 +121,25 @@ def download(vod: dict, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     part_file = Path(f"{dest}.part")
 
-    master_url = vod.get("source_url") or vod.get("source")
+    master_url = vod.get("source_url")
     if not master_url:
         raise KickError("VOD missing source_url")
 
     try:
         req = urllib.request.Request(master_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status != 200:
-                raise KickError(f"Failed to fetch master playlist: HTTP {resp.status}")
             master_text = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         raise KickError(f"HTTP error fetching master playlist: {e.code}") from e
     except urllib.error.URLError as e:
         raise KickError(f"Network error fetching master playlist: {e.reason}") from e
     except Exception as e:
-        if isinstance(e, KickError):
-            raise
         raise KickError(f"Failed to fetch master playlist: {e}") from e
 
     rendition = best_rendition(master_url, master_text)
 
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
+        *FFMPEG,
         "-i", rendition,
         "-c", "copy",
         "-f", "mp4",
@@ -163,8 +153,6 @@ def download(vod: dict, dest: Path) -> Path:
         raise KickError(f"ffmpeg download failed: {tail}")
 
     expected_duration = vod.get("duration_s")
-    if expected_duration is None and "duration" in vod:
-        expected_duration = vod["duration"] // 1000
     if expected_duration is None:
         part_file.unlink(missing_ok=True)
         raise KickError("VOD missing duration_s for duration check")
@@ -173,8 +161,6 @@ def download(vod: dict, dest: Path) -> Path:
         actual_duration = probe_duration(part_file)
     except Exception as e:
         part_file.unlink(missing_ok=True)
-        if isinstance(e, KickError):
-            raise
         raise KickError(f"Failed to probe duration of downloaded file: {e}") from e
 
     diff = abs(actual_duration - expected_duration)

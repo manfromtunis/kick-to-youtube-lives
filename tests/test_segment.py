@@ -376,6 +376,28 @@ class TestGenerate(unittest.TestCase):
         self.assertIn("model-404", req1.full_url)
         self.assertIn("model-valid", req2.full_url)
 
+
+    @patch("urllib.request.urlopen")
+    def test_generate_logs_warning_on_failover_and_backoff(self, mock_urlopen):
+        err_404 = urllib.error.HTTPError(
+            url="http://fake", code=404, msg="Not Found", hdrs={}, fp=io.BytesIO(b"{}")
+        )
+        ok_response = MagicMock()
+        ok_response.read.return_value = json.dumps({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": json.dumps({"status": "ok"})}]
+                }
+            }]
+        }).encode("utf-8")
+        ok_response.__enter__.return_value = ok_response
+
+        mock_urlopen.side_effect = [err_404, ok_response]
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            segment.generate(parts=[], schema={}, models=["model-404", "model-valid"])
+
+        self.assertTrue(any("model-404: HTTP 404" in msg for msg in cm.output))
+
     @patch("urllib.request.urlopen")
     def test_generate_retries_url_error(self, mock_urlopen):
         url_err = urllib.error.URLError("Connection reset")
@@ -504,20 +526,22 @@ class TestPlan(unittest.TestCase):
             ]
 
             duration_s = 3600
-            res = segment.plan(
-                src=Path("test.mp4"),
-                workdir=tmp_path,
-                duration_s=duration_s,
-                min_part_minutes=15,
-                model="gemini-3.8-flash",
-            )
+            with self.assertLogs("k2y", level="WARNING") as cm:
+                res = segment.plan(
+                    src=Path("test.mp4"),
+                    workdir=tmp_path,
+                    duration_s=duration_s,
+                    min_part_minutes=15,
+                    model="gemini-3.8-flash",
+                )
 
+            self.assertTrue(any("Merge failed twice" in m and "Merge 2 failed" in m for m in cm.output))
             self.assertEqual(mock_merge.call_count, 2)
             self.assertEqual(len(res), 1)
             self.assertEqual(res[0]["start_s"], 0)
             self.assertEqual(res[0]["end_s"], duration_s)
             self.assertEqual(res[0]["title"], "Kick streaming live")
-            self.assertEqual(res[0]["description"], "Discussion about AI tools")
+            self.assertEqual(res[0]["description"], "")
 
             # Check that chunk files are deleted
             self.assertFalse(chunk_file.exists())

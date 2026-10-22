@@ -152,6 +152,35 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(row["attempts"], 3)
         self.assertIn("persistent crash", row["error"])
 
+
+    def test_missing_secret_stops_run_without_attempt_and_logs_error(self):
+        vod1 = {
+            "id": 201,
+            "title": "Stream 201",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod201.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod1)
+
+        def step_missing_sec(c, cfg, v):
+            raise config.MissingSecret("missing secret client_secret.json (see docs...)")
+
+        pipeline.STEPS = {"new": step_missing_sec}
+
+        with patch("k2y.kick.list_vods", return_value=[]), self.assertLogs("k2y", level="ERROR") as cm:
+            ret = pipeline.run(self.cfg)
+
+        self.assertEqual(ret, 0)
+        self.assertTrue(any("missing secret client_secret.json" in msg for msg in cm.output))
+
+        row1 = db.get_vod(self.conn, 201)
+        self.assertEqual(row1["state"], "new")
+        self.assertEqual(row1["attempts"], 0)
+        self.assertIsNone(row1["error"])
+
     def test_quota_exceeded_stops_run_without_attempt_or_next_vod(self):
         vod1 = {
             "id": 201,

@@ -11,6 +11,8 @@ FONT_CANDIDATES = [
     Path("C:/Windows/Fonts/arial.ttf"),
 ]
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
+FFMPEG = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+
 
 
 def _filter_path(p: Path) -> str:
@@ -65,10 +67,7 @@ def cut(src: Path, start_s: int, end_s: int, dest: Path) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
+        *FFMPEG,
         "-ss", str(start_s),
         "-to", str(end_s),
         "-i", str(src),
@@ -83,21 +82,18 @@ def cut(src: Path, start_s: int, end_s: int, dest: Path) -> Path:
     return dest
 
 
-def wrap_title(title: str, max_lines: int = 2, width: int = 24) -> str:
+def wrap_title(title: str) -> str:
     """Wrap long titles onto at most 2 lines (~24 chars per line), truncating with '…'."""
     title = title.strip()
     if not title:
         return ""
-    lines = textwrap.wrap(title, width=width)
-    if len(lines) <= max_lines:
+    lines = textwrap.wrap(title, width=24)
+    if len(lines) <= 2:
         return "\n".join(lines)
     first_line = lines[0]
     remaining = " ".join(lines[1:])
-    short = textwrap.shorten(remaining, width=width, placeholder="…")
-    if short and short != "…":
-        second_line = short
-    else:
-        second_line = remaining[:width - 1].rstrip() + "…"
+    short = textwrap.shorten(remaining, width=24, placeholder="…")
+    second_line = short if short and short != "…" else remaining[:23].rstrip() + "…"
     return f"{first_line}\n{second_line}"
 
 
@@ -107,7 +103,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    wrapped = wrap_title(title, max_lines=2, width=24)
+    wrapped = wrap_title(title)
 
     # Use a temporary file for drawtext to handle apostrophes, colons, accents, etc.
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
@@ -124,10 +120,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
             "x=(w-text_w)/2:y=h*2/3+(h/3-text_h)/2:expansion=none"
         )
         cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
+            *FFMPEG,
             "-ss", str(at_s),
             "-i", str(src),
             "-vf", vf,
@@ -146,10 +139,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
             q += 2
             tmp_dest = dest.with_suffix(".tmp.jpg")
             cmd_reencode = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-y",
+                *FFMPEG,
                 "-i", str(dest),
                 "-frames:v", "1",
                 "-q:v", str(q),
@@ -163,36 +153,29 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
 
         return dest
     finally:
-        try:
-            tf_path.unlink()
-        except OSError:
-            pass
+        tf_path.unlink(missing_ok=True)
+
+
+def _fit(text: str, suffix: str) -> str:
+    return f"{text[:100 - len(suffix)]}{suffix}"
 
 
 def full_title(session_title: str, started_at: str) -> str:
     """Kick session_title + ' | Stream du <DD/MM/YYYY>', max 100 chars."""
-    dt_str = ""
     try:
         dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
         dt_str = dt.strftime("%d/%m/%Y")
     except Exception:
         dt_str = started_at[:10]
-
-    suffix = f" | Stream du {dt_str}"
-    max_session_len = 100 - len(suffix)
-    trimmed_title = session_title[:max_session_len]
-    return f"{trimmed_title}{suffix}"
+    return _fit(session_title, f" | Stream du {dt_str}")
 
 
 def part_title(gemini_title: str, index: int, total: int) -> str:
     """Gemini title + ' | Partie <n>/<total>', max 100 chars."""
-    suffix = f" | Partie {index}/{total}"
-    max_gemini_len = 100 - len(suffix)
-    trimmed = gemini_title[:max_gemini_len]
-    return f"{trimmed}{suffix}"
+    return _fit(gemini_title, f" | Partie {index}/{total}")
 
 
-def full_description(session_title: str, parts: list[dict], channel: str) -> str:
+def full_description(parts: list[dict], channel: str) -> str:
     """Format full VOD description."""
     items = []
     for p in parts:
@@ -247,7 +230,6 @@ def part_description(part: dict, full_video_id: str | None, channel: str) -> str
         sections.append(desc_text)
     if chaps:
         sections.append(chaps)
-    if links_str:
-        sections.append(links_str)
+    sections.append(links_str)
 
     return "\n\n".join(sections)[:5000]

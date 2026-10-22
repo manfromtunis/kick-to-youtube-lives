@@ -303,6 +303,16 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 0)
         mock_auth.assert_called_once_with(paste=True)
 
+
+    def test_missing_secret_exits_1_and_prints_to_stderr(self):
+        stderr = io.StringIO()
+        with patch("k2y.config.load", side_effect=config.MissingSecret("missing secret client_secret.json")), \
+             patch("sys.stderr", stderr):
+            ret = cli.main(["run"])
+
+        self.assertEqual(ret, 1)
+        self.assertIn("missing secret client_secret.json", stderr.getvalue())
+
     def test_exit_codes(self):
         # 2 on bad usage / missing command
         with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
