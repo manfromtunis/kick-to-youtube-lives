@@ -84,7 +84,7 @@ k2y/
   __main__.py   # CLI entry: python3 -m k2y <command>
   cli.py        # argparse commands, calls pipeline + db
   db.py         # SQLite state (schema below)
-  kick.py       # list VODs, resolve best rendition, segment download + concat
+  kick.py       # list VODs, resolve best rendition, one ffmpeg download + duration check
   segment.py    # audio extract, Gemini Files upload, thematic parts, validation
   media.py      # cut parts, thumbnails, chapters text
   youtube.py    # OAuth (loopback + PKCE), resumable upload, thumbnails.set
