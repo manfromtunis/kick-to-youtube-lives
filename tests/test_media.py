@@ -361,6 +361,26 @@ class TestDescriptions(unittest.TestCase):
         sanitized_h = sanitize_hashtags(raw_hashtags)
         self.assertEqual(sanitized_h, ["#IA", "#DeepSeek", "#LLMTunisie", "#script"])
 
+    def test_sanitize_tags_removes_commas(self):
+        tags = ["ia,ai", "deep, seek", "tag,with,multiple,commas"]
+        self.assertEqual(sanitize_tags(tags), ["iaai", "deep seek", "tagwithmultiplecommas"])
+
+    def test_sanitize_tags_drops_tags_over_100_chars(self):
+        tags = ["a" * 101, "short tag", "b" * 100, "c" * 105]
+        self.assertEqual(sanitize_tags(tags), ["short tag", "b" * 100])
+
+    def test_sanitize_tags_budget_spaces_and_separators_capped_at_480(self):
+        # 4 tags of 95 chars (no spaces): 4 * 95 = 380 chars, 3 separators = 383 budget
+        # tag 5 has space: length 94 -> counted as 94 + 2 = 96. Separator 1 -> 383 + 1 + 96 = 480 (fits exactly)
+        # tag 6 would exceed 480 and is capped
+        tags_exact = ["a" * 95, "b" * 95, "c" * 95, "d" * 95, "e " + "f" * 92, "extra"]
+        self.assertEqual(len(sanitize_tags(tags_exact)), 5)
+        self.assertEqual(sanitize_tags(tags_exact)[-1], "e " + "f" * 92)
+
+        # tag 5 with space of length 95 -> counted as 95 + 2 = 97 -> 383 + 1 + 97 = 481 > 480 -> dropped
+        tags_over = ["a" * 95, "b" * 95, "c" * 95, "d" * 95, "e " + "f" * 93, "extra"]
+        self.assertEqual(len(sanitize_tags(tags_over)), 4)
+
     def test_byte_limit_trimming_order(self):
         parts = [
             {

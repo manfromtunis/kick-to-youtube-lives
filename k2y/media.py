@@ -342,21 +342,25 @@ def part_title(gemini_title: str, index: int, total: int) -> str:
 
 
 def sanitize_tags(tags: list[str] | None) -> list[str]:
-    """Sanitise tags for YouTube snippet: lowercase, strip, remove <>, deduplicate, <= 500 chars total."""
+    """Sanitise tags for YouTube snippet: lowercase, strip, remove <> and commas, drop >100 chars, <= 480 chars total budget."""
     if not tags:
         return []
     cleaned: list[str] = []
     seen: set[str] = set()
-    total_len = 0
+    total_budget = 0
     for t in tags:
-        t_clean = str(t).strip().lower().replace("<", "").replace(">", "")
+        t_clean = str(t).strip().lower().replace("<", "").replace(">", "").replace(",", "")
         if not t_clean or t_clean in seen:
             continue
-        if total_len + len(t_clean) > 500:
+        if len(t_clean) > 100:
+            continue
+        cost = len(t_clean) + 2 if " " in t_clean else len(t_clean)
+        needed = cost + (1 if cleaned else 0)
+        if total_budget + needed > 480:
             break
         seen.add(t_clean)
         cleaned.append(t_clean)
-        total_len += len(t_clean)
+        total_budget += needed
     return cleaned
 
 
