@@ -1230,6 +1230,62 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(row["state"], "uploading")
         self.assertEqual(row["error"], "quota exceeded")
 
+    def test_final_description_pass_youtube_error_logs_and_marks_done(self):
+        vod_id = 995
+        vod = {
+            "id": vod_id,
+            "title": "Stream 400 Error",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod995.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "uploading")
+        plan_data = {
+            "parts": [
+                {"start_s": 0, "end_s": 1800, "title": "Part 1"},
+                {"start_s": 1800, "end_s": 3600, "title": "Part 2"},
+            ],
+        }
+        db.save_plan(self.conn, vod_id, plan_data)
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "source.mp4").write_bytes(b"src")
+        (v_dir / "thumb_0.jpg").write_bytes(b"thumb0")
+        (v_dir / "thumb_1.jpg").write_bytes(b"thumb1")
+        (v_dir / "thumb_2.jpg").write_bytes(b"thumb2")
+        (v_dir / "part_1.mp4").write_bytes(b"p1")
+        (v_dir / "part_2.mp4").write_bytes(b"p2")
+
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600, file=v_dir / "source.mp4", thumb=v_dir / "thumb_0.jpg")
+        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_bad", thumb_done=1, desc_done=0)
+
+        db.upsert_upload(self.conn, vod_id, 1, "Part 1", 0, 1800, file=v_dir / "part_1.mp4", thumb=v_dir / "thumb_1.jpg")
+        db.update_upload(self.conn, vod_id, 1, youtube_id="yt_good_1", thumb_done=1, desc_done=0)
+
+        db.upsert_upload(self.conn, vod_id, 2, "Part 2", 1800, 3600, file=v_dir / "part_2.mp4", thumb=v_dir / "thumb_2.jpg")
+        db.update_upload(self.conn, vod_id, 2, youtube_id="yt_good_2", thumb_done=1, desc_done=0)
+
+        updated_ids = []
+        def fake_update(video_id, meta):
+            if video_id == "yt_bad":
+                raise youtube.YouTubeError("400 Bad Request")
+            updated_ids.append(video_id)
+
+        with patch("k2y.youtube.update_snippet", side_effect=fake_update):
+            with self.assertLogs("k2y", level="WARNING") as cm:
+                pipeline.advance(self.conn, self.cfg, vod_id)
+
+        self.assertTrue(any("yt_bad" in msg and "400 Bad Request" in msg for msg in cm.output))
+        self.assertEqual(updated_ids, ["yt_good_1", "yt_good_2"])
+        ups = db.uploads(self.conn, vod_id)
+        self.assertTrue(all(u["desc_done"] == 1 for u in ups))
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["state"], "done")
+        self.assertEqual(row["attempts"], 0)
+
     def test_refresh_metadata_legacy_plan_calls_gemini_and_updates_db_and_youtube(self):
         vod_id = 994
         vod = {

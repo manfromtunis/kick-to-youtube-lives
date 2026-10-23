@@ -326,8 +326,14 @@ def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data
     for row in ups:
         if row["desc_done"] or not row["youtube_id"]:
             continue
-        youtube.update_snippet(row["youtube_id"], _row_meta(cfg, vod, row, ups, plan_data))
-        db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
+        try:
+            youtube.update_snippet(row["youtube_id"], _row_meta(cfg, vod, row, ups, plan_data))
+            db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
+        except (youtube.QuotaExceeded, youtube.AuthRequired):
+            raise
+        except youtube.YouTubeError as e:
+            logger.warning("VOD %s: failed to update snippet for video %s: %s", vod["id"], row["youtube_id"], e)
+            db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
 
 
 def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
