@@ -376,9 +376,10 @@ class TestDescriptions(unittest.TestCase):
         self.assertEqual(len(sanitize_tags(tags_exact)), 5)
         self.assertEqual(sanitize_tags(tags_exact)[-1], "e " + "f" * 92)
 
-        # tag 5 with space of length 95 -> counted as 95 + 2 = 97 -> 383 + 1 + 97 = 481 > 480 -> dropped
+        # tag 5 with space of length 95 -> counted as 95 + 2 = 97 -> 383 + 1 + 97 = 481 > 480 -> dropped,
+        # but the short tag after it still fits (383 + 1 + 5 = 389)
         tags_over = ["a" * 95, "b" * 95, "c" * 95, "d" * 95, "e " + "f" * 93, "extra"]
-        self.assertEqual(len(sanitize_tags(tags_over)), 4)
+        self.assertEqual(sanitize_tags(tags_over), ["a" * 95, "b" * 95, "c" * 95, "d" * 95, "extra"])
 
     def test_byte_limit_trimming_order(self):
         parts = [

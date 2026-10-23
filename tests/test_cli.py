@@ -591,7 +591,7 @@ class TestCLI(unittest.TestCase):
         db.set_state(self.conn, 963, "cut")
 
         refreshed_ids = []
-        def fake_refresh(conn, cfg, vod_id):
+        def fake_refresh(conn, cfg, vod_id, force=False):
             refreshed_ids.append(vod_id)
 
         # 1. Single VOD
@@ -612,7 +612,7 @@ class TestCLI(unittest.TestCase):
 
         # 2b. --all goes on past a per-VOD error, returns 1, leaves no error on done rows
         refreshed_ids.clear()
-        def fail_first(conn, cfg, vod_id):
+        def fail_first(conn, cfg, vod_id, force=False):
             if vod_id == 961:
                 raise RuntimeError("video gone")
             refreshed_ids.append(vod_id)
@@ -626,7 +626,7 @@ class TestCLI(unittest.TestCase):
 
         # 2c. quota stops --all at once
         refreshed_ids.clear()
-        def quota(conn, cfg, vod_id):
+        def quota(conn, cfg, vod_id, force=False):
             refreshed_ids.append(vod_id)
             raise youtube.QuotaExceeded("quota")
         with patch("k2y.pipeline.refresh_metadata", side_effect=quota), \

@@ -69,6 +69,16 @@ def _with_lock(cfg: config.Config, action):
         pipeline.release_lock(lock_path)
 
 
+def _plan_loads(plan_raw: str | None) -> bool:
+    if not plan_raw:
+        return False
+    try:
+        pipeline.load_plan_data(plan_raw)
+        return True
+    except ValueError:  # includes json.JSONDecodeError
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         try:
@@ -141,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_refresh.add_argument("vod_id", type=int, nargs="?", default=None, help="Kick VOD ID")
     p_refresh.add_argument("--all", action="store_true", help="Refresh all VODs in done state")
+    p_refresh.add_argument("--force", action="store_true", help="Re-send videos already at the current layout")
 
     args = parser.parse_args(argv)
     if not args.command:
@@ -239,8 +250,8 @@ def main(argv: list[str] | None = None) -> int:
                     source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
                     if not source_file.exists():
                         target = "new"
-                    elif not vod["plan_json"]:
-                        target = "downloaded"
+                    elif not _plan_loads(vod["plan_json"]):
+                        target = "downloaded"  # no plan or a corrupt one: plan again
                     else:
                         plan = pipeline.load_plan_data(vod["plan_json"])["parts"]
                         expected = pipeline.expected_upload_count(plan)
@@ -351,8 +362,12 @@ def main(argv: list[str] | None = None) -> int:
                     for v in vods:
                         try:
                             print(f"Refreshing metadata for VOD {v['id']} ({v['title']})...")
-                            pipeline.refresh_metadata(conn, cfg, v["id"])
-                            print(f"Successfully refreshed metadata for VOD {v['id']}")
+                            refused = pipeline.refresh_metadata(conn, cfg, v["id"], force=args.force)
+                            if refused:
+                                had_error = True
+                                _print_err(f"VOD {v['id']}: YouTube refused {refused} video(s), see k2y.log")
+                            else:
+                                print(f"Successfully refreshed metadata for VOD {v['id']}")
                         except pipeline.StopRun as sr:
                             _print_err(f"Stopped: {sr}")
                             return 1

@@ -58,7 +58,7 @@ All commands (`py -m k2y ...`) must be run from the repository root folder (`kic
    ```
 
 ### Reaction Photos
-Place reaction photos in `%USERPROFILE%\.config\k2y\faces\` (or `$HOME/.config/k2y/faces/`). Any `.jpg`, `.jpeg`, `.png`, or `.webp` file is supported. The pipeline deterministically selects a photo for each thumbnail and blends it on the right edge with an alpha gradient. If the folder is missing or empty, thumbnails are generated without reaction photos and a warning is logged once per run.
+Melek's cut-out reaction photos ship in `assets/faces/`, so thumbnails get a face with no setup. To use other photos, put them in `%USERPROFILE%\.config\k2y\faces\` (or `$K2Y_CONFIG_DIR/faces/`); a non-empty folder there replaces the repo photos. Any `.jpg`, `.jpeg`, `.png` or `.webp` works. Transparent PNGs get a white rim; to cut one out, run once `rembg i -m birefnet-portrait in.jpg out.png` in a throwaway virtualenv. Each thumbnail picks a photo deterministically, so a re-run gives the same image.
 
 ### Daily Use
 Run all commands from the `kick-to-youtube-lives` root directory:

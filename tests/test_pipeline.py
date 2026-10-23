@@ -1042,6 +1042,18 @@ class TestPipeline(unittest.TestCase):
         # Deterministic: repeated call returns identical path
         self.assertEqual(pipeline.pick_face(vod_id, 0, faces_dir=faces_dir), face0)
 
+    def test_pick_face_falls_back_to_repo_photos(self):
+        # Empty CONFIG_DIR/faces: the photos shipped in assets/faces are used.
+        repo = self.config_dir / "repo_faces"
+        repo.mkdir()
+        (repo / "r.png").write_bytes(b"x")
+        with patch("k2y.config.CONFIG_DIR", self.config_dir), patch("k2y.pipeline.REPO_FACES", repo):
+            self.assertEqual(pipeline.pick_face(1, 0).name, "r.png")
+            # A photo in CONFIG_DIR/faces overrides the repo ones.
+            (self.config_dir / "faces").mkdir(exist_ok=True)
+            (self.config_dir / "faces" / "mine.jpg").write_bytes(b"x")
+            self.assertEqual(pipeline.pick_face(1, 0).name, "mine.jpg")
+
     def test_pick_face_empty_or_missing_warns_once(self):
         pipeline.reset_faces_warned()
         missing_dir = self.config_dir / "non_existent_faces"
@@ -1053,7 +1065,7 @@ class TestPipeline(unittest.TestCase):
         self.assertIsNone(res1)
         self.assertIsNone(res2)
         # Warning logged only once
-        self.assertEqual(len([m for m in cm.output if "Faces directory" in m]), 1)
+        self.assertEqual(len([m for m in cm.output if "No reaction photos" in m]), 1)
 
         # Reset and test empty dir
         pipeline.reset_faces_warned()
@@ -1062,7 +1074,7 @@ class TestPipeline(unittest.TestCase):
         with self.assertLogs("k2y", level="WARNING") as cm2:
             res3 = pipeline.pick_face(2, 0, faces_dir=empty_dir)
         self.assertIsNone(res3)
-        self.assertEqual(len([m for m in cm2.output if "Faces directory" in m]), 1)
+        self.assertEqual(len([m for m in cm2.output if "No reaction photos" in m]), 1)
 
     def test_load_plan_legacy_list_and_v2_dict(self):
         self.assertEqual(pipeline.load_plan(None), ([], ""))
@@ -1276,7 +1288,7 @@ class TestPipeline(unittest.TestCase):
         updated_ids = []
         def fake_update(video_id, meta):
             if video_id == "yt_bad":
-                raise youtube.YouTubeError("400 Bad Request")
+                raise youtube.YouTubeError("400 Bad Request", status=400)
             updated_ids.append(video_id)
 
         with patch("k2y.youtube.update_snippet", side_effect=fake_update):
@@ -1395,6 +1407,27 @@ class TestPipeline(unittest.TestCase):
         plan["parts"][0]["hook"] = "Le hook."
         meta = pipeline._row_meta(self.cfg, vod, row, [row], plan)
         self.assertTrue(meta["description"].startswith("Le hook."))
+
+
+    def test_final_pass_transient_youtube_error_propagates_and_resumes(self):
+        self._legacy_done_vod(996, desc_done=(0, 0, 0))
+        calls = []
+        def flaky(vid, m):
+            calls.append(vid)
+            if vid == "yt1" and calls.count("yt1") == 1:
+                raise youtube.YouTubeError("HTTP 503: backendError", status=503)
+        filled = {"vod_hook": "H", "parts": [{"idx": 1, "hook": "a"}, {"idx": 2, "hook": "b"}]}
+        with patch("k2y.youtube.update_snippet", side_effect=flaky), \
+             patch("k2y.segment.fill_metadata", return_value=filled):
+            with self.assertRaises(youtube.YouTubeError):
+                pipeline.refresh_metadata(self.conn, self.cfg, 996)
+            self.assertEqual(db.get_upload(self.conn, 996, 1)["desc_done"], 0)
+            self.assertEqual(pipeline.refresh_metadata(self.conn, self.cfg, 996), 0)
+        self.assertEqual(calls, ["yt0", "yt1", "yt1", "yt2"])
+        # Finished at the current layout: --all on a later day sends nothing.
+        with patch("k2y.youtube.update_snippet", side_effect=flaky) as again:
+            pipeline.refresh_metadata(self.conn, self.cfg, 996)
+            again.assert_not_called()
 
 
 if __name__ == "__main__":

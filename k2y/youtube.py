@@ -44,8 +44,11 @@ class QuotaExceeded(Exception):
 
 
 class YouTubeError(Exception):
-    """General YouTube API error."""
-    pass
+    """General YouTube API error. status is the HTTP code when there is one."""
+
+    def __init__(self, msg: str, status: int | None = None):
+        super().__init__(msg)
+        self.status = status
 
 
 class ThumbnailsForbidden(Exception):
@@ -102,7 +105,7 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
     err_str = f"HTTP {code}: {reason}"
     if msg:
         err_str += f" - {msg}"
-    return YouTubeError(err_str)
+    return YouTubeError(err_str, status=code)
 
 
 def _load_client_secret() -> tuple[str, str, str, str]:

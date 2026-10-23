@@ -71,23 +71,30 @@ def reset_faces_warned() -> None:
     _faces_warned = False
 
 
-def pick_face(vod_id: int, idx: int, faces_dir: Path | None = None) -> Path | None:
-    """Pick deterministic face photo for (vod_id, idx) from faces_dir.
+# Melek's cut-out reaction photos ship with the repo; a non-empty CONFIG_DIR/faces overrides them.
+REPO_FACES = Path(__file__).resolve().parent.parent / "assets" / "faces"
 
+
+def pick_face(vod_id: int, idx: int, faces_dir: Path | None = None) -> Path | None:
+    """Pick deterministic face photo for (vod_id, idx).
+
+    Looks in faces_dir if given, else CONFIG_DIR/faces then the repo's assets/faces.
     Formula: sorted(files)[(vod_id * 31 + idx) % len(files)]
-    Warns once per run when the faces folder is empty or missing.
+    Warns once per run when no folder has photos.
     """
     global _faces_warned
-    if faces_dir is None:
-        faces_dir = config.CONFIG_DIR / "faces"
+    dirs = [faces_dir] if faces_dir is not None else [config.CONFIG_DIR / "faces", REPO_FACES]
     valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
     files = []
-    if faces_dir.exists() and faces_dir.is_dir():
-        files = [p for p in faces_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+    for d in dirs:
+        if d.is_dir():
+            files = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+        if files:
+            break
     if not files:
         if not _faces_warned:
             logger.warning(
-                f"Faces directory {faces_dir} is missing or empty; thumbnails will be generated without reaction photos"
+                f"No reaction photos in {', '.join(map(str, dirs))}; thumbnails will be generated without a face"
             )
             _faces_warned = True
         return None
@@ -112,6 +119,7 @@ def load_plan_data(plan_raw: str | None) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"plan_json must be a list or an object, got {type(data).__name__}")
     return {
+        **data,  # keep keys this function doesn't know (desc_ver, future fields)
         "parts": data.get("parts") or [],
         "vod_thumb_text": str(data.get("vod_thumb_text") or ""),
         "vod_hook": str(data.get("vod_hook") or ""),
@@ -278,7 +286,7 @@ def _row_meta(cfg: config.Config, vod, row, ups: list, plan_data: dict) -> dict:
             links=cfg.links,
             # A single-part VOD only uploads idx 0: fall back to that part's text.
             vod_hook=plan_data.get("vod_hook")
-            or (plan[0].get("hook") or plan[0].get("description") if plan else None),
+            or (plan[0].get("hook") or plan[0].get("description") if len(plan) == 1 else None),
             hashtags=plan_data.get("vod_hashtags"),
             part_videos=ups,
         )
@@ -305,24 +313,42 @@ def _row_meta(cfg: config.Config, vod, row, ups: list, plan_data: dict) -> dict:
     }
 
 
-def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> None:
-    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout."""
+# Bump when the description layout changes, so refresh-metadata --all re-sends old VODs.
+DESC_VERSION = 2
+
+
+def _permanent(e: Exception) -> bool:
+    """A YouTube error that retrying the same request won't fix (bad metadata, deleted video)."""
+    return getattr(e, "status", None) in (400, 403, 404) and "rateLimit" not in str(e)
+
+
+def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> int:
+    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout.
+
+    Returns how many videos YouTube permanently refused (logged and skipped). Quota, auth and
+    transient errors propagate, so the run stops and the next run resumes the unfinished rows.
+    """
     if not isinstance(plan_data, dict):
         plan_data = {"parts": plan_data}
+    refused = 0
     for row in ups:
         if row["desc_done"] or not row["youtube_id"]:
             continue
         try:
             youtube.update_snippet(row["youtube_id"], _row_meta(cfg, vod, row, ups, plan_data))
-            db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
-        except (youtube.QuotaExceeded, youtube.AuthRequired):
-            raise
         except youtube.YouTubeError as e:
-            logger.warning("VOD %s: failed to update snippet for video %s: %s", vod["id"], row["youtube_id"], e)
-            db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
+            if not _permanent(e):
+                raise
+            logger.warning("VOD %s: YouTube refused the snippet for video %s: %s", vod["id"], row["youtube_id"], e)
+            refused += 1
+        db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
+    if plan_data.get("desc_ver") != DESC_VERSION:
+        plan_data["desc_ver"] = DESC_VERSION
+        db.save_plan(conn, vod["id"], plan_data)
+    return refused
 
 
-def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
+def refresh_metadata(conn, cfg: config.Config, vod_id: int, force: bool = False) -> int:
     """Refresh metadata and descriptions for a published VOD in 'done' state."""
     vod = db.get_vod(conn, vod_id)
     if not vod:
@@ -370,11 +396,14 @@ def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
         plan_data["meta_filled"] = True
         db.save_plan(conn, vod_id, plan_data)
 
+    # Rows already at the current layout stay done, so a quota stop (or --all over several
+    # days) resumes instead of re-sending finished videos. force re-sends everything.
     ups = db.uploads(conn, vod_id)
-    if ups and all(u["desc_done"] == 1 for u in ups):
+    stale = plan_data.get("desc_ver") != DESC_VERSION and all(u["desc_done"] for u in ups)
+    if force or stale:
         db.clear_desc_done(conn, vod_id)
         ups = db.uploads(conn, vod_id)
-    apply_final_descriptions(conn, cfg, vod, ups, plan_data)
+    return apply_final_descriptions(conn, cfg, vod, ups, plan_data)
 
 
 def step_upload(conn, cfg: config.Config, vod) -> str:

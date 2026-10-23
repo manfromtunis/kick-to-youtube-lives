@@ -359,7 +359,7 @@ def sanitize_tags(tags: list[str] | None) -> list[str]:
         cost = len(t_clean) + 2 if " " in t_clean else len(t_clean)
         needed = cost + (1 if cleaned else 0)
         if total_budget + needed > 480:
-            break
+            continue  # a shorter tag later may still fit
         seen.add(t_clean)
         cleaned.append(t_clean)
         total_budget += needed
