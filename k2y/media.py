@@ -240,7 +240,14 @@ def thumbnail(
             filter_complex = (
                 "[0]scale=1280:720,boxblur=6,eq=brightness=-0.25[bg];"
                 # Phone photos are landscape with the face centred: keep a centred 4:5 portrait.
-                "[1]crop='min(iw,ih*4/5)':ih,scale=-1:760,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='min(255, 255*X/(W*0.35))'[face];"
+                "[1]crop='min(iw,ih*4/5)':ih,scale=-1:760,format=rgba,split=3[p][pa][pw];"
+                # White rim from the dilated alpha: separates a cut-out PNG from the dark
+                # background, and stays hidden under an opaque JPG.
+                "[pa]alphaextract," + ",".join(["dilation"] * 8) + "[rim];"
+                "[pw]drawbox=c=white:t=fill,format=rgb24[white];"
+                "[white][rim]alphamerge[outline];"
+                "[outline][p]overlay=format=rgb,format=rgba,"
+                "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*min(1, X/(W*0.35))'[face];"
                 f"[bg][face]overlay=x=W-w+40:y=-20,{dt1},{dt2}"
             )
             cmd = [
