@@ -6,7 +6,9 @@ from pathlib import Path
 import re
 import subprocess
 import textwrap
+from typing import Any
 
+from . import config
 from .kick import FFMPEG, probe_duration
 
 FONT_CANDIDATES = [
@@ -16,6 +18,13 @@ FONT_CANDIDATES = [
     Path("C:/Windows/Fonts/arial.ttf"),
 ]
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _escape_font_path(p: Path) -> str:
@@ -342,28 +351,217 @@ def part_title(gemini_title: str, index: int, total: int) -> str:
     return _fit(gemini_title, f" | Partie {index}/{total}")
 
 
-def full_description(parts: list[dict], channel: str) -> str:
-    """Format full VOD description."""
+def sanitize_tags(tags: list[str] | None) -> list[str]:
+    """Sanitise tags for YouTube snippet: lowercase, strip, remove <>, deduplicate, <= 500 chars total."""
+    if not tags:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    total_len = 0
+    for t in tags:
+        t_clean = str(t).strip().lower().replace("<", "").replace(">", "")
+        if not t_clean or t_clean in seen:
+            continue
+        if total_len + len(t_clean) > 500:
+            break
+        seen.add(t_clean)
+        cleaned.append(t_clean)
+        total_len += len(t_clean)
+    return cleaned
+
+
+def sanitize_hashtags(hashtags: list[str] | None) -> list[str]:
+    """Sanitise hashtags: strip, remove <>, no spaces, prefix #, deduplicate."""
+    if not hashtags:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for h in hashtags:
+        h_clean = str(h).strip().replace("<", "").replace(">", "")
+        h_clean = "".join(h_clean.split())
+        h_val = h_clean.lstrip("#")
+        if not h_val:
+            continue
+        h_clean = f"#{h_val}"
+        lower_h = h_clean.lower()
+        if lower_h in seen:
+            continue
+        seen.add(lower_h)
+        cleaned.append(h_clean)
+    return cleaned
+
+
+def format_link(label: str, url: str) -> str:
+    lbl = str(label).strip()
+    u = str(url).strip()
+    if lbl.endswith(":"):
+        return f"{lbl} {u}"
+    return f"{lbl} : {u}"
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    s = max(0, int(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h > 0:
+        return f"{h}h{m:02d}"
+    return f"{m}min"
+
+
+def _build_links_block(channel: str, links: list | tuple | None) -> str:
+    lines = []
+    if channel:
+        lines.append(f"🔴 En live sur Kick : https://kick.com/{channel.strip()}")
+    active_links = links if links is not None else config.DEFAULT_LINKS
+    for item in active_links:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            lines.append(format_link(item[0], item[1]))
+    return "\n".join(lines)
+
+
+def _resolve_part_yt_id(part_source: Any, idx_1based: int, part_dict: dict) -> str | None:
+    if part_dict.get("youtube_id"):
+        return str(part_dict["youtube_id"])
+    if not part_source:
+        return None
+    if isinstance(part_source, dict):
+        return part_source.get(idx_1based)
+    if isinstance(part_source, list):
+        if idx_1based - 1 < len(part_source):
+            item = part_source[idx_1based - 1]
+            if isinstance(item, str):
+                return item
+        for item in part_source:
+            if isinstance(item, dict) or hasattr(item, "__getitem__"):
+                try:
+                    if item.get("idx") == idx_1based:
+                        return item.get("youtube_id")
+                except (AttributeError, TypeError):
+                    pass
+                try:
+                    if hasattr(item, "keys") and "idx" in item.keys() and item["idx"] == idx_1based:
+                        return item["youtube_id"]
+                except Exception:
+                    pass
+            if isinstance(item, (tuple, list)) and len(item) >= 3 and item[0] == idx_1based:
+                return str(item[2])
+    return None
+
+
+def _assemble_and_trim_description(
+    hook: str,
+    chapters_block: str,
+    nav_header: str,
+    nav_lines: list[str],
+    links_block: str,
+    hashtags_block: str,
+) -> str:
+    hook = hook.replace("<", "").replace(">", "").strip()
+    if len(hook) > 200:
+        hook = hook[:200].rstrip()
+
+    def _build(h: str, n_lines: list[str]) -> str:
+        blocks = []
+        if h:
+            blocks.append(h)
+        if chapters_block:
+            blocks.append(chapters_block)
+        if nav_header and n_lines:
+            blocks.append(f"{nav_header}\n" + "\n".join(n_lines))
+        if links_block:
+            blocks.append(links_block)
+        if hashtags_block:
+            blocks.append(hashtags_block)
+        return "\n\n".join(blocks)
+
+    curr_nav = [ln.replace("<", "").replace(">", "").strip() for ln in nav_lines if ln.strip()]
+    text = _build(hook, curr_nav)
+    if len(text.encode("utf-8")) <= 5000:
+        return text
+
+    # Drop navigation lines from the end first
+    while curr_nav:
+        curr_nav.pop()
+        text = _build(hook, curr_nav)
+        if len(text.encode("utf-8")) <= 5000:
+            return text
+
+    # If all navigation lines are dropped, shorten the hook
+    while hook:
+        text = _build(hook, [])
+        encoded_len = len(text.encode("utf-8"))
+        if encoded_len <= 5000:
+            return text
+        excess = encoded_len - 5000
+        hook = hook[:-max(1, excess)].rstrip()
+
+    res = _build("", [])
+    if len(res.encode("utf-8")) <= 5000:
+        return res
+    return _truncate_utf8(res, 5000)
+
+
+def full_description(
+    parts: list[dict],
+    channel: str = "randomguy42",
+    *,
+    links: list | tuple | None = None,
+    vod_hook: str | None = None,
+    hashtags: list[str] | None = None,
+    part_videos: list[Any] | None = None,
+) -> str:
+    """Format full VOD description following the v2 layout."""
+    hook = str(vod_hook or "").strip()
+
     items = []
     for p in parts:
         start_s = int(p.get("start_s", 0))
         t = str(p.get("title", "")).strip()
         items.append((start_s, t))
 
-    chaps = chapters(items)
-    link_line = f"Live sur https://kick.com/{channel}"
+    chaps_text = chapters(items)
+    chaps_block = f"⏱️ Chapitres\n{chaps_text}" if chaps_text else ""
 
-    if chaps:
-        desc = f"{chaps}\n\n{link_line}"
-    else:
-        desc = link_line
+    nav_header = ""
+    nav_lines: list[str] = []
+    if len(parts) > 1:
+        nav_header = f"📺 Ce live découpé en {len(parts)} vidéos"
+        for i, p in enumerate(parts, 1):
+            title = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", str(p.get("title", f"Partie {i}"))).strip()
+            yt_id = _resolve_part_yt_id(part_videos, i, p)
+            if yt_id:
+                nav_lines.append(f"{i}/{len(parts)} {title} https://youtu.be/{yt_id}")
+        if not nav_lines:
+            nav_header = ""
 
-    return desc[:5000]
+    links_block = _build_links_block(channel, links)
+
+    sanitized_ht = sanitize_hashtags(hashtags)
+    hashtags_block = " ".join(sanitized_ht) if sanitized_ht else ""
+
+    return _assemble_and_trim_description(
+        hook, chaps_block, nav_header, nav_lines, links_block, hashtags_block
+    )
 
 
-def part_description(part: dict, full_video_id: str | None, channel: str) -> str:
-    """Format part video description."""
-    desc_text = str(part.get("description", "")).strip()
+def part_description(
+    part: dict,
+    full_video_id: str | None = None,
+    channel: str = "randomguy42",
+    *,
+    part_index: int | None = None,
+    total_parts: int | None = None,
+    all_parts: list[dict] | None = None,
+    other_parts: list[Any] | None = None,
+    full_duration_s: int | None = None,
+    links: list | tuple | None = None,
+    hashtags: list[str] | None = None,
+) -> str:
+    """Format part video description following the v2 layout."""
+    hook = str(part.get("hook") or part.get("description", "")).strip()
+
     part_start_s = int(part.get("start_s", 0))
     part_end_s = int(part.get("end_s", 0))
     part_title_str = str(part.get("title", "")).strip()
@@ -386,19 +584,57 @@ def part_description(part: dict, full_video_id: str | None, channel: str) -> str
 
     rebased_kms.sort(key=lambda x: x[0])
     part_duration = part_end_s - part_start_s if part_end_s > part_start_s else None
-    chaps = chapters(rebased_kms, end_s=part_duration)
+    chaps_text = chapters(rebased_kms, end_s=part_duration)
+    chaps_block = f"⏱️ Chapitres\n{chaps_text}" if chaps_text else ""
 
-    links = []
-    if full_video_id:
-        links.append(f"Stream complet: https://youtu.be/{full_video_id}")
-    links.append(f"Live sur https://kick.com/{channel}")
-    links_str = "\n".join(links)
+    tot = total_parts or (len(all_parts) if all_parts is not None else (len(other_parts) + 1 if other_parts is not None else 1))
+    idx = part_index
+    if idx is None:
+        if all_parts and part in all_parts:
+            idx = all_parts.index(part) + 1
+        elif part.get("idx"):
+            idx = int(part["idx"])
+        else:
+            idx = 1
 
-    sections = []
-    if desc_text:
-        sections.append(desc_text)
-    if chaps:
-        sections.append(chaps)
-    sections.append(links_str)
+    other_list: list[tuple[int, str, str]] = []
+    if all_parts:
+        for j, p in enumerate(all_parts, 1):
+            if j != idx:
+                yt_id = _resolve_part_yt_id(p, j, p)
+                title = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", str(p.get("title", f"Partie {j}"))).strip()
+                if yt_id:
+                    other_list.append((j, title, yt_id))
+    elif other_parts:
+        for item in other_parts:
+            if isinstance(item, (tuple, list)) and len(item) >= 3:
+                other_list.append((int(item[0]), str(item[1]), str(item[2])))
+            elif isinstance(item, dict) or hasattr(item, "__getitem__"):
+                j = int(item.get("idx", 0)) if hasattr(item, "get") else int(item["idx"])
+                t = str(item.get("title", f"Partie {j}")) if hasattr(item, "get") else str(item["title"])
+                t = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", t).strip()
+                y = str(item.get("youtube_id", "")) if hasattr(item, "get") else str(item["youtube_id"])
+                if y:
+                    other_list.append((j, t, y))
 
-    return "\n\n".join(sections)[:5000]
+    nav_header = ""
+    nav_lines: list[str] = []
+    if tot > 1:
+        nav_header = "📺 Les autres parties de ce live"
+        for other_idx, other_title, other_id in other_list:
+            nav_lines.append(f"{other_idx}/{tot} {other_title} https://youtu.be/{other_id}")
+        if full_video_id:
+            dur_label = f"({format_duration(full_duration_s)}) " if full_duration_s else ""
+            nav_lines.append(f"▶️ Le stream complet {dur_label}: https://youtu.be/{full_video_id}")
+        if not nav_lines:
+            nav_header = ""
+
+    links_block = _build_links_block(channel, links)
+
+    ht_val = part.get("hashtags") if part.get("hashtags") is not None else hashtags
+    sanitized_ht = sanitize_hashtags(ht_val)
+    hashtags_block = " ".join(sanitized_ht) if sanitized_ht else ""
+
+    return _assemble_and_trim_description(
+        hook, chaps_block, nav_header, nav_lines, links_block, hashtags_block
+    )

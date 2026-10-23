@@ -12,6 +12,8 @@ from k2y.media import (
     _escape_font_path,
     chapters,
     cut,
+    format_duration,
+    format_link,
     full_description,
     full_title,
     hms,
@@ -19,7 +21,9 @@ from k2y.media import (
     part_title,
     probe_duration,
     hook_lines,
+    sanitize_hashtags,
     sanitize_hook,
+    sanitize_tags,
     thumbnail,
     wrap_title,
 )
@@ -112,6 +116,15 @@ class TestTitles(unittest.TestCase):
         self.assertEqual(len(res), 100)
 
 
+DEFAULT_LINKS_BLOCK = (
+    "🔴 En live sur Kick : https://kick.com/randomguy42\n"
+    "📸 Instagram : https://www.instagram.com/ghmelek/\n"
+    "🛠️ AuraStack : https://aurastack.link/\n"
+    "💸 Clip2Earn : https://www.clip2earn.money/\n"
+    "📱 Bakchich : https://www.instagram.com/bakchich.app/"
+)
+
+
 class TestDescriptions(unittest.TestCase):
     def test_full_description_with_qualifying_chapters(self):
         parts = [
@@ -120,8 +133,8 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 120, "title": "Part 3: Boss fight"},
         ]
         desc = full_description(parts, "randomguy42")
-        expected_chapters = "0:00 Part 1: Setup\n1:00 Part 2: Gameplay\n2:00 Part 3: Boss fight"
-        expected = f"{expected_chapters}\n\nLive sur https://kick.com/randomguy42"
+        expected_chapters = "⏱️ Chapitres\n0:00 Part 1: Setup\n1:00 Part 2: Gameplay\n2:00 Part 3: Boss fight"
+        expected = f"{expected_chapters}\n\n{DEFAULT_LINKS_BLOCK}"
         self.assertEqual(desc, expected)
 
     def test_full_description_without_qualifying_chapters(self):
@@ -129,7 +142,7 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 0, "title": "Part 1: Setup"},
         ]
         desc = full_description(parts, "randomguy42")
-        self.assertEqual(desc, "Live sur https://kick.com/randomguy42")
+        self.assertEqual(desc, DEFAULT_LINKS_BLOCK)
 
     def test_full_description_truncation(self):
         parts = [
@@ -138,7 +151,7 @@ class TestDescriptions(unittest.TestCase):
             {"start_s": 40, "title": "P2"},
         ]
         desc = full_description(parts, "x" * 6000)
-        self.assertLessEqual(len(desc), 5000)
+        self.assertLessEqual(len(desc.encode("utf-8")), 5000)
 
     def test_part_description_with_full_video_id(self):
         part = {
@@ -151,10 +164,24 @@ class TestDescriptions(unittest.TestCase):
                 {"at_s": 200, "what": "Fought wolves"},
             ],
         }
-        desc = part_description(part, "abc123xyz", "randomguy42")
-        expected_chaps = "0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
-        expected_links = "Stream complet: https://youtu.be/abc123xyz\nLive sur https://kick.com/randomguy42"
-        expected = f"Exploring the open world.\n\n{expected_chaps}\n\n{expected_links}"
+        all_parts = [
+            part,
+            {"start_s": 300, "end_s": 500, "title": "Boss", "youtube_id": "part2_id"},
+        ]
+        desc = part_description(
+            part,
+            full_video_id="abc123xyz",
+            channel="randomguy42",
+            all_parts=all_parts,
+            full_duration_s=500,
+        )
+        expected_chaps = "⏱️ Chapitres\n0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
+        expected_nav = (
+            "📺 Les autres parties de ce live\n"
+            "2/2 Boss https://youtu.be/part2_id\n"
+            "▶️ Le stream complet (8min) : https://youtu.be/abc123xyz"
+        )
+        expected = f"Exploring the open world.\n\n{expected_chaps}\n\n{expected_nav}\n\n{DEFAULT_LINKS_BLOCK}"
         self.assertEqual(desc, expected)
 
     def test_part_description_moment_at_start_not_duplicated(self):
@@ -170,10 +197,10 @@ class TestDescriptions(unittest.TestCase):
             ],
         }
         desc = part_description(part, None, "randomguy42")
-        expected_chaps = "0:00 Custom Start\n0:30 Found a chest\n1:40 Fought wolves"
-        expected = f"Exploring.\n\n{expected_chaps}\n\nLive sur https://kick.com/randomguy42"
+        expected_chaps = "⏱️ Chapitres\n0:00 Custom Start\n0:30 Found a chest\n1:40 Fought wolves"
+        expected = f"Exploring.\n\n{expected_chaps}\n\n{DEFAULT_LINKS_BLOCK}"
         self.assertEqual(desc, expected)
-        self.assertNotIn("Stream complet:", desc)
+        self.assertNotIn("▶️ Le stream complet", desc)
 
     def test_part_description_without_qualifying_chapters(self):
         part = {
@@ -184,7 +211,7 @@ class TestDescriptions(unittest.TestCase):
             "key_moments": [],
         }
         desc = part_description(part, "vid456", "randomguy42")
-        expected = "Just playing.\n\nStream complet: https://youtu.be/vid456\nLive sur https://kick.com/randomguy42"
+        expected = f"Just playing.\n\n{DEFAULT_LINKS_BLOCK}"
         self.assertEqual(desc, expected)
 
     def test_part_description_ignores_out_of_range_key_moments(self):
@@ -201,11 +228,170 @@ class TestDescriptions(unittest.TestCase):
                 {"at_s": 350, "what": "After end_s - out of range"},
             ],
         }
-        desc = part_description(part, "abc123xyz", "randomguy42")
-        expected_chaps = "0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
-        expected_links = "Stream complet: https://youtu.be/abc123xyz\nLive sur https://kick.com/randomguy42"
-        expected = f"Exploring open world.\n\n{expected_chaps}\n\n{expected_links}"
+        desc = part_description(part, None, "randomguy42")
+        expected_chaps = "⏱️ Chapitres\n0:00 Exploration\n0:30 Found a chest\n1:40 Fought wolves"
+        expected = f"Exploring open world.\n\n{expected_chaps}\n\n{DEFAULT_LINKS_BLOCK}"
         self.assertEqual(desc, expected)
+
+    def test_layout_blocks_and_order_full_vod(self):
+        parts = [
+            {"start_s": 0, "title": "Setup", "youtube_id": "id1"},
+            {"start_s": 2400, "title": "Calcul RAM", "youtube_id": "id2"},
+            {"start_s": 4800, "title": "Reaction", "youtube_id": "id3"},
+        ]
+        desc = full_description(
+            parts=parts,
+            channel="randomguy42",
+            vod_hook="Combien de RAM pour DeepSeek ? Je calcule tout en direct.",
+            hashtags=["#IA", "#DeepSeek", "#Tunisie"],
+            part_videos=parts,
+        )
+        blocks = desc.split("\n\n")
+        self.assertEqual(len(blocks), 5)
+        # Block 1: Hook
+        self.assertEqual(blocks[0], "Combien de RAM pour DeepSeek ? Je calcule tout en direct.")
+        # Block 2: Chapters
+        self.assertTrue(blocks[1].startswith("⏱️ Chapitres\n0:00 Setup\n40:00 Calcul RAM\n1:20:00 Reaction"))
+        # Block 3: Navigation
+        self.assertTrue(blocks[2].startswith("📺 Ce live découpé en 3 vidéos"))
+        self.assertIn("1/3 Setup https://youtu.be/id1", blocks[2])
+        self.assertIn("2/3 Calcul RAM https://youtu.be/id2", blocks[2])
+        self.assertIn("3/3 Reaction https://youtu.be/id3", blocks[2])
+        # Block 4: Links
+        self.assertEqual(blocks[3], DEFAULT_LINKS_BLOCK)
+        # Block 5: Hashtags
+        self.assertEqual(blocks[4], "#IA #DeepSeek #Tunisie")
+
+    def test_layout_blocks_and_order_part(self):
+        part = {
+            "start_s": 2400,
+            "end_s": 4800,
+            "title": "Calcul de RAM",
+            "hook": "Combien de RAM pour faire tourner DeepSeek chez soi ?",
+            "hashtags": ["#DeepSeek", "#Hardware"],
+            "key_moments": [
+                {"at_s": 2400, "what": "Intro calcul"},
+                {"at_s": 3000, "what": "Formule math"},
+                {"at_s": 4000, "what": "Résultat final"},
+            ],
+        }
+        all_parts = [
+            {"start_s": 0, "end_s": 2400, "title": "Intro", "youtube_id": "id1"},
+            part,
+            {"start_s": 4800, "end_s": 7200, "title": "Outro", "youtube_id": "id3"},
+        ]
+        desc = part_description(
+            part=part,
+            full_video_id="full_id_123",
+            channel="randomguy42",
+            all_parts=all_parts,
+            full_duration_s=7200,
+        )
+        blocks = desc.split("\n\n")
+        self.assertEqual(len(blocks), 5)
+        # Block 1: Hook
+        self.assertEqual(blocks[0], "Combien de RAM pour faire tourner DeepSeek chez soi ?")
+        # Block 2: Chapters
+        self.assertTrue(blocks[1].startswith("⏱️ Chapitres\n0:00 Intro calcul\n10:00 Formule math\n26:40 Résultat final"))
+        # Block 3: Navigation
+        self.assertTrue(blocks[2].startswith("📺 Les autres parties de ce live"))
+        self.assertIn("1/3 Intro https://youtu.be/id1", blocks[2])
+        self.assertNotIn("2/3 Calcul de RAM", blocks[2])
+        self.assertIn("3/3 Outro https://youtu.be/id3", blocks[2])
+        self.assertIn("▶️ Le stream complet (2h00) : https://youtu.be/full_id_123", blocks[2])
+        # Block 4: Links
+        self.assertEqual(blocks[3], DEFAULT_LINKS_BLOCK)
+        # Block 5: Hashtags
+        self.assertEqual(blocks[4], "#DeepSeek #Hardware")
+
+    def test_single_part_vod_no_navigation(self):
+        part = {
+            "start_s": 0,
+            "end_s": 1200,
+            "title": "Seule partie",
+            "hook": "Un stream complet d'une seule partie.",
+            "description": "Description ici.",
+        }
+        full_desc = full_description([part], channel="randomguy42", vod_hook="Hook complet")
+        self.assertNotIn("📺", full_desc)
+        self.assertNotIn("Les autres parties", full_desc)
+        self.assertNotIn("Ce live découpé", full_desc)
+
+        part_desc = part_description(part, full_video_id="full_id", channel="randomguy42", total_parts=1)
+        self.assertNotIn("📺", part_desc)
+        self.assertNotIn("Les autres parties", part_desc)
+        self.assertNotIn("▶️ Le stream complet", part_desc)
+
+    def test_hook_fallback_for_legacy_plans(self):
+        part_legacy = {
+            "start_s": 0,
+            "end_s": 1000,
+            "title": "Partie 1",
+            "description": "Ceci est la description classique sans hook.",
+        }
+        desc_legacy = part_description(part_legacy, channel="randomguy42")
+        self.assertTrue(desc_legacy.startswith("Ceci est la description classique sans hook."))
+
+        part_new = {
+            "start_s": 0,
+            "end_s": 1000,
+            "title": "Partie 1",
+            "hook": "Mon nouveau hook percutant !",
+            "description": "Ancienne description ignorée pour le hook.",
+        }
+        desc_new = part_description(part_new, channel="randomguy42")
+        self.assertTrue(desc_new.startswith("Mon nouveau hook percutant !"))
+
+    def test_links_from_config(self):
+        custom_links = [
+            ("Mon Site", "https://example.com"),
+            ("Twitter", "https://twitter.com/melek"),
+        ]
+        desc = full_description([], channel="randomguy42", links=custom_links)
+        self.assertIn("Mon Site : https://example.com", desc)
+        self.assertIn("Twitter : https://twitter.com/melek", desc)
+        self.assertNotIn("📸 Instagram", desc)
+
+    def test_tags_and_hashtags_sanitizing(self):
+        raw_tags = [" DeepSeek ", "IA", "<hack>", "deepseek", "TUNISIE", "A" * 600]
+        sanitized_t = sanitize_tags(raw_tags)
+        self.assertEqual(sanitized_t, ["deepseek", "ia", "hack", "tunisie"])
+
+        raw_hashtags = [" IA ", "#DeepSeek", "LLM Tunisie", "<script>", "#", "###IA"]
+        sanitized_h = sanitize_hashtags(raw_hashtags)
+        self.assertEqual(sanitized_h, ["#IA", "#DeepSeek", "#LLMTunisie", "#script"])
+
+    def test_byte_limit_trimming_order(self):
+        parts = [
+            {
+                "start_s": i * 30,
+                "title": f"Partie {i}",
+                "youtube_id": f"yt_id_{i}_" + "X" * 80,
+            }
+            for i in range(60)
+        ]
+        hook = "Mon super hook " + "H" * 150
+        desc = full_description(
+            parts,
+            channel="randomguy42",
+            vod_hook=hook,
+            part_videos=parts,
+        )
+        self.assertLessEqual(len(desc.encode("utf-8")), 5000)
+        self.assertIn("⏱️ Chapitres", desc)
+        self.assertIn("🔴 En live sur Kick", desc)
+        self.assertIn("📸 Instagram", desc)
+        self.assertIn("1/60 Partie 0", desc)
+        self.assertNotIn("60/60 Partie 59", desc)
+
+        long_hook = "H" * 200
+        desc_part = part_description(
+            {"start_s": 0, "end_s": 100, "title": "P1", "hook": long_hook},
+            channel="randomguy42",
+            total_parts=1,
+        )
+        self.assertLessEqual(len(desc_part.encode("utf-8")), 5000)
+        self.assertIn("🔴 En live sur Kick", desc_part)
 
 
 class TestWrapTitle(unittest.TestCase):
