@@ -421,32 +421,44 @@ def _build_links_block(channel: str, links: list | tuple | None) -> str:
     return "\n".join(lines)
 
 
-def _resolve_part_yt_id(part_source: Any, idx_1based: int, part_dict: dict) -> str | None:
-    if part_dict.get("youtube_id"):
-        return str(part_dict["youtube_id"])
+def _resolve_part_yt_id(part_source: Any, idx_1based: int, part_dict: Any = None) -> str | None:
+    if part_dict is not None:
+        try:
+            if hasattr(part_dict, "get") and part_dict.get("youtube_id"):
+                return str(part_dict["youtube_id"])
+            if hasattr(part_dict, "keys") and "youtube_id" in part_dict.keys() and part_dict["youtube_id"]:
+                return str(part_dict["youtube_id"])
+        except Exception:
+            pass
     if not part_source:
         return None
     if isinstance(part_source, dict):
-        return part_source.get(idx_1based)
-    if isinstance(part_source, list):
+        return part_source.get(idx_1based) or part_source.get(str(idx_1based))
+    if isinstance(part_source, (list, tuple)):
         if idx_1based - 1 < len(part_source):
             item = part_source[idx_1based - 1]
             if isinstance(item, str):
                 return item
         for item in part_source:
-            if isinstance(item, dict) or hasattr(item, "__getitem__"):
-                try:
-                    if item.get("idx") == idx_1based:
-                        return item.get("youtube_id")
-                except (AttributeError, TypeError):
-                    pass
-                try:
-                    if hasattr(item, "keys") and "idx" in item.keys() and item["idx"] == idx_1based:
-                        return item["youtube_id"]
-                except Exception:
-                    pass
             if isinstance(item, (tuple, list)) and len(item) >= 3 and item[0] == idx_1based:
                 return str(item[2])
+            if hasattr(item, "__getitem__"):
+                item_idx = None
+                try:
+                    if hasattr(item, "get"):
+                        item_idx = item.get("idx")
+                    elif hasattr(item, "keys") and "idx" in item.keys():
+                        item_idx = item["idx"]
+                except Exception:
+                    pass
+                if item_idx == idx_1based:
+                    try:
+                        if hasattr(item, "get") and item.get("youtube_id"):
+                            return str(item["youtube_id"])
+                        if hasattr(item, "keys") and "youtube_id" in item.keys() and item["youtube_id"]:
+                            return str(item["youtube_id"])
+                    except Exception:
+                        pass
     return None
 
 
@@ -587,29 +599,68 @@ def part_description(
     chaps_text = chapters(rebased_kms, end_s=part_duration)
     chaps_block = f"⏱️ Chapitres\n{chaps_text}" if chaps_text else ""
 
-    tot = total_parts or (len(all_parts) if all_parts is not None else (len(other_parts) + 1 if other_parts is not None else 1))
+    part_items = []
+    if all_parts:
+        for p in all_parts:
+            p_idx = None
+            try:
+                if hasattr(p, "get"):
+                    p_idx = p.get("idx")
+                elif hasattr(p, "keys") and "idx" in p.keys():
+                    p_idx = p["idx"]
+            except Exception:
+                pass
+            if p_idx == 0:
+                continue
+            part_items.append(p)
+
+    tot = total_parts or (len(part_items) if all_parts is not None else (len(other_parts) + 1 if other_parts is not None else 1))
     idx = part_index
     if idx is None:
-        if all_parts and part in all_parts:
-            idx = all_parts.index(part) + 1
-        elif part.get("idx"):
-            idx = int(part["idx"])
+        if part_items and part in part_items:
+            idx = part_items.index(part) + 1
         else:
-            idx = 1
+            p_idx = None
+            try:
+                if hasattr(part, "get"):
+                    p_idx = part.get("idx")
+                elif hasattr(part, "keys") and "idx" in part.keys():
+                    p_idx = part["idx"]
+            except Exception:
+                pass
+            idx = int(p_idx) if p_idx is not None else 1
 
     other_list: list[tuple[int, str, str]] = []
-    if all_parts:
-        for j, p in enumerate(all_parts, 1):
+    if part_items:
+        for loop_j, p in enumerate(part_items, 1):
+            p_idx = None
+            try:
+                if hasattr(p, "get"):
+                    p_idx = p.get("idx")
+                elif hasattr(p, "keys") and "idx" in p.keys():
+                    p_idx = p["idx"]
+            except Exception:
+                pass
+            j = int(p_idx) if p_idx is not None else loop_j
             if j != idx:
                 yt_id = _resolve_part_yt_id(p, j, p)
-                title = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", str(p.get("title", f"Partie {j}"))).strip()
+                p_title = None
+                try:
+                    if hasattr(p, "get"):
+                        p_title = p.get("title")
+                    elif hasattr(p, "keys") and "title" in p.keys():
+                        p_title = p["title"]
+                except Exception:
+                    pass
+                p_title = p_title or f"Partie {j}"
+                title = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", str(p_title)).strip()
                 if yt_id:
                     other_list.append((j, title, yt_id))
     elif other_parts:
         for item in other_parts:
             if isinstance(item, (tuple, list)) and len(item) >= 3:
                 other_list.append((int(item[0]), str(item[1]), str(item[2])))
-            elif isinstance(item, dict) or hasattr(item, "__getitem__"):
+            elif hasattr(item, "__getitem__"):
                 j = int(item.get("idx", 0)) if hasattr(item, "get") else int(item["idx"])
                 t = str(item.get("title", f"Partie {j}")) if hasattr(item, "get") else str(item["title"])
                 t = re.sub(r"\s*\|\s*Partie\s+\d+/\d+\s*$", "", t).strip()

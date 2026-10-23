@@ -110,6 +110,33 @@ def load_plan(plan_raw: str | None) -> tuple[list[dict], str]:
     return ([], "")
 
 
+def load_plan_data(plan_raw: str | None) -> dict:
+    """Load plan JSON returning dict with parts, vod_thumb_text, vod_hook, vod_tags, vod_hashtags."""
+    if not plan_raw:
+        return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
+    try:
+        data = json.loads(plan_raw)
+    except Exception:
+        return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
+    if isinstance(data, dict):
+        return {
+            "parts": data.get("parts", []),
+            "vod_thumb_text": str(data.get("vod_thumb_text", "")),
+            "vod_hook": str(data.get("vod_hook", "")),
+            "vod_tags": list(data.get("vod_tags", [])),
+            "vod_hashtags": list(data.get("vod_hashtags", [])),
+        }
+    elif isinstance(data, list):
+        return {
+            "parts": data,
+            "vod_thumb_text": "",
+            "vod_hook": "",
+            "vod_tags": [],
+            "vod_hashtags": [],
+        }
+    return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
+
+
 def expected_upload_count(plan: list | dict) -> int:
     """Compute expected number of upload rows from a plan (list or dict)."""
     if isinstance(plan, dict):
@@ -249,10 +276,143 @@ def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     return "uploading"
 
 
+def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> None:
+    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout."""
+    if isinstance(plan_data, dict):
+        plan = plan_data.get("parts", [])
+        vod_hook = plan_data.get("vod_hook", "")
+        vod_tags = plan_data.get("vod_tags", [])
+        vod_hashtags = plan_data.get("vod_hashtags", [])
+    else:
+        plan = plan_data
+        vod_hook = ""
+        vod_tags = []
+        vod_hashtags = []
+
+    non_game_categories = {
+        "Just Chatting",
+        "IRL",
+        "Cooking",
+        "Music",
+        "Art",
+        "Talk Shows & Podcasts",
+        "Science & Technology",
+        "Software & Game Development",
+        None,
+        "",
+    }
+    cat = vod["category"]
+    category_id = "22" if cat in non_game_categories else "20"
+
+    row_0 = next((u for u in ups if u["idx"] == 0), None)
+    full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
+
+    vod_id = vod["id"]
+    for row in ups:
+        if hasattr(row, "keys") and "desc_done" in row.keys() and row["desc_done"]:
+            continue
+        try:
+            if row["desc_done"]:
+                continue
+        except (IndexError, KeyError, TypeError):
+            pass
+
+        video_id = row["youtube_id"]
+        if not video_id:
+            continue
+
+        if row["idx"] == 0:
+            desc = media.full_description(
+                plan,
+                cfg.channel,
+                links=cfg.links,
+                vod_hook=vod_hook,
+                hashtags=vod_hashtags,
+                part_videos=ups,
+            )
+            tags = media.sanitize_tags(vod_tags)
+        else:
+            part_idx = row["idx"] - 1
+            part_dict = plan[part_idx] if part_idx < len(plan) else {}
+            desc = media.part_description(
+                part_dict,
+                full_youtube_id,
+                cfg.channel,
+                part_index=row["idx"],
+                total_parts=len(plan),
+                all_parts=ups,
+                full_duration_s=int(vod["duration_s"]),
+                links=cfg.links,
+                hashtags=part_dict.get("hashtags"),
+            )
+            tags = media.sanitize_tags(part_dict.get("tags"))
+
+        meta = {
+            "title": row["title"],
+            "description": desc,
+            "category_id": category_id,
+            "tags": tags,
+        }
+
+        youtube.update_snippet(video_id, meta)
+        db.update_upload(conn, vod_id, row["idx"], desc_done=1)
+
+
+def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
+    """Refresh metadata and descriptions for a published VOD in 'done' state."""
+    vod = db.get_vod(conn, vod_id)
+    if not vod:
+        raise RuntimeError(f"VOD {vod_id} not found in database")
+    if vod["state"] != "done":
+        raise RuntimeError(f"Cannot refresh metadata for VOD {vod_id}: state is {vod['state']} (must be 'done')")
+
+    plan_raw = vod["plan_json"]
+    if not plan_raw:
+        raise RuntimeError(f"Cannot refresh metadata for VOD {vod_id}: plan_json is empty")
+
+    plan_data = load_plan_data(plan_raw)
+    parts = plan_data.get("parts", [])
+
+    # Check if plan lacks the new fields
+    needs_gemini = (
+        not plan_data.get("vod_hook")
+        or any(not p.get("hook") for p in parts)
+    )
+
+    if needs_gemini:
+        logger.info(f"VOD {vod_id}: plan lacks descriptions v2 fields; calling Gemini to fill metadata")
+        raw_models = [cfg.model] + segment.FALLBACK_MODELS
+        models = list(dict.fromkeys(raw_models))
+        meta_result = segment.fill_metadata(
+            vod_title=vod["title"],
+            duration_s=int(vod["duration_s"]),
+            parts=parts,
+            models=models,
+        )
+        plan_data["vod_hook"] = str(meta_result.get("vod_hook", ""))
+        plan_data["vod_tags"] = list(meta_result.get("vod_tags", []))
+        plan_data["vod_hashtags"] = list(meta_result.get("vod_hashtags", []))
+
+        part_results_by_idx = {p["idx"]: p for p in meta_result.get("parts", []) if "idx" in p}
+        for i, part in enumerate(parts, 1):
+            res_p = part_results_by_idx.get(i)
+            if res_p:
+                part["hook"] = res_p.get("hook", part.get("hook", ""))
+                part["tags"] = res_p.get("tags", part.get("tags", []))
+                part["hashtags"] = res_p.get("hashtags", part.get("hashtags", []))
+
+        db.save_plan(conn, vod_id, plan_data)
+
+    db.clear_desc_done(conn, vod_id)
+    ups = db.uploads(conn, vod_id)
+    apply_final_descriptions(conn, cfg, vod, ups, plan_data)
+
+
 def step_upload(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     src = cfg.vod_dir(vod_id) / "source.mp4"
-    plan, _ = load_plan(vod["plan_json"])
+    plan_data = load_plan_data(vod["plan_json"])
+    plan = plan_data.get("parts", [])
     expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
     indices = {u["idx"] for u in ups}
@@ -296,16 +456,36 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
         video_id = row["youtube_id"]
         if not video_id:
             if row["idx"] == 0:
-                desc = media.full_description(plan, cfg.channel)
+                desc = media.full_description(
+                    plan,
+                    cfg.channel,
+                    links=cfg.links,
+                    vod_hook=plan_data.get("vod_hook"),
+                    hashtags=plan_data.get("vod_hashtags"),
+                    part_videos=ups,
+                )
+                tags = media.sanitize_tags(plan_data.get("vod_tags"))
             else:
                 part_idx = row["idx"] - 1
                 part_dict = plan[part_idx] if part_idx < len(plan) else {}
-                desc = media.part_description(part_dict, full_youtube_id, cfg.channel)
+                desc = media.part_description(
+                    part_dict,
+                    full_youtube_id,
+                    cfg.channel,
+                    part_index=row["idx"],
+                    total_parts=len(plan),
+                    all_parts=ups,
+                    full_duration_s=int(vod["duration_s"]),
+                    links=cfg.links,
+                    hashtags=part_dict.get("hashtags"),
+                )
+                tags = media.sanitize_tags(part_dict.get("tags"))
 
             meta = {
                 "title": row["title"],
                 "description": desc,
                 "category_id": category_id,
+                "tags": tags,
             }
 
             def on_session(session_url: str) -> None:
@@ -324,6 +504,10 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
         if not row["thumb_done"] and row["thumb"]:
             youtube.set_thumbnail(video_id, Path(row["thumb"]))
             db.update_upload(conn, vod_id, row["idx"], thumb_done=1)
+
+    # Final description pass
+    ups = db.uploads(conn, vod_id)
+    apply_final_descriptions(conn, cfg, vod, ups, plan_data)
 
     vod_dir = cfg.vod_dir(vod_id)
     if vod_dir.exists():
