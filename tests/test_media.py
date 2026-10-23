@@ -677,6 +677,37 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertEqual(info2["streams"][0]["width"], 1280)
         self.assertEqual(info2["streams"][0]["height"], 720)
 
+    def test_thumbnail_real_ffmpeg_font_path_with_colon(self):
+        dejavu = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+        if not dejavu.exists():
+            self.skipTest("DejaVuSans-Bold.ttf not found on system")
+
+        colon_dir = self.temp_dir / "a:b"
+        colon_dir.mkdir(parents=True, exist_ok=True)
+        font_copy = colon_dir / "font.ttf"
+        shutil.copy(dejavu, font_copy)
+
+        face_path = self.temp_dir / "face_colon.png"
+        cmd_face = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=blue:s=500x600",
+            "-frames:v", "1",
+            str(face_path),
+        ]
+        subprocess.run(cmd_face, check=True)
+
+        dest_face = self.temp_dir / "thumb_colon_face.jpg"
+        dest_noface = self.temp_dir / "thumb_colon_noface.jpg"
+
+        with patch("k2y.media._find_font", return_value=font_copy):
+            out1 = thumbnail(self.synthetic_video, at_s=2, hook="Colon Font Face", dest=dest_face, face=face_path)
+            out2 = thumbnail(self.synthetic_video, at_s=2, hook="Colon Font No Face", dest=dest_noface)
+
+        self.assertEqual(out1, dest_face)
+        self.assertTrue(dest_face.exists())
+        self.assertEqual(out2, dest_noface)
+        self.assertTrue(dest_noface.exists())
+
 
 
     def test_thumbnail_real_ffmpeg_with_and_without_face_in_hostile_dir(self):

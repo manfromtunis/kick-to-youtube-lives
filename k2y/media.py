@@ -219,17 +219,7 @@ def thumbnail(
 
     try:
         font_file = _find_font()
-        if font_file:
-            font_esc = (
-                _escape_font_path(font_file)
-                .replace(",", r"\,")
-                .replace("[", r"\[")
-                .replace("]", r"\]")
-                .replace(" ", r"\ ")
-            )
-            font_arg = f"fontfile={font_esc}:"
-        else:
-            font_arg = ""
+        font_arg = f"fontfile='{_escape_font_path(font_file)}':" if font_file else ""
 
         # Layout rules: text fits in left 60% starting at x=50
         max_w = (1280 - 100) if face_path is None else (int(1280 * 0.60) - 50)
