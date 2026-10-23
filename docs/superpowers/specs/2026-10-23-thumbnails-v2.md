@@ -41,9 +41,20 @@ are at the end of this file.
 - The prompt also names the streamer **Melek** (Gemini called him "Malik") and asks for
   French `description` fields.
 
+## Cut-outs (added 2026-10-23 at Melek's request)
+
+- Melek's photos are landscape phone shots with the face centred, so the code crops them to
+  a centred 4:5 portrait before scaling.
+- Background removal happens once per photo, outside k2y, so k2y keeps no extra dependency:
+  `rembg i -m birefnet-portrait in.jpg out.png` in a throwaway virtualenv. Put the PNGs in
+  `faces/`.
+- The code keeps the PNG's alpha and draws an 8 px white rim from the dilated alpha, so a
+  dark t-shirt stays visible on the dark background. Under an opaque JPG the rim is hidden,
+  so JPGs render as before.
+
 ## Out of scope
 
-Picking webcam frames automatically, background removal, A/B testing thumbnails.
+Picking webcam frames automatically, background removal inside k2y, A/B testing thumbnails.
 
 ## Prototype (reference)
 
