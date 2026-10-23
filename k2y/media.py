@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import textwrap
 from typing import Any
@@ -25,12 +26,6 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
-
-
-def _escape_font_path(p: Path) -> str:
-    """Convert path to forward slashes, escaping colons and single quotes for ffmpeg filter syntax."""
-    s = str(p).replace("\\", "/")
-    return s.replace(":", r"\:").replace("'", r"\'")
 
 
 def _find_font() -> Path | None:
@@ -211,6 +206,7 @@ def thumbnail(
     tf2_name = f"{safe_stem}_2.txt"
     tf1_path = dest.parent / tf1_name
     tf2_path = dest.parent / tf2_name
+    font_copy = dest.parent / f"{safe_stem}_font.ttf"
 
     tf1_path.write_text(line1, encoding="utf-8")
     tf2_path.write_text(line2, encoding="utf-8")
@@ -219,7 +215,12 @@ def thumbnail(
 
     try:
         font_file = _find_font()
-        font_arg = f"fontfile='{_escape_font_path(font_file)}':" if font_file else ""
+        font_arg = ""
+        if font_file:
+            # Same trick as the textfiles: a relative ASCII name in cwd, so no path
+            # (C:, quotes, commas) ever reaches the filter string.
+            shutil.copyfile(font_file, font_copy)
+            font_arg = f"fontfile={font_copy.name}:"
 
         # Layout rules: text fits in left 60% starting at x=50
         max_w = (1280 - 100) if face_path is None else (int(1280 * 0.60) - 50)
@@ -320,6 +321,7 @@ def thumbnail(
     finally:
         tf1_path.unlink(missing_ok=True)
         tf2_path.unlink(missing_ok=True)
+        font_copy.unlink(missing_ok=True)
 
 
 def _fit(text: str, suffix: str) -> str:

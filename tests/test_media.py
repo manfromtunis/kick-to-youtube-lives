@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 from k2y.kick import KickError
 from k2y.media import (
-    _escape_font_path,
     chapters,
     cut,
     format_duration,
@@ -485,15 +484,23 @@ class TestHookLines(unittest.TestCase):
         self.assertEqual(hook_lines("MOMENT UNIQUE DU JOUR"), ("MOMENT", "UNIQUE DU JOUR"))
 
 class TestFilterPath(unittest.TestCase):
-    def test_windows_path_conversion_and_escaping(self):
-        p = Path(r"C:\Windows\Fonts\arialbd.ttf")
-        filtered = _escape_font_path(p)
-        self.assertEqual(filtered, r"C\:/Windows/Fonts/arialbd.ttf")
-
-    def test_windows_path_with_single_quote(self):
-        p = Path(r"C:\Users\Melek's Files\font.ttf")
-        filtered = _escape_font_path(p)
-        self.assertEqual(filtered, r"C\:/Users/Melek\'s Files/font.ttf")
+    def test_font_goes_in_as_relative_copy(self):
+        # A Windows-style font path must never reach the filter string.
+        with tempfile.TemporaryDirectory() as d:
+            font = Path(d) / "C:fonts, o'k.ttf"
+            font.write_bytes(b"fake")
+            dest = Path(d) / "out" / "thumb_0.jpg"
+            with patch("k2y.media._find_font", return_value=font), \
+                 patch("k2y.media.probe_duration", return_value=20.0), \
+                 patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=1, stderr="stop")
+                with self.assertRaises(RuntimeError):
+                    thumbnail(Path(d) / "v.mp4", 1, "HOOK", dest)
+            args = mock_run.call_args[0][0]
+            vf = args[args.index("-vf") + 1]
+            self.assertIn("fontfile=thumb_0_font.ttf:", vf)
+            self.assertNotIn(d, vf)
+            self.assertFalse((dest.parent / "thumb_0_font.ttf").exists())
 
     def test_font_fallback_omits_fontfile(self):
         with patch("k2y.media._find_font", return_value=None),              patch("k2y.media.probe_duration", return_value=20.0),              patch("subprocess.run") as mock_run:
