@@ -708,6 +708,18 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertEqual(out2, dest_noface)
         self.assertTrue(dest_noface.exists())
 
+    def test_thumbnail_drawtext_expansion_none_renders_special_hooks(self):
+        dest_pts = self.temp_dir / "thumb_pts.jpg"
+        dest_unbalanced = self.temp_dir / "thumb_unbalanced.jpg"
+
+        out_pts = thumbnail(self.synthetic_video, at_s=2, hook="Hook %{pts}", dest=dest_pts)
+        self.assertEqual(out_pts, dest_pts)
+        self.assertTrue(dest_pts.exists())
+
+        out_unbalanced = thumbnail(self.synthetic_video, at_s=2, hook="Hook %{", dest=dest_unbalanced)
+        self.assertEqual(out_unbalanced, dest_unbalanced)
+        self.assertTrue(dest_unbalanced.exists())
+
 
 
     def test_thumbnail_real_ffmpeg_with_and_without_face_in_hostile_dir(self):

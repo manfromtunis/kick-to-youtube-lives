@@ -228,11 +228,11 @@ def thumbnail(
 
         dt1 = (
             f"drawtext={font_arg}textfile={tf1_name}:"
-            f"fontsize={fs1}:fontcolor=#FFD400:borderw=10:bordercolor=black:x=50:y=210"
+            f"fontsize={fs1}:fontcolor=#FFD400:borderw=10:bordercolor=black:x=50:y=210:expansion=none"
         )
         dt2 = (
             f"drawtext={font_arg}textfile={tf2_name}:"
-            f"fontsize={fs2}:fontcolor=white:borderw=10:bordercolor=black:x=50:y=400"
+            f"fontsize={fs2}:fontcolor=white:borderw=10:bordercolor=black:x=50:y=400:expansion=none"
         )
 
         if face_path is not None:
