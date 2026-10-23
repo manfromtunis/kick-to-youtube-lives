@@ -119,6 +119,8 @@ def sanitize_hook(text: str | None, fallback_title: str = "") -> str:
         fb = (fallback_title or "").strip()
         fb = fb.replace("<", "").replace(">", "")
         fb = re.sub(r"[\r\n]+", " ", fb).strip()
+        # Kick titles chain ideas with ; | , : and the first idea makes the best hook.
+        fb = re.split(r"[;|,:]", fb)[0]
         words = fb.split()[:3]
         cleaned = " ".join(words)
 

@@ -242,6 +242,8 @@ class TestHookSanitizing(unittest.TestCase):
         self.assertEqual(sanitize_hook("", "Chill gaming session | Stream du 22/10/2026"), "CHILL GAMING SESSION")
         self.assertEqual(sanitize_hook(None, "My Great Stream"), "MY GREAT STREAM")
         self.assertEqual(sanitize_hook("   <> \n ", "Short title"), "SHORT TITLE")
+        self.assertEqual(sanitize_hook("", "sick stream, malla jaw, tinkering"), "SICK STREAM")
+        self.assertEqual(sanitize_hook("", "stream layéli zomboid; mafamech jaw"), "STREAM LAYÉLI ZOMBOID")
 
     def test_sanitize_hook_cuts_at_22_chars_on_word_boundary(self):
         # 21 chars fits exactly
