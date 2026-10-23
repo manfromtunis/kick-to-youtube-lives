@@ -134,6 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Install Task Scheduler task on Windows or print crontab line",
     )
 
+        # refresh-metadata
+    p_refresh = subparsers.add_parser(
+        "refresh-metadata",
+        help="Rebuild descriptions and update YouTube metadata for published VODs",
+    )
+    p_refresh.add_argument("vod_id", type=int, nargs="?", default=None, help="Kick VOD ID")
+    p_refresh.add_argument("--all", action="store_true", help="Refresh all VODs in done state")
+
     args = parser.parse_args(argv)
     if not args.command:
         if sys.stderr is not None:
@@ -312,6 +320,51 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             return _with_lock(cfg, do_auth)
+
+        elif args.command == "refresh-metadata":
+            if not args.all and args.vod_id is None:
+                _print_err("Error: must specify vod_id or --all")
+                return 2
+            if args.all and args.vod_id is not None:
+                _print_err("Error: cannot specify both vod_id and --all")
+                return 2
+
+            def do_refresh():
+                conn = db.connect(cfg.db_path)
+                if args.all:
+                    vods = [v for v in db.all_vods(conn) if v["state"] == "done"]
+                    if not vods:
+                        print("No VODs in done state to refresh.")
+                        return 0
+                else:
+                    conn, vod = _vod_or_err(cfg, args.vod_id)
+                    if not vod:
+                        return 1
+                    if vod["state"] != "done":
+                        _print_err(f"Cannot refresh metadata for VOD {args.vod_id}: state is {vod['state']} (must be 'done')")
+                        return 1
+                    vods = [vod]
+
+                for v in vods:
+                    try:
+                        print(f"Refreshing metadata for VOD {v['id']} ({v['title']})...")
+                        pipeline.refresh_metadata(conn, cfg, v["id"])
+                        print(f"Successfully refreshed metadata for VOD {v['id']}")
+                    except pipeline.StopRun as sr:
+                        _print_err(f"Stopped: {sr}")
+                        return 1
+                    except Exception as e:
+                        if isinstance(e, (youtube.QuotaExceeded, youtube.AuthRequired, segment.DailyQuota)):
+                            msg = str(e)
+                            db.set_error(conn, v["id"], msg)
+                            _print_err(f"Error on VOD {v['id']}: {msg}")
+                            return 1
+                        logger.exception(f"Error refreshing metadata for VOD {v['id']}: {e}")
+                        _print_err(f"Error refreshing metadata for VOD {v['id']}: {e}")
+                        return 1
+                return 0
+
+            return _with_lock(cfg, do_refresh)
 
         elif args.command == "install-timer":
             if _is_windows():

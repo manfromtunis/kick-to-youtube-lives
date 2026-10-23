@@ -275,7 +275,7 @@ class TestCLI(unittest.TestCase):
         self.assertTrue(pipeline.acquire_lock(lock_path))
 
         try:
-            for cmd_args in [["plan", "123"], ["retry", "123"], ["skip", "123"], ["backfill", "123"], ["auth"], ["set-upload", "123", "0", "yt_1"]]:
+            for cmd_args in [["plan", "123"], ["retry", "123"], ["skip", "123"], ["backfill", "123"], ["auth"], ["set-upload", "123", "0", "yt_1"], ["refresh-metadata", "123"]]:
                 stderr = io.StringIO()
                 with patch("sys.stderr", stderr):
                     ret = cli.main(cmd_args)
@@ -552,6 +552,76 @@ class TestCLI(unittest.TestCase):
         self.assertTrue(log_file.exists())
         log_content = log_file.read_text(encoding="utf-8")
         self.assertIn("JSONDecodeError", log_content)
+
+
+
+    def test_refresh_metadata_cli_single_and_all(self):
+        vod1 = {
+            "id": 961,
+            "title": "VOD 961 Done",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/961",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        vod2 = {
+            "id": 962,
+            "title": "VOD 962 Done",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/962",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        vod3 = {
+            "id": 963,
+            "title": "VOD 963 Not Done",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/963",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod1)
+        db.set_state(self.conn, 961, "done")
+        db.upsert_vod(self.conn, vod2)
+        db.set_state(self.conn, 962, "done")
+        db.upsert_vod(self.conn, vod3)
+        db.set_state(self.conn, 963, "cut")
+
+        refreshed_ids = []
+        def fake_refresh(conn, cfg, vod_id):
+            refreshed_ids.append(vod_id)
+
+        # 1. Single VOD
+        stdout1 = io.StringIO()
+        with patch("k2y.pipeline.refresh_metadata", side_effect=fake_refresh), patch("sys.stdout", stdout1):
+            ret = cli.main(["refresh-metadata", "961"])
+        self.assertEqual(ret, 0)
+        self.assertEqual(refreshed_ids, [961])
+        self.assertIn("Successfully refreshed metadata for VOD 961", stdout1.getvalue())
+
+        # 2. --all (should refresh 961 and 962, but not 963)
+        refreshed_ids.clear()
+        stdout2 = io.StringIO()
+        with patch("k2y.pipeline.refresh_metadata", side_effect=fake_refresh), patch("sys.stdout", stdout2):
+            ret = cli.main(["refresh-metadata", "--all"])
+        self.assertEqual(ret, 0)
+        self.assertEqual(sorted(refreshed_ids), [961, 962])
+
+        # 3. Refuses when not done
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["refresh-metadata", "963"])
+        self.assertEqual(ret, 1)
+        self.assertIn("must be 'done'", stderr.getvalue())
+
+        # 4. Arg validation
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            self.assertEqual(cli.main(["refresh-metadata"]), 2)
+            self.assertEqual(cli.main(["refresh-metadata", "961", "--all"]), 2)
 
 
 if __name__ == "__main__":
