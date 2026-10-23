@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_refresh.add_argument("vod_id", type=int, nargs="?", default=None, help="Kick VOD ID")
     p_refresh.add_argument("--all", action="store_true", help="Refresh all VODs in done state")
-    p_refresh.add_argument("--force", action="store_true", help="Re-send videos already at the current layout")
+    p_refresh.add_argument("--force", action="store_true", help="Re-send videos already at the current layout (one VOD at a time: --all --force restarts from zero on each run)")
 
     args = parser.parse_args(argv)
     if not args.command:

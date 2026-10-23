@@ -46,9 +46,10 @@ class QuotaExceeded(Exception):
 class YouTubeError(Exception):
     """General YouTube API error. status is the HTTP code when there is one."""
 
-    def __init__(self, msg: str, status: int | None = None):
+    def __init__(self, msg: str, status: int | None = None, reasons: tuple[str, ...] = ()):
         super().__init__(msg)
         self.status = status
+        self.reasons = reasons
 
 
 class ThumbnailsForbidden(Exception):
@@ -66,6 +67,7 @@ _RETRYABLE = (OSError, http.client.HTTPException)
 def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None) -> Exception:
     code = e.code
     reason = str(getattr(e, "reason", "HTTPError"))
+    parsed_reasons: tuple[str, ...] = ()
     msg = ""
     try:
         raw = raw_body if raw_body is not None else e.read().decode("utf-8", errors="replace")
@@ -92,6 +94,10 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
                         for r in reasons:
                             if r in QUOTA_REASONS:
                                 return QuotaExceeded(f"{r}: {msg}")
+                    # 401 from the Data API, or a token without the upload scope: re-auth, don't retry.
+                    if code == 401 or "insufficientPermissions" in reasons:
+                        return AuthRequired(AUTH_REQUIRED_MSG)
+                    parsed_reasons = tuple(r for r in reasons if isinstance(r, str))
                     if reasons:
                         reason = ", ".join(reasons)
                 elif isinstance(err, str):
@@ -105,7 +111,7 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
     err_str = f"HTTP {code}: {reason}"
     if msg:
         err_str += f" - {msg}"
-    return YouTubeError(err_str, status=code)
+    return YouTubeError(err_str, status=code, reasons=parsed_reasons)
 
 
 def _load_client_secret() -> tuple[str, str, str, str]:

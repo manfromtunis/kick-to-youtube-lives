@@ -97,6 +97,19 @@ class TestYouTube(unittest.TestCase):
         self.temp_dir.cleanup()
 
     # 1. Quota error parsing raises QuotaExceeded for quotaExceeded, uploadLimitExceeded, dailyLimitExceeded on any 4xx
+    def _api_error(self, code: int, reason: str):
+        body = json.dumps({"error": {"code": code, "message": "m", "errors": [{"reason": reason}]}}).encode()
+        return youtube._parse_youtube_error(_make_http_error(code, "x", body))
+
+    def test_auth_reasons_map_to_auth_required(self) -> None:
+        self.assertIsInstance(self._api_error(401, "authError"), youtube.AuthRequired)
+        self.assertIsInstance(self._api_error(403, "insufficientPermissions"), youtube.AuthRequired)
+
+    def test_youtube_error_keeps_status_and_reasons(self) -> None:
+        e = self._api_error(403, "userRateLimitExceeded")
+        self.assertIsInstance(e, youtube.YouTubeError)
+        self.assertEqual((e.status, e.reasons), (403, ("userRateLimitExceeded",)))
+
     def test_quota_error_parsing_raises_quota_exceeded(self) -> None:
         quota_body = json.dumps({
             "error": {

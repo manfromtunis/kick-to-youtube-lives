@@ -125,8 +125,7 @@ def load_plan_data(plan_raw: str | None) -> dict:
         "vod_hook": str(data.get("vod_hook") or ""),
         "vod_tags": list(data.get("vod_tags") or []),
         "vod_hashtags": list(data.get("vod_hashtags") or []),
-        "meta_filled": bool(data.get("meta_filled")),
-    }
+    } | ({"meta_filled": True} if data.get("meta_filled") else {})
 
 
 def expected_upload_count(plan: list | dict) -> int:
@@ -319,7 +318,9 @@ DESC_VERSION = 2
 
 def _permanent(e: Exception) -> bool:
     """A YouTube error that retrying the same request won't fix (bad metadata, deleted video)."""
-    return getattr(e, "status", None) in (400, 403, 404) and "rateLimit" not in str(e)
+    reasons = getattr(e, "reasons", ()) or (str(e),)
+    transient = any("ratelimit" in r.lower() or "backend" in r.lower() for r in reasons)
+    return getattr(e, "status", None) in (400, 403, 404) and not transient
 
 
 def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> int:
@@ -394,6 +395,7 @@ def refresh_metadata(conn, cfg: config.Config, vod_id: int, force: bool = False)
                 part["hashtags"] = res_p.get("hashtags", part.get("hashtags", []))
 
         plan_data["meta_filled"] = True
+        plan_data.pop("desc_ver", None)  # new hooks: the live descriptions are stale
         db.save_plan(conn, vod_id, plan_data)
 
     # Rows already at the current layout stay done, so a quota stop (or --all over several

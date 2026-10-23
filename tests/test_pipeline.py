@@ -1430,5 +1430,26 @@ class TestPipeline(unittest.TestCase):
             again.assert_not_called()
 
 
+    def test_permanent_only_for_real_refusals(self):
+        E = youtube.YouTubeError
+        self.assertTrue(pipeline._permanent(E("HTTP 400: invalidTags", 400, ("invalidTags",))))
+        self.assertTrue(pipeline._permanent(E("HTTP 404: videoNotFound", 404, ("videoNotFound",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 403: userRateLimitExceeded", 403, ("userRateLimitExceeded",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 403: rateLimitExceeded", 403, ("rateLimitExceeded",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 503: backendError", 503, ("backendError",))))
+        self.assertFalse(pipeline._permanent(E("no status")))
+
+    def test_refresh_after_gemini_fill_resends_finished_vod(self):
+        # Finished by the pipeline (desc_ver set) with a legacy plan: the fill must go live.
+        self._legacy_done_vod(997)
+        plan = json.loads(db.get_vod(self.conn, 997)["plan_json"])
+        db.save_plan(self.conn, 997, {"parts": plan, "desc_ver": pipeline.DESC_VERSION})
+        filled = {"vod_hook": "H", "parts": [{"idx": 1, "hook": "a"}, {"idx": 2, "hook": "b"}]}
+        with patch("k2y.segment.fill_metadata", return_value=filled), \
+             patch("k2y.youtube.update_snippet") as upd:
+            pipeline.refresh_metadata(self.conn, self.cfg, 997)
+        self.assertEqual(upd.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
