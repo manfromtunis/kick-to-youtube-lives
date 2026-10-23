@@ -40,8 +40,10 @@ def ensure_since(cfg: Config) -> Config:
     if p.exists():
         try:
             raw = json.loads(p.read_text(encoding="utf-8-sig"))
-        except Exception:
-            raw = {}
+        except Exception as e:
+            raise ValueError(f"Invalid JSON in config file {p}: {e}") from e
+        if not isinstance(raw, dict):
+            raise ValueError(f"Config file {p} must contain a JSON object, got {type(raw).__name__}")
     stored_since = raw.get("since")
     if stored_since:
         return dataclasses.replace(cfg, since=str(stored_since))

@@ -34,6 +34,8 @@ All commands (`py -m k2y ...`) must be run from the repository root folder (`kic
    ```cmd
    py -m k2y install-timer
    ```
+   This schedules `schtasks` to run `k2y-task.pyw` with `pythonw.exe` directly (no console popups or `.cmd` scripts).
+
    **Battery condition**: By default, Windows Task Scheduler only runs tasks when connected to AC power. To allow runs while on battery, open **Task Scheduler** (`taskschd.msc`), select **Task Scheduler Library > k2y**, open **Properties > Conditions**, and untick **"Start the task only if the computer is on AC power"** (and untick "Stop if the computer switches to battery power").
 6. Check pipeline status:
    ```cmd
@@ -50,8 +52,8 @@ Run all commands from the `kick-to-youtube-lives` root directory:
 
 ### Logs
 Logs are kept in `%USERPROFILE%\.local\share\k2y\`:
-- `k2y.log`: pipeline state machine and execution logs written by Python's `RotatingFileHandler` (5 MB max, 3 backups, UTF-8).
-- `k2y-task.log`: scheduler wrapper log capturing console stdout/stderr redirects from the automated Task Scheduler runner.
+- `k2y.log`: pipeline state machine and execution logs, including any uncaught exceptions from `k2y-task.pyw` (5 MB max, 3 backups, UTF-8).
+- `k2y-task.log`: crontab redirect log on Linux.
 
 ### Privacy & Quotas
 - **Private-only**: All videos are uploaded strictly with `privacyStatus: private`. There is no option to publish publicly.

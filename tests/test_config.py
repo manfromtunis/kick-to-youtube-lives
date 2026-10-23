@@ -70,6 +70,28 @@ class TestConfig(unittest.TestCase):
             mode = stat.S_IMODE(sec_file.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
+    def test_ensure_since_sets_today_when_no_config(self):
+        cfg = config.Config(channel="chan")
+        cfg_after = config.ensure_since(cfg)
+        self.assertIsNotNone(cfg_after.since)
+        cfg_file = self.config_dir / "config.json"
+        self.assertTrue(cfg_file.exists())
+        saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved.get("since"), cfg_after.since)
+
+    def test_ensure_since_invalid_json_raises_clear_error_and_does_not_overwrite(self):
+        cfg_file = self.config_dir / "config.json"
+        bad_json = "{\ninvalid json content..."
+        cfg_file.write_text(bad_json, encoding="utf-8")
+
+        cfg = config.Config(channel="chan")
+        with self.assertRaises(ValueError) as ctx:
+            config.ensure_since(cfg)
+
+        self.assertIn("Invalid JSON in config file", str(ctx.exception))
+        # Ensure file was not overwritten
+        self.assertEqual(cfg_file.read_text(encoding="utf-8"), bad_json)
+
 
 if __name__ == "__main__":
     unittest.main()

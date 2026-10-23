@@ -78,18 +78,29 @@ def pending_vods(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return cur.fetchall()
 
 
-def set_state(conn: sqlite3.Connection, vod_id: int, state: str, error: str | None = None) -> None:
-    """Update state, error, and updated_at for a VOD. Resets attempts when error is None."""
+def set_state(
+    conn: sqlite3.Connection,
+    vod_id: int,
+    state: str,
+    error: str | None = None,
+    reset_attempts: bool = True,
+) -> None:
+    """Update state, error, and updated_at for a VOD. Resets attempts when error is None and reset_attempts is True."""
     with conn:
-        if error is None:
+        if error is not None:
+            conn.execute(
+                "UPDATE vods SET state = ?, error = ?, updated_at = ? WHERE id = ?",
+                (state, error, _now_iso(), vod_id),
+            )
+        elif reset_attempts:
             conn.execute(
                 "UPDATE vods SET state = ?, error = NULL, attempts = 0, updated_at = ? WHERE id = ?",
                 (state, _now_iso(), vod_id),
             )
         else:
             conn.execute(
-                "UPDATE vods SET state = ?, error = ?, updated_at = ? WHERE id = ?",
-                (state, error, _now_iso(), vod_id),
+                "UPDATE vods SET state = ?, updated_at = ? WHERE id = ?",
+                (state, _now_iso(), vod_id),
             )
 
 
@@ -180,11 +191,22 @@ def clear_pending_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
 
 
 def delete_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
-    """Delete all uploads for vod_id."""
+    """Delete uploads for vod_id where youtube_id and upload_session are NULL.
+
+    Raises RuntimeError if any rows with youtube_id or upload_session remain for that VOD.
+    """
     with conn:
         conn.execute(
-            "DELETE FROM uploads WHERE vod_id = ?",
+            "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL AND upload_session IS NULL",
             (vod_id,),
+        )
+    remaining = conn.execute(
+        "SELECT idx, youtube_id, upload_session FROM uploads WHERE vod_id = ? AND (youtube_id IS NOT NULL OR upload_session IS NOT NULL)",
+        (vod_id,),
+    ).fetchall()
+    if remaining:
+        raise RuntimeError(
+            f"cannot delete uploads for VOD {vod_id}: {len(remaining)} uploaded or in-progress rows remain"
         )
 
 

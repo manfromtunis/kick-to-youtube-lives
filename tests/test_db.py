@@ -105,6 +105,15 @@ class TestDB(unittest.TestCase):
         row = db.get_vod(self.conn, 1)
         self.assertEqual(row["error"], "explicit error")
 
+        # Backward transition: reset_attempts=False keeps attempts
+        db.record_error(self.conn, 1, "failed again")
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["attempts"], 1)
+        db.set_state(self.conn, 1, "new", reset_attempts=False)
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["state"], "new")
+        self.assertEqual(row["attempts"], 1)
+
     def test_set_duration(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
         db.upsert_vod(self.conn, vod)
@@ -119,8 +128,31 @@ class TestDB(unittest.TestCase):
         db.upsert_upload(self.conn, 1, 1, "Part 1", 0, 50)
         self.assertEqual(len(db.uploads(self.conn, 1)), 2)
 
+        # Rows without youtube_id or upload_session are deleted cleanly
         db.delete_uploads(self.conn, 1)
         self.assertEqual(len(db.uploads(self.conn, 1)), 0)
+
+    def test_delete_uploads_raises_when_rows_have_youtube_id_or_session(self):
+        vod = {"id": 2, "title": "VOD 2", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url2"}
+        db.upsert_vod(self.conn, vod)
+        db.upsert_upload(self.conn, 2, 0, "Full VOD", 0, 100)
+        db.upsert_upload(self.conn, 2, 1, "Part 1", 0, 50)
+        db.update_upload(self.conn, 2, 0, youtube_id="yt_existing")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            db.delete_uploads(self.conn, 2)
+        self.assertIn("cannot delete uploads for VOD 2", str(ctx.exception))
+
+        # Check that the unuploaded row (idx 1) was deleted, but uploaded row (idx 0) remains
+        ups = db.uploads(self.conn, 2)
+        self.assertEqual(len(ups), 1)
+        self.assertEqual(ups[0]["idx"], 0)
+
+        # Test upload_session as well
+        db.upsert_upload(self.conn, 2, 1, "Part 1", 0, 50)
+        db.update_upload(self.conn, 2, 1, upload_session="http://upload.session")
+        with self.assertRaises(RuntimeError):
+            db.delete_uploads(self.conn, 2)
 
     def test_record_error_increments_and_fails_at_max(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}

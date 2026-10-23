@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from . import config, db, kick, pipeline, segment, youtube
+from . import config, db, kick, pipeline, youtube
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 
@@ -142,23 +142,15 @@ def main(argv: list[str] | None = None) -> int:
 
                 source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
                 if not source_file.exists():
-                    kick.download(dict(vod), source_file)
-                    dur = int(kick.probe_duration(source_file))
-                    db.set_duration(conn, args.vod_id, dur)
+                    pipeline.step_download(conn, cfg, vod)
                     db.set_state(conn, args.vod_id, "downloaded")
                     vod = db.get_vod(conn, args.vod_id)
 
-                parts = segment.plan(
-                    source_file,
-                    cfg.vod_dir(args.vod_id),
-                    int(vod["duration_s"]),
-                    int(cfg.min_part_minutes),
-                    str(cfg.model),
-                )
-
-                db.delete_uploads(conn, args.vod_id)
-                db.save_plan(conn, args.vod_id, parts)
+                vod_for_plan = dict(vod, plan_json=None)
+                pipeline.step_plan(conn, cfg, vod_for_plan)
                 db.set_state(conn, args.vod_id, "planned")
+                vod = db.get_vod(conn, args.vod_id)
+                parts = json.loads(vod["plan_json"]) if vod and vod["plan_json"] else []
 
                 print(f"{'Start':<8} {'End':<8} {'Min':<6} {'Title'}")
                 for p in parts:
@@ -234,7 +226,9 @@ def main(argv: list[str] | None = None) -> int:
                 if inserted:
                     print(f"Backfilled VOD {args.vod_id}: {match['title']}")
                 else:
-                    print("already known")
+                    row = db.get_vod(conn, args.vod_id)
+                    st = row["state"] if row else "unknown"
+                    print(f"VOD {args.vod_id} already known (state {st})")
                 return 0
 
             return _with_lock(cfg, do_backfill)
@@ -244,19 +238,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "install-timer":
-            pythonw = Path(sys.executable).with_name("pythonw.exe")
-            python_exe = str(pythonw) if pythonw.exists() else sys.executable
-            task_log = cfg.work_dir / "k2y-task.log"
             if _is_windows():
-                cfg.work_dir.mkdir(parents=True, exist_ok=True)
-                cmd_path = cfg.work_dir / "k2y-run.cmd"
-                cmd_content = (
-                    f"@echo off\n"
-                    f'cd /d "{REPO_DIR}"\n'
-                    f'"{python_exe}" -m k2y run >> "{task_log}" 2>&1\n'
-                )
-                cmd_encoding = "mbcs" if sys.platform == "win32" else "utf-8"
-                cmd_path.write_text(cmd_content, encoding=cmd_encoding)
+                exe_str = str(sys.executable)
+                sep = "\\" if "\\" in exe_str else "/"
+                if sep in exe_str:
+                    py_dir = exe_str.rsplit(sep, 1)[0]
+                    pythonw = f"{py_dir}{sep}pythonw.exe"
+                else:
+                    pythonw = "pythonw.exe"
+                python_exe = pythonw if os.path.exists(pythonw) else exe_str
+                task_script = str(REPO_DIR / "k2y-task.pyw").replace("/", "\\")
+                tr_val = f'"{python_exe}" "{task_script}"'
                 subprocess.run(
                     [
                         "schtasks",
@@ -269,14 +261,16 @@ def main(argv: list[str] | None = None) -> int:
                         "/TN",
                         "k2y",
                         "/TR",
-                        '"' + str(cmd_path) + '"',
+                        tr_val,
                     ],
                     check=True,
                 )
                 print("Task 'k2y' scheduled successfully.")
                 print("To check: schtasks /Query /TN k2y")
                 print("To remove: schtasks /Delete /TN k2y /F")
+                print("Battery note: Windows Task Scheduler runs on AC power only by default; see README to allow running on battery.")
             else:
+                task_log = cfg.work_dir / "k2y-task.log"
                 repo_q = shlex.quote(str(REPO_DIR))
                 py_q = shlex.quote(sys.executable)
                 log_q = shlex.quote(str(task_log))

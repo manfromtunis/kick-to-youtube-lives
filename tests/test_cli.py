@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from k2y import cli, config, db, segment, youtube
+from k2y import cli, config, db, pipeline, youtube
 
 
 class TestCLI(unittest.TestCase):
@@ -21,12 +21,6 @@ class TestCLI(unittest.TestCase):
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir = Path(self.tmp.name) / "work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
-
-        class FakeAuthRequired(Exception):
-            pass
-
-        self.auth_req_patcher = patch.object(youtube, "AuthRequired", FakeAuthRequired, create=True)
-        self.auth_req_patcher.start()
 
         self.orig_config_dir = config.CONFIG_DIR
         config.CONFIG_DIR = self.config_dir
@@ -44,8 +38,10 @@ class TestCLI(unittest.TestCase):
 
     def tearDown(self):
         config.CONFIG_DIR = self.orig_config_dir
-        self.auth_req_patcher.stop()
         self.conn.close()
+        # Clean up any leftover locks
+        lock_path = self.work_dir / "k2y.lock"
+        pipeline.release_lock(lock_path)
         self.tmp.cleanup()
 
     def test_status_json_output_shape(self):
@@ -256,25 +252,28 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertIn("Backfilled VOD 901: Old Stream Backfill", stdout1.getvalue())
 
-        # Second backfill: already known
+        # Second backfill: already known (with state)
         stdout2 = io.StringIO()
         with patch("k2y.kick.list_vods", return_value=[old_vod]), patch("sys.stdout", stdout2):
             ret = cli.main(["backfill", "901"])
 
         self.assertEqual(ret, 0)
-        self.assertIn("already known", stdout2.getvalue())
+        self.assertIn("VOD 901 already known (state new)", stdout2.getvalue())
 
     def test_lock_held_prints_message_and_exits_1(self):
         lock_path = self.work_dir / "k2y.lock"
-        # Hold lock with current PID
-        lock_path.write_text(f"{os.getpid()} {int(1e9)}\n")
+        # Hold lock using OS lock
+        self.assertTrue(pipeline.acquire_lock(lock_path))
 
-        for cmd in ["plan", "retry", "skip", "backfill"]:
-            stderr = io.StringIO()
-            with patch("sys.stderr", stderr):
-                ret = cli.main([cmd, "123"])
-            self.assertEqual(ret, 1)
-            self.assertIn("a run is in progress, try again later", stderr.getvalue())
+        try:
+            for cmd in ["plan", "retry", "skip", "backfill"]:
+                stderr = io.StringIO()
+                with patch("sys.stderr", stderr):
+                    ret = cli.main([cmd, "123"])
+                self.assertEqual(ret, 1)
+                self.assertIn("a run is in progress, try again later", stderr.getvalue())
+        finally:
+            pipeline.release_lock(lock_path)
 
     def test_plan_command_refuses_when_done_or_skipped(self):
         v_done = {
@@ -330,7 +329,7 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 1)
         self.assertIn("Cannot re-plan VOD 920", stderr.getvalue())
 
-    def test_plan_command_saves_before_printing_and_deletes_all_upload_rows(self):
+    def test_plan_command_reuses_pipeline_step_download_and_step_plan(self):
         vod_id = 950
         vod = {
             "id": vod_id,
@@ -343,54 +342,59 @@ class TestCLI(unittest.TestCase):
         }
         db.upsert_vod(self.conn, vod)
         vod_dir = self.cfg.vod_dir(vod_id)
-        vod_dir.mkdir(parents=True, exist_ok=True)
-        (vod_dir / "source.mp4").write_bytes(b"source data")
-
-        # Existing upload rows without youtube_id or session
-        db.upsert_upload(self.conn, vod_id, 0, "Old Row 0", 0, 3600)
-        db.upsert_upload(self.conn, vod_id, 1, "Old Row 1", 0, 1800)
-        self.assertEqual(len(db.uploads(self.conn, vod_id)), 2)
 
         plan_result = [
             {"start_s": 0, "end_s": 1800, "title": "New Part 1", "description": "D1", "key_moments": []},
             {"start_s": 1800, "end_s": 3600, "title": "New Part 2", "description": "D2", "key_moments": []},
         ]
 
+        def fake_step_download(c, cfg, v):
+            vod_dir.mkdir(parents=True, exist_ok=True)
+            (vod_dir / "source.mp4").write_bytes(b"mock source")
+            db.set_duration(c, v["id"], 3600)
+            return "downloaded"
+
+        def fake_step_plan(c, cfg, v):
+            db.save_plan(c, v["id"], plan_result)
+            return "planned"
+
         stdout = io.StringIO()
-        with patch("k2y.segment.plan", return_value=plan_result), patch("sys.stdout", stdout):
+        with patch("k2y.pipeline.step_download", side_effect=fake_step_download) as mock_dl, \
+             patch("k2y.pipeline.step_plan", side_effect=fake_step_plan) as mock_plan, \
+             patch("sys.stdout", stdout):
             ret = cli.main(["plan", str(vod_id)])
 
         self.assertEqual(ret, 0)
+        mock_dl.assert_called_once()
+        mock_plan.assert_called_once()
         output = stdout.getvalue()
         self.assertIn("New Part 1", output)
         self.assertIn("New Part 2", output)
 
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(row["state"], "planned")
-        saved_plan = json.loads(row["plan_json"])
-        self.assertEqual(len(saved_plan), 2)
 
-        # Verify all previous upload rows were deleted on re-plan
-        ups = db.uploads(self.conn, vod_id)
-        self.assertEqual(len(ups), 0)
-
-    def test_install_timer_windows(self):
+    def test_install_timer_windows_exact_tr_with_spaces_and_battery_note(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
+
+        fake_python = r"C:\Program Files\Python 3.12\python.exe"
+        fake_pythonw = r"C:\Program Files\Python 3.12\pythonw.exe"
+        fake_repo = Path(r"C:\Users\User Name\Projects\kick-to-youtube-lives")
+
         with patch("k2y.cli._is_windows", return_value=True), \
+             patch("sys.executable", fake_python), \
+             patch("os.path.exists", return_value=True), \
+             patch("k2y.cli.REPO_DIR", fake_repo), \
              patch("subprocess.run") as mock_run, \
              patch("sys.stdout", stdout), \
              patch("sys.stderr", stderr):
             ret = cli.main(["install-timer"])
 
         self.assertEqual(ret, 0)
+        # Ensure .cmd is NOT generated
         cmd_file = self.work_dir / "k2y-run.cmd"
-        self.assertTrue(cmd_file.exists())
-        content = cmd_file.read_text(encoding="utf-8")
-        self.assertTrue(content.startswith("@echo off\n"))
-        self.assertIn('cd /d "', content)
-        self.assertIn('-m k2y run >> "', content)
-        self.assertIn('k2y-task.log" 2>&1', content)
+        self.assertFalse(cmd_file.exists())
 
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
@@ -400,11 +404,14 @@ class TestCLI(unittest.TestCase):
         self.assertIn("k2y", args)
         self.assertIn("/TR", args)
         tr_index = args.index("/TR")
-        self.assertEqual(args[tr_index + 1], '"' + str(cmd_file) + '"')
+
+        expected_tr = f'"{fake_pythonw}" "{str(fake_repo / "k2y-task.pyw").replace("/", "\\")}"'
+        self.assertEqual(args[tr_index + 1], expected_tr)
 
         out_text = stdout.getvalue()
         self.assertIn("schtasks /Query /TN k2y", out_text)
         self.assertIn("schtasks /Delete /TN k2y /F", out_text)
+        self.assertIn("battery", out_text.lower())
 
     def test_install_timer_linux(self):
         stdout = io.StringIO()

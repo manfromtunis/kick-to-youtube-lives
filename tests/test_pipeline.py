@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from k2y import config, db, kick, pipeline, segment, youtube
+from k2y import config, db, kick, media, pipeline, segment, youtube
 
 
 class TestPipeline(unittest.TestCase):
@@ -26,12 +26,6 @@ class TestPipeline(unittest.TestCase):
 
         self.stderr_patcher = patch("sys.stderr", io.StringIO())
         self.mock_stderr = self.stderr_patcher.start()
-
-        class FakeAuthRequired(Exception):
-            pass
-
-        self.auth_req_patcher = patch.object(youtube, "AuthRequired", FakeAuthRequired, create=True)
-        self.FakeAuthRequired = self.auth_req_patcher.start()
 
         self.orig_config_dir = config.CONFIG_DIR
         config.CONFIG_DIR = self.config_dir
@@ -53,7 +47,11 @@ class TestPipeline(unittest.TestCase):
         pipeline.STEPS = self.orig_steps
         config.CONFIG_DIR = self.orig_config_dir
         self.conn.close()
-        self.auth_req_patcher.stop()
+        # Clean up any open locks
+        lock_path = self.work_dir / "k2y.lock"
+        pipeline.release_lock(lock_path)
+        for path in list(pipeline._OPEN_LOCKS.keys()):
+            pipeline.release_lock(path)
         self.stderr_patcher.stop()
         self.tmp.cleanup()
 
@@ -177,7 +175,7 @@ class TestPipeline(unittest.TestCase):
         db.upsert_vod(self.conn, vod1)
 
         def step_missing_sec(c, cfg, v):
-            raise config.MissingSecret("missing secret client_secret.json (see docs...)")
+            raise config.MissingSecret("missing secret /path/client_secret.json (see docs...)")
 
         pipeline.STEPS = {"new": step_missing_sec}
 
@@ -185,14 +183,39 @@ class TestPipeline(unittest.TestCase):
             ret = pipeline.run(self.cfg)
 
         self.assertEqual(ret, 0)
-        self.assertTrue(any("missing secret client_secret.json" in msg and "run `py -m k2y auth`" in msg for msg in cm.output))
+        self.assertTrue(any("client_secret.json" in msg and "run `py -m k2y auth`" in msg for msg in cm.output))
 
         row1 = db.get_vod(self.conn, 201)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
         self.assertIsNone(row1["error"])
 
-    def test_auth_required_stops_run_without_attempt_and_logs_error(self):
+    def test_missing_secret_gemini_key_logs_str_e_without_auth_hint(self):
+        vod1 = {
+            "id": 2011,
+            "title": "Stream 2011",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2011.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod1)
+
+        def step_missing_gemini(c, cfg, v):
+            raise config.MissingSecret("missing secret /path/gemini.key (see docs...)")
+
+        pipeline.STEPS = {"new": step_missing_gemini}
+
+        with patch("k2y.kick.list_vods", return_value=[]), self.assertLogs("k2y", level="ERROR") as cm:
+            ret = pipeline.run(self.cfg)
+
+        self.assertEqual(ret, 0)
+        # Should log str(e), with NO auth hint
+        self.assertTrue(any("gemini.key" in msg for msg in cm.output))
+        self.assertFalse(any("run `py -m k2y auth`" in msg for msg in cm.output))
+
+    def test_auth_required_stops_run_without_attempt_and_logs_error_once(self):
         vod1 = {
             "id": 202,
             "title": "Stream 202",
@@ -205,7 +228,7 @@ class TestPipeline(unittest.TestCase):
         db.upsert_vod(self.conn, vod1)
 
         def step_auth_req(c, cfg, v):
-            raise self.FakeAuthRequired("invalid_grant token expired")
+            raise youtube.AuthRequired(youtube.AUTH_REQUIRED_MSG)
 
         pipeline.STEPS = {"new": step_auth_req}
 
@@ -213,9 +236,46 @@ class TestPipeline(unittest.TestCase):
             ret = pipeline.run(self.cfg)
 
         self.assertEqual(ret, 0)
-        self.assertTrue(any("invalid_grant" in msg and "run `py -m k2y auth`" in msg for msg in cm.output))
+        # Auth hint must appear exactly once in the logged message
+        auth_hint = "run `py -m k2y auth`"
+        matching = [msg for msg in cm.output if auth_hint in msg]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].count(auth_hint), 1)
 
         row1 = db.get_vod(self.conn, 202)
+        self.assertEqual(row1["state"], "new")
+        self.assertEqual(row1["attempts"], 0)
+        self.assertIsNone(row1["error"])
+
+    def test_thumbnails_forbidden_stops_run_without_attempt_and_logs(self):
+        vod1 = {
+            "id": 2022,
+            "title": "Stream 2022",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2022.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod1)
+
+        class CustomThumbnailsForbidden(Exception):
+            pass
+
+        def step_thumb_forbid(c, cfg, v):
+            raise CustomThumbnailsForbidden("Channel not allowed custom thumbnails; verify channel at https://www.youtube.com/verify")
+
+        pipeline.STEPS = {"new": step_thumb_forbid}
+
+        with patch.object(youtube, "ThumbnailsForbidden", CustomThumbnailsForbidden, create=True), \
+             patch("k2y.kick.list_vods", return_value=[]), \
+             self.assertLogs("k2y", level="ERROR") as cm:
+            ret = pipeline.run(self.cfg)
+
+        self.assertEqual(ret, 0)
+        self.assertTrue(any("https://www.youtube.com/verify" in msg for msg in cm.output))
+
+        row1 = db.get_vod(self.conn, 2022)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
         self.assertIsNone(row1["error"])
@@ -330,15 +390,17 @@ class TestPipeline(unittest.TestCase):
         }
         db.upsert_vod(self.conn, vod)
 
-        with patch("k2y.kick.download") as mock_dl, patch("k2y.kick.probe_duration", return_value=3542.9):
+        with patch("k2y.kick.download") as mock_dl, patch("k2y.kick.probe_duration", return_value=3542.9) as mock_probe:
             row = db.get_vod(self.conn, vod_id)
             res = pipeline.step_download(self.conn, self.cfg, row)
             self.assertEqual(res, "downloaded")
+            # Pipeline probes at most once
+            mock_probe.assert_called_once()
 
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(row["duration_s"], 3542)
 
-    def test_advance_resets_attempts_and_error_on_step_success(self):
+    def test_advance_resets_attempts_and_error_on_forward_transition(self):
         vod_id = 207
         vod = {
             "id": vod_id,
@@ -366,10 +428,134 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertIsNone(row["error"])
 
+    def test_advance_keeps_attempts_on_backward_transition(self):
+        vod_id = 2071
+        vod = {
+            "id": vod_id,
+            "title": "Stream 2071",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2071.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "cut")
+        db.record_error(self.conn, vod_id, "transient error")
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["attempts"], 1)
+
+        # Backward transition: cut -> planned
+        def fallback_step(c, cfg, v):
+            return "planned"
+
+        pipeline.STEPS = {"cut": fallback_step}
+        pipeline.advance(self.conn, self.cfg, vod_id)
+
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["state"], "planned")
+        # Backward transition keeps attempts!
+        self.assertEqual(row["attempts"], 1)
+
+    def test_advance_stops_after_20_transitions_and_records_counted_error(self):
+        vod_id = 2072
+        vod = {
+            "id": vod_id,
+            "title": "Stream 2072",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2072.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+
+        def step_a(c, cfg, v):
+            return "downloaded"
+
+        def step_b(c, cfg, v):
+            return "new"
+
+        pipeline.STEPS = {"new": step_a, "downloaded": step_b}
+        pipeline.advance(self.conn, self.cfg, vod_id)
+
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["error"], "too many state transitions")
+
+    def test_step_cut_deletes_stale_upload_rows_without_youtube_id_or_session(self):
+        vod_id = 2073
+        vod = {
+            "id": vod_id,
+            "title": "Stream 2073",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2073.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        plan = [{"start_s": 0, "end_s": 3600, "title": "Single Part"}]  # 1 part -> expected = 1 (idx 0)
+        db.save_plan(self.conn, vod_id, plan)
+
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        src = v_dir / "source.mp4"
+        src.write_bytes(b"content")
+
+        # Stale row idx 1 (idx >= expected) without youtube_id or session
+        db.upsert_upload(self.conn, vod_id, 1, "Stale Part 1", 1800, 3600)
+        self.assertEqual(len(db.uploads(self.conn, vod_id)), 1)
+
+        row = db.get_vod(self.conn, vod_id)
+        with patch("k2y.media.thumbnail"):
+            res = pipeline.step_cut(self.conn, self.cfg, row)
+            self.assertEqual(res, "cut")
+
+        ups = db.uploads(self.conn, vod_id)
+        self.assertEqual(len(ups), 1)
+        self.assertEqual(ups[0]["idx"], 0)
+
+    def test_step_cut_raises_on_stale_row_with_youtube_id_or_session(self):
+        vod_id = 2074
+        vod = {
+            "id": vod_id,
+            "title": "Stream 2074",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2074.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        plan = [{"start_s": 0, "end_s": 3600, "title": "Single Part"}]
+        db.save_plan(self.conn, vod_id, plan)
+
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        src = v_dir / "source.mp4"
+        src.write_bytes(b"content")
+
+        # Stale row with youtube_id
+        db.upsert_upload(self.conn, vod_id, 2, "Stale Part 2", 1800, 3600)
+        db.update_upload(self.conn, vod_id, 2, youtube_id="yt_already_stale")
+
+        row = db.get_vod(self.conn, vod_id)
+        with patch("k2y.media.thumbnail"), self.assertRaises(RuntimeError) as ctx:
+            pipeline.step_cut(self.conn, self.cfg, row)
+
+        self.assertIn("stale upload row idx 2 already on YouTube as yt_already_stale; resolve manually", str(ctx.exception))
+
+        # Stale row with upload_session
+        db.update_upload(self.conn, vod_id, 2, youtube_id=None, upload_session="http://session/stale")
+        with patch("k2y.media.thumbnail"), self.assertRaises(RuntimeError) as ctx:
+            pipeline.step_cut(self.conn, self.cfg, row)
+
+        self.assertIn("stale upload row idx 2 already on YouTube as http://session/stale; resolve manually", str(ctx.exception))
+
     def test_step_cut_ready_and_upload_incomplete_rows_return_planned(self):
         vod_id = 208
         plan = [{"start_s": 0, "end_s": 1800, "title": "P1"}, {"start_s": 1800, "end_s": 3600, "title": "P2"}]
-        # expected rows: 3 (idx 0, 1, 2)
         vod = {
             "id": vod_id,
             "title": "Stream 208",
@@ -386,7 +572,6 @@ class TestPipeline(unittest.TestCase):
         src = v_dir / "source.mp4"
         src.write_bytes(b"source")
 
-        # Insert only idx 0 and idx 1 (missing idx 2)
         p1 = v_dir / "part_1.mp4"
         p1.write_bytes(b"p1")
         t0 = v_dir / "thumb_0.jpg"
@@ -397,18 +582,16 @@ class TestPipeline(unittest.TestCase):
         db.upsert_upload(self.conn, vod_id, 1, "P1", 0, 1800, file=p1, thumb=t1)
 
         row = db.get_vod(self.conn, vod_id)
-        # Missing row 2 with source existing -> returns "planned"
         self.assertEqual(pipeline.step_cut_ready(self.conn, self.cfg, row), "planned")
         self.assertEqual(pipeline.step_upload(self.conn, self.cfg, row), "planned")
 
-        # Missing row 2 with source missing -> returns "new"
         src.unlink()
         self.assertEqual(pipeline.step_cut_ready(self.conn, self.cfg, row), "new")
         self.assertEqual(pipeline.step_upload(self.conn, self.cfg, row), "new")
 
     def test_step_cut_ready_missing_cut_file_returns_planned(self):
         vod_id = 209
-        plan = [{"start_s": 0, "end_s": 3600, "title": "P1"}]  # 1 part -> expected count 1 (idx 0)
+        plan = [{"start_s": 0, "end_s": 3600, "title": "P1"}]
         vod = {
             "id": vod_id,
             "title": "Stream 209",
@@ -425,14 +608,12 @@ class TestPipeline(unittest.TestCase):
         src = v_dir / "source.mp4"
         src.write_bytes(b"source")
         thumb = v_dir / "thumb_0.jpg"
-        # file exists in db but file does not exist on disk
         db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600, file=v_dir / "missing.mp4", thumb=thumb)
 
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(pipeline.step_cut_ready(self.conn, self.cfg, row), "planned")
         self.assertEqual(pipeline.step_upload(self.conn, self.cfg, row), "planned")
 
-        # If source is also missing -> returns "new"
         src.unlink()
         self.assertEqual(pipeline.step_cut_ready(self.conn, self.cfg, row), "new")
         self.assertEqual(pipeline.step_upload(self.conn, self.cfg, row), "new")
@@ -466,91 +647,107 @@ class TestPipeline(unittest.TestCase):
             self.assertEqual(res, "done")
             self.assertTrue(any("Failed to remove VOD directory" in msg for msg in cm.output))
 
-    def test_lock_prevents_second_concurrent_run(self):
+    def test_lock_linux_second_acquire_fails_and_succeeds_after_release(self):
         lock_path = self.work_dir / "k2y.lock"
-        lock_path.write_text(f"{os.getpid()} {int(time.time())}\n")
+        # First acquire succeeds
+        self.assertTrue(pipeline.acquire_lock(lock_path))
 
-        with patch("k2y.kick.list_vods") as mock_list:
-            ret = pipeline.run(self.cfg)
-            self.assertEqual(ret, 0)
-            mock_list.assert_not_called()
+        # Second acquire in the same process via a separate fd fails while the first is held
+        self.assertFalse(pipeline.acquire_lock(lock_path))
 
-    def test_lock_with_live_pid_never_stale_even_if_old(self):
+        # Release first lock
+        pipeline.release_lock(lock_path)
+
+        # Second acquire now succeeds
+        self.assertTrue(pipeline.acquire_lock(lock_path))
+
+        # Lock file is never deleted
+        self.assertTrue(lock_path.exists())
+
+        pipeline.release_lock(lock_path)
+        self.assertTrue(lock_path.exists())
+
+    def test_lock_windows_branch_msvcrt_mock(self):
+        fake_msvcrt = MagicMock()
+        fake_msvcrt.LK_NBLCK = 1
+        fake_msvcrt.LK_UNLCK = 2
+        lock_path = self.work_dir / "k2y_win.lock"
+
+        with patch("k2y.pipeline.os.name", "nt"), patch.dict("sys.modules", {"msvcrt": fake_msvcrt}):
+            self.assertTrue(pipeline.acquire_lock(lock_path))
+            fake_msvcrt.locking.assert_called_once()
+            call_args = fake_msvcrt.locking.call_args[0]
+            self.assertEqual(call_args[1], fake_msvcrt.LK_NBLCK)
+            self.assertEqual(call_args[2], 1)
+
+            pipeline.release_lock(lock_path)
+            self.assertEqual(fake_msvcrt.locking.call_count, 2)
+            rel_args = fake_msvcrt.locking.call_args[0]
+            self.assertEqual(rel_args[1], fake_msvcrt.LK_UNLCK)
+            self.assertEqual(rel_args[2], 1)
+            self.assertTrue(lock_path.exists())
+
+        # Test failure to acquire when msvcrt.locking raises OSError
+        fake_msvcrt_fail = MagicMock()
+        fake_msvcrt_fail.LK_NBLCK = 1
+        fake_msvcrt_fail.locking.side_effect = OSError(13, "Permission denied")
+
+        with patch("k2y.pipeline.os.name", "nt"), patch.dict("sys.modules", {"msvcrt": fake_msvcrt_fail}):
+            self.assertFalse(pipeline.acquire_lock(self.work_dir / "k2y_win_fail.lock"))
+
+    def test_lock_prevents_second_concurrent_run_and_logs(self):
         lock_path = self.work_dir / "k2y.lock"
-        # 9 hours old with live PID -> NOT stale
-        stale_time = int(time.time()) - (9 * 3600)
-        lock_path.write_text(f"{os.getpid()} {stale_time}\n")
+        self.assertTrue(pipeline.acquire_lock(lock_path))
 
-        with patch("k2y.kick.list_vods") as mock_list:
-            ret = pipeline.run(self.cfg)
-            self.assertEqual(ret, 0)
-            mock_list.assert_not_called()
-
-    def test_lock_replaces_stale_lock_by_dead_pid(self):
-        lock_path = self.work_dir / "k2y.lock"
-        dead_pid = 99999999
-        lock_path.write_text(f"{dead_pid} {int(time.time())}\n")
-
-        with patch("k2y.pipeline._is_pid_running", return_value=False):
-            with patch("k2y.kick.list_vods", return_value=[]) as mock_list:
-                ret = pipeline.run(self.cfg)
-                self.assertEqual(ret, 0)
-                mock_list.assert_called_once()
-
-    def test_lock_staleness_when_pid_cannot_be_checked(self):
-        lock_path = self.work_dir / "k2y.lock"
-        now = int(time.time())
-
-        # 9 hours old and PID check returns None -> stale, run proceeds
-        lock_path.write_text(f"12345 {now - 9 * 3600}\n")
-        with patch("k2y.pipeline._is_pid_running", return_value=None):
-            with patch("k2y.kick.list_vods", return_value=[]) as mock_list:
-                ret = pipeline.run(self.cfg)
-                self.assertEqual(ret, 0)
-                mock_list.assert_called_once()
-
-        # 1 hour old and PID check returns None -> NOT stale, run skips
-        lock_path.write_text(f"12345 {now - 3600}\n")
-        with patch("k2y.pipeline._is_pid_running", return_value=None):
-            with patch("k2y.kick.list_vods", return_value=[]) as mock_list:
+        try:
+            with patch("k2y.kick.list_vods") as mock_list, self.assertLogs("k2y", level="INFO") as cm:
                 ret = pipeline.run(self.cfg)
                 self.assertEqual(ret, 0)
                 mock_list.assert_not_called()
+                self.assertTrue(any("another run in progress" in msg for msg in cm.output))
+        finally:
+            pipeline.release_lock(lock_path)
 
-    def test_lock_empty_file_staleness(self):
-        lock_path = self.work_dir / "k2y.lock"
+    def test_discovery_robustness_skips_malformed_vod_and_continues(self):
+        vod_valid_1 = {
+            "id": 310,
+            "title": "Valid Stream 1",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/310",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        vod_malformed = {
+            "id": 311,
+            "started_at": "2026-10-23T10:30:00Z",
+            # missing title, duration_s, source_url -> raises KeyError in upsert_vod
+        }
+        vod_valid_2 = {
+            "id": 312,
+            "title": "Valid Stream 2",
+            "started_at": "2026-10-23T11:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/312",
+            "category": "Gaming",
+            "is_live": False,
+        }
 
-        # Empty and fresh (mtime = now) -> NOT stale, run skips
-        lock_path.write_text("")
-        with patch("k2y.kick.list_vods") as mock_list:
+        pipeline.STEPS = {}
+
+        with patch("k2y.kick.list_vods", return_value=[vod_valid_1, vod_malformed, vod_valid_2]), \
+             self.assertLogs("k2y", level="WARNING") as cm:
             ret = pipeline.run(self.cfg)
-            self.assertEqual(ret, 0)
-            mock_list.assert_not_called()
 
-        # Empty and old (> 60s) -> stale, run proceeds
-        lock_path.write_text("")
-        old_time = time.time() - 100
-        os.utime(lock_path, (old_time, old_time))
-        with patch("k2y.kick.list_vods", return_value=[]) as mock_list:
-            ret = pipeline.run(self.cfg)
-            self.assertEqual(ret, 0)
-            mock_list.assert_called_once()
-
-    def test_lock_released_in_finally(self):
-        lock_path = self.work_dir / "k2y.lock"
-        self.assertFalse(lock_path.exists())
-
-        with patch("k2y.kick.list_vods", return_value=[]):
-            ret = pipeline.run(self.cfg)
-            self.assertEqual(ret, 0)
-
-        self.assertFalse(lock_path.exists())
+        self.assertEqual(ret, 0)
+        self.assertTrue(any("skipping Kick VOD 311" in msg for msg in cm.output))
+        self.assertIsNotNone(db.get_vod(self.conn, 310))
+        self.assertIsNotNone(db.get_vod(self.conn, 312))
 
     def test_setup_logging_tty_and_idempotent(self):
         log_dir = self.work_dir / "log_test"
         pipeline._logging_configured = False
 
-        # When stderr is not a tty, no StreamHandler is added
         with patch.object(sys.stderr, "isatty", return_value=False):
             pipeline.setup_logging(log_dir)
             self.assertTrue(pipeline._logging_configured)
@@ -558,7 +755,6 @@ class TestPipeline(unittest.TestCase):
             stream_handlers = [h for h in root_handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)]
             self.assertEqual(len(stream_handlers), 0)
 
-        # Idempotent call does not duplicate
         pipeline.setup_logging(log_dir)
         self.assertTrue((log_dir / "k2y.log").exists())
 
@@ -718,11 +914,42 @@ class TestPipeline(unittest.TestCase):
         db.upsert_vod(self.conn, vod)
         db.set_state(self.conn, vod_id, "downloaded")
 
-        # source.mp4 does not exist in vod_dir
         pipeline.advance(self.conn, self.cfg, vod_id)
 
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(row["state"], "new")
+
+    def test_k2y_task_pyw_logs_traceback_on_exception(self):
+        import subprocess
+        task_script = Path(__file__).resolve().parent.parent / "k2y-task.pyw"
+        self.assertTrue(task_script.exists())
+
+        # Run script in subprocess with mock config pointing to our work_dir and causing cli.main to fail
+        env = dict(os.environ)
+        env["K2Y_CONFIG_DIR"] = str(self.config_dir)
+        (self.config_dir / "config.json").write_text(
+            json.dumps({"work_dir": str(self.work_dir)}),
+            encoding="utf-8",
+        )
+
+        test_py = f"""
+import sys
+from unittest.mock import patch
+
+with patch('k2y.cli.main', side_effect=RuntimeError('simulated crash')):
+    import runpy
+    try:
+        runpy.run_path({repr(str(task_script))}, run_name='__main__')
+    except Exception:
+        pass
+"""
+        proc = subprocess.run([sys.executable, "-c", test_py], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0)
+
+        log_file = self.work_dir / "k2y.log"
+        self.assertTrue(log_file.exists())
+        log_content = log_file.read_text(encoding="utf-8")
+        self.assertIn("RuntimeError: simulated crash", log_content)
 
 
 if __name__ == "__main__":
