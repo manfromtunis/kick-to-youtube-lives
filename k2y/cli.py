@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline.step_plan(conn, cfg, vod_for_plan)
                 db.set_state(conn, args.vod_id, "planned")
                 vod = db.get_vod(conn, args.vod_id)
-                parts = json.loads(vod["plan_json"]) if vod and vod["plan_json"] else []
+                parts, _ = pipeline.load_plan(vod["plan_json"]) if vod and vod["plan_json"] else ([], "")
 
                 print(f"{'Start':<8} {'End':<8} {'Min':<6} {'Title'}")
                 for p in parts:

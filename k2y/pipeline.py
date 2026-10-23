@@ -63,9 +63,60 @@ def _thumb_moment_for_part(part: dict) -> int:
     return int(part.get("start_s", 0)) + 60
 
 
-def expected_upload_count(plan: list) -> int:
-    """Compute expected number of upload rows from a plan."""
-    return len(plan) + 1 if len(plan) >= 2 else 1
+_faces_warned = False
+
+
+def reset_faces_warned() -> None:
+    global _faces_warned
+    _faces_warned = False
+
+
+def pick_face(vod_id: int, idx: int, faces_dir: Path | None = None) -> Path | None:
+    """Pick deterministic face photo for (vod_id, idx) from faces_dir.
+
+    Formula: sorted(files)[(vod_id * 31 + idx) % len(files)]
+    Warns once per run when the faces folder is empty or missing.
+    """
+    global _faces_warned
+    if faces_dir is None:
+        faces_dir = config.CONFIG_DIR / "faces"
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    files = []
+    if faces_dir.exists() and faces_dir.is_dir():
+        files = [p for p in faces_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+    if not files:
+        if not _faces_warned:
+            logger.warning(
+                f"Faces directory {faces_dir} is missing or empty; thumbnails will be generated without reaction photos"
+            )
+            _faces_warned = True
+        return None
+    sorted_files = sorted(files)
+    return sorted_files[(vod_id * 31 + idx) % len(sorted_files)]
+
+
+def load_plan(plan_raw: str | None) -> tuple[list[dict], str]:
+    """Load plan JSON, supporting both v2 dict format and legacy list format."""
+    if not plan_raw:
+        return ([], "")
+    try:
+        data = json.loads(plan_raw)
+    except Exception:
+        return ([], "")
+    if isinstance(data, dict):
+        return (data.get("parts", []), str(data.get("vod_thumb_text", "")))
+    elif isinstance(data, list):
+        return (data, "")
+    return ([], "")
+
+
+def expected_upload_count(plan: list | dict) -> int:
+    """Compute expected number of upload rows from a plan (list or dict)."""
+    if isinstance(plan, dict):
+        parts = plan.get("parts", [])
+    else:
+        parts = plan
+    return len(parts) + 1 if len(parts) >= 2 else 1
 
 
 def step_download(conn, cfg: config.Config, vod) -> str:
@@ -104,7 +155,7 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
     plan_raw = vod["plan_json"]
     if not plan_raw:
         return "downloaded"
-    plan = json.loads(plan_raw)
+    plan, vod_thumb_text = load_plan(plan_raw)
 
     vod_dir = cfg.vod_dir(vod_id)
     vod_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +164,9 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
     full_thumb_at = _thumb_moment_for_part(plan[0]) if plan else 60
     full_title = media.full_title(vod["title"], vod["started_at"])
     thumb_0 = vod_dir / "thumb_0.jpg"
-    media.thumbnail(src, full_thumb_at, full_title, thumb_0)
+    hook_0 = media.sanitize_hook(vod_thumb_text, fallback_title=vod["title"])
+    face_0 = pick_face(vod_id, 0)
+    media.thumbnail(src, full_thumb_at, hook_0, thumb_0, face=face_0)
     db.upsert_upload(
         conn,
         vod_id=vod_id,
@@ -133,7 +186,9 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
             p_title = media.part_title(part.get("title", ""), i, len(plan))
             p_thumb = vod_dir / f"thumb_{i}.jpg"
             p_moment = _thumb_moment_for_part(part)
-            media.thumbnail(src, p_moment, p_title, p_thumb)
+            p_hook = media.sanitize_hook(part.get("thumb_text"), fallback_title=part.get("title", ""))
+            face_i = pick_face(vod_id, i)
+            media.thumbnail(src, p_moment, p_hook, p_thumb, face=face_i)
             db.upsert_upload(
                 conn,
                 vod_id=vod_id,
@@ -169,7 +224,7 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
 def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     src = cfg.vod_dir(vod_id) / "source.mp4"
-    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    plan, _ = load_plan(vod["plan_json"])
     expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
     indices = {u["idx"] for u in ups}
@@ -197,7 +252,7 @@ def step_cut_ready(conn, cfg: config.Config, vod) -> str:
 def step_upload(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     src = cfg.vod_dir(vod_id) / "source.mp4"
-    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    plan, _ = load_plan(vod["plan_json"])
     expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
     indices = {u["idx"] for u in ups}
@@ -427,6 +482,7 @@ def run(cfg: config.Config | None = None) -> int:
         cfg = config.load()
 
     setup_logging(cfg.work_dir)
+    reset_faces_warned()
 
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.work_dir / "k2y.lock"
