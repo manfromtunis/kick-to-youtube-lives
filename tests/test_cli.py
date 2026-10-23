@@ -463,6 +463,21 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(cli.main([]), 2)
             self.assertEqual(cli.main(["retry", "9999"]), 1)
 
+    def test_retry_with_corrupt_plan_replans(self):
+        db.upsert_vod(self.conn, {
+            "id": 704, "title": "V4", "started_at": "2026-10-23T10:00:00Z", "duration_s": 3600,
+            "source_url": "u", "category": "Gaming", "is_live": False,
+        })
+        d = self.cfg.vod_dir(704)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "source.mp4").write_bytes(b"source")
+        self.conn.execute("UPDATE vods SET plan_json = '{not json' WHERE id = 704")
+        self.conn.commit()
+        db.record_error(self.conn, 704, "Error", max_attempts=1)
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(cli.main(["retry", "704"]), 0)
+        self.assertEqual(db.get_vod(self.conn, 704)["state"], "downloaded")
+
     def test_retry_restart_upload_clears_sessions(self):
         vod = {
             "id": 750,
