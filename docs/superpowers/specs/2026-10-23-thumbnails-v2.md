@@ -15,8 +15,9 @@ are at the end of this file.
    Line 1 is yellow `#FFD400`, size 160, black border 10. Line 2 is white, size 110, black
    border 10. Line 1 = first word, or the first two if they are short; line 2 = the rest.
    The text must fit in the left 60% (shrink the font size until `text_w` fits).
-4. **Font:** Impact (`C:\Windows\Fonts\impact.ttf`) on Windows, else Anton or DejaVu Sans
-   Bold through the existing `_find_font()` order with Impact added first.
+4. **Font:** Impact (`C:\Windows\Fonts\impact.ttf`) on Windows, else DejaVu Sans Bold or Arial, in
+   `_find_font()` order. The font is copied next to the thumbnail and passed by relative
+   name, so no path enters the filter string.
 
 ## Reaction photos
 
