@@ -182,7 +182,7 @@ Instructions:
 1. "vod_hook": 1 or 2 sentences in French, first person as Melek (use "je", never "le streamer"), at most 200 characters, summarizing the whole live stream hook.
 2. "vod_tags": 5 to 10 lowercase tags for the full live stream.
 3. "vod_hashtags": 3 to 4 hashtags starting with # and without spaces for the full live stream.
-4. For each part (match by "idx"):
+4. For each part (match by "idx", part idx is 1-based ("idx 1 = Partie 1")):
    - "hook": 1 or 2 sentences in French, first person as Melek, at most 200 characters.
    - "tags": 5 to 10 lowercase tags for this part.
    - "hashtags": 3 to 4 hashtags starting with # and without spaces for this part."""

@@ -1345,6 +1345,41 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(updated_snippets[2][0], "yt_p2")
         self.assertIn("P2 HOOK GEMINI", updated_snippets[2][1]["description"])
 
+    def _legacy_done_vod(self, vod_id, desc_done=(1, 1, 1)):
+        db.upsert_vod(self.conn, {
+            "id": vod_id, "title": "Legacy", "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600, "source_url": "u", "category": "Gaming", "is_live": False,
+        })
+        db.set_state(self.conn, vod_id, "done")
+        db.save_plan(self.conn, vod_id, [
+            {"start_s": 0, "end_s": 1800, "title": "A", "description": "desc A"},
+            {"start_s": 1800, "end_s": 3600, "title": "B", "description": "desc B"},
+        ])
+        for idx, (title, a, b) in enumerate([("Full", 0, 3600), ("A", 0, 1800), ("B", 1800, 3600)]):
+            db.upsert_upload(self.conn, vod_id, idx, title, a, b)
+            db.update_upload(self.conn, vod_id, idx, youtube_id=f"yt{idx}", desc_done=desc_done[idx])
+
+    def test_refresh_metadata_resumes_after_quota_and_calls_gemini_once(self):
+        self._legacy_done_vod(995)
+        # Gemini ignores the 1-based idx: results map by position.
+        meta = {"vod_hook": "H", "vod_tags": [], "vod_hashtags": [], "parts": [
+            {"idx": 0, "hook": "hook A"}, {"idx": 1, "hook": "hook B"}]}
+        sent, quota_hit = [], []
+        def quota_on_third(vid, m):
+            if vid == "yt2" and not quota_hit:
+                quota_hit.append(1)
+                raise youtube.QuotaExceeded("quota")
+            sent.append(vid)
+        with patch("k2y.segment.fill_metadata", return_value=meta) as fill, \
+             patch("k2y.youtube.update_snippet", side_effect=quota_on_third):
+            with self.assertRaises(youtube.QuotaExceeded):
+                pipeline.refresh_metadata(self.conn, self.cfg, 995)
+            pipeline.refresh_metadata(self.conn, self.cfg, 995)
+        fill.assert_called_once()
+        self.assertEqual(sent, ["yt0", "yt1", "yt2"])  # resumed, no resend of yt0/yt1
+        parts = json.loads(db.get_vod(self.conn, 995)["plan_json"])["parts"]
+        self.assertEqual([p["hook"] for p in parts], ["hook A", "hook B"])
+
 
 if __name__ == "__main__":
     unittest.main()

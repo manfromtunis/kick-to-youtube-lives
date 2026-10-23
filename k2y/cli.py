@@ -13,7 +13,7 @@ import subprocess
 import sys
 from typing import Any
 
-from . import config, db, kick, pipeline, youtube
+from . import config, db, kick, pipeline, segment, youtube
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("k2y")
@@ -330,38 +330,46 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
             def do_refresh():
-                if args.all:
-                    conn = db.connect(cfg.db_path)
-                    vods = [v for v in db.all_vods(conn) if v["state"] == "done"]
-                    if not vods:
-                        print("No VODs in done state to refresh.")
-                        return 0
-                else:
-                    conn, vod = _vod_or_err(cfg, args.vod_id)
-                    if not vod:
-                        return 1
-                    if vod["state"] != "done":
-                        _print_err(f"Cannot refresh metadata for VOD {args.vod_id}: state is {vod['state']} (must be 'done')")
-                        return 1
-                    vods = [vod]
+                conn = None
+                try:
+                    if args.all:
+                        conn = db.connect(cfg.db_path)
+                        vods = [v for v in db.all_vods(conn) if v["state"] == "done"]
+                        if not vods:
+                            print("No VODs in done state to refresh.")
+                            return 0
+                    else:
+                        conn, vod = _vod_or_err(cfg, args.vod_id)
+                        if not vod:
+                            return 1
+                        if vod["state"] != "done":
+                            _print_err(f"Cannot refresh metadata for VOD {args.vod_id}: state is {vod['state']} (must be 'done')")
+                            return 1
+                        vods = [vod]
 
-                for v in vods:
-                    try:
-                        print(f"Refreshing metadata for VOD {v['id']} ({v['title']})...")
-                        pipeline.refresh_metadata(conn, cfg, v["id"])
-                        print(f"Successfully refreshed metadata for VOD {v['id']}")
-                    except pipeline.StopRun as sr:
-                        _print_err(f"Stopped: {sr}")
-                        return 1
-                    except (youtube.QuotaExceeded, youtube.AuthRequired, segment.DailyQuota) as e:
-                        db.set_error(conn, v["id"], str(e))
-                        _print_err(f"Error on VOD {v['id']}: {e}")
-                        return 1
-                    except Exception as e:
-                        logger.exception(f"Error refreshing metadata for VOD {v['id']}: {e}")
-                        _print_err(f"Error refreshing metadata for VOD {v['id']}: {e}")
-                        return 1
-                return 0
+                    had_error = False
+                    for v in vods:
+                        try:
+                            print(f"Refreshing metadata for VOD {v['id']} ({v['title']})...")
+                            pipeline.refresh_metadata(conn, cfg, v["id"])
+                            print(f"Successfully refreshed metadata for VOD {v['id']}")
+                        except pipeline.StopRun as sr:
+                            _print_err(f"Stopped: {sr}")
+                            return 1
+                        except (youtube.QuotaExceeded, youtube.AuthRequired, segment.DailyQuota) as e:
+                            _print_err(f"Error on VOD {v['id']}: {e}")
+                            return 1
+                        except Exception as e:
+                            logger.exception(f"Error refreshing metadata for VOD {v['id']}: {e}")
+                            _print_err(f"Error refreshing metadata for VOD {v['id']}: {e}")
+                            if args.all:
+                                had_error = True
+                                continue
+                            return 1
+                    return 1 if had_error else 0
+                finally:
+                    if args.all and conn is not None:
+                        conn.close()
 
             return _with_lock(cfg, do_refresh)
 

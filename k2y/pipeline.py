@@ -125,6 +125,7 @@ def load_plan_data(plan_raw: str | None) -> dict:
             "vod_hook": str(data.get("vod_hook", "")),
             "vod_tags": list(data.get("vod_tags", [])),
             "vod_hashtags": list(data.get("vod_hashtags", [])),
+            "meta_filled": bool(data.get("meta_filled", False)),
         }
     elif isinstance(data, list):
         return {
@@ -351,10 +352,9 @@ def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
     plan_data = load_plan_data(plan_raw)
     parts = plan_data.get("parts", [])
 
-    # Check if plan lacks the new fields
-    needs_gemini = (
-        not plan_data.get("vod_hook")
-        or any(not p.get("hook") for p in parts)
+    # Legacy plans (no v2 fields) get one Gemini fill, recorded by meta_filled.
+    needs_gemini = not (
+        plan_data.get("meta_filled") or plan_data.get("vod_hook") or any(p.get("hook") for p in parts)
     )
 
     if needs_gemini:
@@ -371,18 +371,24 @@ def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
         plan_data["vod_tags"] = list(meta_result.get("vod_tags", []))
         plan_data["vod_hashtags"] = list(meta_result.get("vod_hashtags", []))
 
-        part_results_by_idx = {p["idx"]: p for p in meta_result.get("parts", []) if "idx" in p}
+        part_results = meta_result.get("parts", [])
+        by_idx = {p.get("idx"): p for p in part_results}
+        if set(by_idx) != set(range(1, len(parts) + 1)) and len(part_results) == len(parts):
+            by_idx = dict(enumerate(part_results, 1))  # Gemini ignored the 1-based idx
         for i, part in enumerate(parts, 1):
-            res_p = part_results_by_idx.get(i)
+            res_p = by_idx.get(i)
             if res_p:
                 part["hook"] = res_p.get("hook", part.get("hook", ""))
                 part["tags"] = res_p.get("tags", part.get("tags", []))
                 part["hashtags"] = res_p.get("hashtags", part.get("hashtags", []))
 
+        plan_data["meta_filled"] = True
         db.save_plan(conn, vod_id, plan_data)
 
-    db.clear_desc_done(conn, vod_id)
     ups = db.uploads(conn, vod_id)
+    if ups and all(u["desc_done"] == 1 for u in ups):
+        db.clear_desc_done(conn, vod_id)
+        ups = db.uploads(conn, vod_id)
     apply_final_descriptions(conn, cfg, vod, ups, plan_data)
 
 

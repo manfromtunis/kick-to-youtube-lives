@@ -610,6 +610,32 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(sorted(refreshed_ids), [961, 962])
 
+        # 2b. --all goes on past a per-VOD error, returns 1, leaves no error on done rows
+        refreshed_ids.clear()
+        def fail_first(conn, cfg, vod_id):
+            if vod_id == 961:
+                raise RuntimeError("video gone")
+            refreshed_ids.append(vod_id)
+        err = io.StringIO()
+        with patch("k2y.pipeline.refresh_metadata", side_effect=fail_first), \
+             patch("sys.stdout", io.StringIO()), patch("sys.stderr", err):
+            ret = cli.main(["refresh-metadata", "--all"])
+        self.assertEqual(ret, 1)
+        self.assertEqual(refreshed_ids, [962], err.getvalue())
+        self.assertIsNone(db.get_vod(self.conn, 961)["error"])
+
+        # 2c. quota stops --all at once
+        refreshed_ids.clear()
+        def quota(conn, cfg, vod_id):
+            refreshed_ids.append(vod_id)
+            raise youtube.QuotaExceeded("quota")
+        with patch("k2y.pipeline.refresh_metadata", side_effect=quota), \
+             patch("sys.stdout", io.StringIO()), patch("sys.stderr", io.StringIO()):
+            ret = cli.main(["refresh-metadata", "--all"])
+        self.assertEqual(ret, 1)
+        self.assertEqual(len(refreshed_ids), 1)
+        self.assertIsNone(db.get_vod(self.conn, refreshed_ids[0])["error"])
+
         # 3. Refuses when not done
         stderr = io.StringIO()
         with patch("sys.stderr", stderr):
