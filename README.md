@@ -42,6 +42,9 @@ All commands (`py -m k2y ...`) must be run from the repository root folder (`kic
    py -m k2y status
    ```
 
+### Reaction Photos
+Place reaction photos in `%USERPROFILE%\.config\k2y\faces\` (or `$HOME/.config/k2y/faces/`). Any `.jpg`, `.jpeg`, `.png`, or `.webp` file is supported. The pipeline deterministically selects a photo for each thumbnail and blends it on the right edge with an alpha gradient. If the folder is missing or empty, thumbnails are generated without reaction photos and a warning is logged once per run.
+
 ### Daily Use
 Run all commands from the `kick-to-youtube-lives` root directory:
 - `py -m k2y status` (or `py -m k2y status --json`): view pipeline status, state, upload progress, attempts, and errors.
