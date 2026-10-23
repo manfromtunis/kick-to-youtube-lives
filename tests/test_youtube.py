@@ -617,7 +617,7 @@ class TestYouTube(unittest.TestCase):
             )
         self.assertIn(
             "upload session expired; check YouTube Studio for a finished duplicate of 'My Stream Title', "
-            "then run `py -m k2y retry <vod>`",
+            "then run `py -m k2y retry <vod> --restart-upload`",
             str(ctx.exception),
         )
 

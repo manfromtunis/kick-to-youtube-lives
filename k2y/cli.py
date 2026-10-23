@@ -6,21 +6,49 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 from . import config, db, kick, pipeline, youtube
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger("k2y")
+
+
+def _print_err(*args: Any, **kwargs: Any) -> None:
+    if sys.stderr is not None:
+        try:
+            print(*args, file=sys.stderr, **kwargs)
+        except Exception:
+            pass
+
+
+def _determine_work_dir() -> Path:
+    cfg_file = config.CONFIG_DIR / "config.json"
+    if cfg_file.exists():
+        try:
+            data = json.loads(cfg_file.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict) and "work_dir" in data:
+                return Path(data["work_dir"]).expanduser()
+        except Exception:
+            try:
+                m = re.search(r'"work_dir"\s*:\s*"([^"]+)"', cfg_file.read_text(encoding="utf-8-sig"))
+                if m:
+                    return Path(m.group(1)).expanduser()
+            except Exception:
+                pass
+    return Path.home() / ".local/share/k2y"
 
 
 def _vod_or_err(cfg: config.Config, vod_id: int):
     conn = db.connect(cfg.db_path)
     vod = db.get_vod(conn, vod_id)
     if not vod:
-        print(f"VOD {vod_id} not found in database", file=sys.stderr)
+        _print_err(f"VOD {vod_id} not found in database")
         return conn, None
     return conn, vod
 
@@ -33,7 +61,7 @@ def _with_lock(cfg: config.Config, action):
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.work_dir / "k2y.lock"
     if not pipeline.acquire_lock(lock_path):
-        print("a run is in progress, try again later", file=sys.stderr)
+        _print_err("a run is in progress, try again later")
         return 1
     try:
         return action()
@@ -73,6 +101,20 @@ def main(argv: list[str] | None = None) -> int:
     # retry
     p_retry = subparsers.add_parser("retry", help="Retry a failed or errored VOD")
     p_retry.add_argument("vod_id", type=int, help="Kick VOD ID")
+    p_retry.add_argument(
+        "--restart-upload",
+        action="store_true",
+        help="Clear unfinished upload sessions on retry",
+    )
+
+    # set-upload
+    p_set_upload = subparsers.add_parser(
+        "set-upload",
+        help="Record that an upload part is already on YouTube",
+    )
+    p_set_upload.add_argument("vod_id", type=int, help="Kick VOD ID")
+    p_set_upload.add_argument("idx", type=int, help="Upload part index")
+    p_set_upload.add_argument("youtube_id", type=str, help="YouTube video ID")
 
     # skip
     p_skip = subparsers.add_parser("skip", help="Skip a VOD")
@@ -94,11 +136,25 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if not args.command:
-        parser.print_help(file=sys.stderr)
+        if sys.stderr is not None:
+            parser.print_help(file=sys.stderr)
         return 2
 
     try:
-        cfg = config.load()
+        try:
+            cfg = config.load()
+            pipeline.setup_logging(cfg.work_dir)
+        except config.MissingSecret as e:
+            pipeline.setup_logging(_determine_work_dir())
+            logger.exception(f"Missing secret: {e}")
+            _print_err(e)
+            return 1
+        except Exception as e:
+            pipeline.setup_logging(_determine_work_dir())
+            logger.exception(f"Failed to load configuration: {e}")
+            _print_err(f"Error: {e}")
+            return 1
+
         if args.command == "run":
             return pipeline.run(cfg)
 
@@ -132,12 +188,12 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
 
                 if vod["state"] in ("done", "skipped"):
-                    print(f"Cannot re-plan VOD {args.vod_id}: state is {vod['state']}", file=sys.stderr)
+                    _print_err(f"Cannot re-plan VOD {args.vod_id}: state is {vod['state']}")
                     return 1
 
                 ups = db.uploads(conn, args.vod_id)
                 if any(u["youtube_id"] or u["upload_session"] for u in ups):
-                    print(f"Cannot re-plan VOD {args.vod_id}: upload in progress or completed", file=sys.stderr)
+                    _print_err(f"Cannot re-plan VOD {args.vod_id}: upload in progress or completed")
                     return 1
 
                 source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
@@ -166,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
                 conn, vod = _vod_or_err(cfg, args.vod_id)
                 if not vod:
                     return 1
+
+                if args.restart_upload:
+                    cleared = db.clear_upload_sessions(conn, args.vod_id)
+                    print(f"Cleared {cleared} upload session(s) for VOD {args.vod_id}")
 
                 if vod["state"] == "failed":
                     source_file = cfg.vod_dir(args.vod_id) / "source.mp4"
@@ -198,6 +258,19 @@ def main(argv: list[str] | None = None) -> int:
 
             return _with_lock(cfg, do_retry)
 
+        elif args.command == "set-upload":
+            def do_set_upload():
+                conn = db.connect(cfg.db_path)
+                row = db.get_upload(conn, args.vod_id, args.idx)
+                if not row:
+                    _print_err(f"Upload row {args.idx} for VOD {args.vod_id} does not exist")
+                    return 1
+                db.set_upload_youtube_id(conn, args.vod_id, args.idx, args.youtube_id)
+                print(f"Recorded VOD {args.vod_id} part {args.idx} as {args.youtube_id}")
+                return 0
+
+            return _with_lock(cfg, do_set_upload)
+
         elif args.command == "skip":
             def do_skip():
                 conn, vod = _vod_or_err(cfg, args.vod_id)
@@ -208,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         shutil.rmtree(vod_dir)
                     except Exception as e:
-                        logging.getLogger("k2y").warning(f"Failed to remove VOD directory {vod_dir}: {e}")
+                        logger.warning(f"Failed to remove VOD directory {vod_dir}: {e}")
                 db.set_state(conn, args.vod_id, "skipped")
                 return 0
 
@@ -220,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                 vods = kick.list_vods(cfg.channel)
                 match = next((v for v in vods if v["id"] == args.vod_id), None)
                 if not match:
-                    print(f"VOD {args.vod_id} not found in channel {cfg.channel}", file=sys.stderr)
+                    _print_err(f"VOD {args.vod_id} not found in channel {cfg.channel}")
                     return 1
                 inserted = db.upsert_vod(conn, match)
                 if inserted:
@@ -234,19 +307,16 @@ def main(argv: list[str] | None = None) -> int:
             return _with_lock(cfg, do_backfill)
 
         elif args.command == "auth":
-            youtube.auth(paste=args.paste)
-            return 0
+            def do_auth():
+                youtube.auth(paste=args.paste)
+                return 0
+
+            return _with_lock(cfg, do_auth)
 
         elif args.command == "install-timer":
             if _is_windows():
-                exe_str = str(sys.executable)
-                sep = "\\" if "\\" in exe_str else "/"
-                if sep in exe_str:
-                    py_dir = exe_str.rsplit(sep, 1)[0]
-                    pythonw = f"{py_dir}{sep}pythonw.exe"
-                else:
-                    pythonw = "pythonw.exe"
-                python_exe = pythonw if os.path.exists(pythonw) else exe_str
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                python_exe = str(pythonw) if os.path.exists(pythonw) else sys.executable
                 task_script = str(REPO_DIR / "k2y-task.pyw").replace("/", "\\")
                 tr_val = f'"{python_exe}" "{task_script}"'
                 subprocess.run(
@@ -278,8 +348,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     except config.MissingSecret as e:
-        print(e, file=sys.stderr)
+        logger.exception(f"Missing secret: {e}")
+        _print_err(e)
         return 1
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        logger.exception(f"Error: {e}")
+        _print_err(f"Error: {e}")
         return 1

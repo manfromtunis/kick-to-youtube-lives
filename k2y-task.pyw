@@ -10,7 +10,7 @@ os.chdir(repo_dir)
 
 try:
     from k2y import cli
-    cli.main(["run"])
+    sys.exit(cli.main(["run"]))
 except Exception:
     try:
         from k2y import config

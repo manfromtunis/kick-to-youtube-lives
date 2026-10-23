@@ -488,7 +488,7 @@ def upload(
                 title = meta.get("title", "")
                 raise YouTubeError(
                     f"upload session expired; check YouTube Studio for a finished duplicate of '{title}', "
-                    "then run `py -m k2y retry <vod>`"
+                    "then run `py -m k2y retry <vod> --restart-upload`"
                 )
             except _RETRYABLE as e:
                 attempts += 1

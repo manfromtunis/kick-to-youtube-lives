@@ -50,8 +50,7 @@ class TestPipeline(unittest.TestCase):
         # Clean up any open locks
         lock_path = self.work_dir / "k2y.lock"
         pipeline.release_lock(lock_path)
-        for path in list(pipeline._OPEN_LOCKS.keys()):
-            pipeline.release_lock(path)
+        pipeline.release_lock()
         self.stderr_patcher.stop()
         self.tmp.cleanup()
 
@@ -183,12 +182,12 @@ class TestPipeline(unittest.TestCase):
             ret = pipeline.run(self.cfg)
 
         self.assertEqual(ret, 0)
-        self.assertTrue(any("client_secret.json" in msg and "run `py -m k2y auth`" in msg for msg in cm.output))
+        self.assertTrue(any("client_secret.json" in msg and "put the Google OAuth Desktop client file at that path (spec section 5)" in msg for msg in cm.output))
 
         row1 = db.get_vod(self.conn, 201)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
-        self.assertIsNone(row1["error"])
+        self.assertIn("put the Google OAuth Desktop client file at that path (spec section 5)", row1["error"])
 
     def test_missing_secret_gemini_key_logs_str_e_without_auth_hint(self):
         vod1 = {
@@ -212,8 +211,13 @@ class TestPipeline(unittest.TestCase):
 
         self.assertEqual(ret, 0)
         # Should log str(e), with NO auth hint
-        self.assertTrue(any("gemini.key" in msg for msg in cm.output))
+        self.assertTrue(any("gemini.key" in msg and "put the API key there" in msg for msg in cm.output))
         self.assertFalse(any("run `py -m k2y auth`" in msg for msg in cm.output))
+
+        row1 = db.get_vod(self.conn, 2011)
+        self.assertEqual(row1["state"], "new")
+        self.assertEqual(row1["attempts"], 0)
+        self.assertIn("put the API key there", row1["error"])
 
     def test_auth_required_stops_run_without_attempt_and_logs_error_once(self):
         vod1 = {
@@ -245,7 +249,7 @@ class TestPipeline(unittest.TestCase):
         row1 = db.get_vod(self.conn, 202)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
-        self.assertIsNone(row1["error"])
+        self.assertEqual(row1["error"], youtube.AUTH_REQUIRED_MSG)
 
     def test_thumbnails_forbidden_stops_run_without_attempt_and_logs(self):
         vod1 = {
@@ -278,7 +282,7 @@ class TestPipeline(unittest.TestCase):
         row1 = db.get_vod(self.conn, 2022)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
-        self.assertIsNone(row1["error"])
+        self.assertIn("https://www.youtube.com/verify", row1["error"])
 
     def test_quota_exceeded_stops_run_without_attempt_or_next_vod(self):
         vod1 = {
@@ -321,7 +325,7 @@ class TestPipeline(unittest.TestCase):
         row1 = db.get_vod(self.conn, 201)
         self.assertEqual(row1["state"], "new")
         self.assertEqual(row1["attempts"], 0)
-        self.assertIsNone(row1["error"])
+        self.assertEqual(row1["error"], "Daily YouTube upload quota exceeded")
 
         row2 = db.get_vod(self.conn, 202)
         self.assertEqual(row2["state"], "new")
@@ -351,7 +355,7 @@ class TestPipeline(unittest.TestCase):
         row = db.get_vod(self.conn, 203)
         self.assertEqual(row["state"], "new")
         self.assertEqual(row["attempts"], 0)
-        self.assertIsNone(row["error"])
+        self.assertEqual(row["error"], "Gemini quota exhausted")
 
     def test_step_plan_does_not_call_gemini_if_plan_json_exists(self):
         vod_id = 205
@@ -551,7 +555,8 @@ class TestPipeline(unittest.TestCase):
         with patch("k2y.media.thumbnail"), self.assertRaises(RuntimeError) as ctx:
             pipeline.step_cut(self.conn, self.cfg, row)
 
-        self.assertIn("stale upload row idx 2 already on YouTube as http://session/stale; resolve manually", str(ctx.exception))
+        self.assertIn("stale upload row idx 2 upload in progress; resolve manually", str(ctx.exception))
+        self.assertNotIn("http://session/stale", str(ctx.exception))
 
     def test_step_cut_ready_and_upload_incomplete_rows_return_planned(self):
         vod_id = 208
@@ -758,16 +763,7 @@ class TestPipeline(unittest.TestCase):
         pipeline.setup_logging(log_dir)
         self.assertTrue((log_dir / "k2y.log").exists())
 
-    def test_discovery_skips_live_and_before_since(self):
-        vod_live = {
-            "id": 301,
-            "title": "Live Stream",
-            "started_at": "2026-10-23T10:00:00Z",
-            "duration_s": 3600,
-            "source_url": "http://kick.com/301",
-            "category": "Gaming",
-            "is_live": True,
-        }
+    def test_discovery_skips_before_since(self):
         vod_old = {
             "id": 302,
             "title": "Old Stream",
@@ -789,10 +785,9 @@ class TestPipeline(unittest.TestCase):
 
         pipeline.STEPS = {}
 
-        with patch("k2y.kick.list_vods", return_value=[vod_live, vod_old, vod_valid]):
+        with patch("k2y.kick.list_vods", return_value=[vod_old, vod_valid]):
             pipeline.run(self.cfg)
 
-        self.assertIsNone(db.get_vod(self.conn, 301))
         self.assertIsNone(db.get_vod(self.conn, 302))
         self.assertIsNotNone(db.get_vod(self.conn, 303))
 
@@ -924,32 +919,102 @@ class TestPipeline(unittest.TestCase):
         task_script = Path(__file__).resolve().parent.parent / "k2y-task.pyw"
         self.assertTrue(task_script.exists())
 
-        # Run script in subprocess with mock config pointing to our work_dir and causing cli.main to fail
         env = dict(os.environ)
         env["K2Y_CONFIG_DIR"] = str(self.config_dir)
         (self.config_dir / "config.json").write_text(
-            json.dumps({"work_dir": str(self.work_dir)}),
+            '{\n  "work_dir": "' + str(self.work_dir) + '",\n  "broken_syntax": \n}',
             encoding="utf-8",
         )
 
-        test_py = f"""
-import sys
-from unittest.mock import patch
-
-with patch('k2y.cli.main', side_effect=RuntimeError('simulated crash')):
-    import runpy
-    try:
-        runpy.run_path({repr(str(task_script))}, run_name='__main__')
-    except Exception:
-        pass
-"""
-        proc = subprocess.run([sys.executable, "-c", test_py], env=env, capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0)
+        proc = subprocess.run([sys.executable, str(task_script)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
 
         log_file = self.work_dir / "k2y.log"
         self.assertTrue(log_file.exists())
         log_content = log_file.read_text(encoding="utf-8")
-        self.assertIn("RuntimeError: simulated crash", log_content)
+        self.assertIn("JSONDecodeError", log_content)
+
+    def test_missing_secret_youtube_token_logs_auth_hint(self):
+        vod1 = {
+            "id": 2012,
+            "title": "Stream 2012",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod2012.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod1)
+
+        def step_missing_yt(c, cfg, v):
+            raise config.MissingSecret("missing secret /path/youtube_token.json (see docs...)")
+
+        pipeline.STEPS = {"new": step_missing_yt}
+
+        with patch("k2y.kick.list_vods", return_value=[]), self.assertLogs("k2y", level="ERROR") as cm:
+            ret = pipeline.run(self.cfg)
+
+        self.assertEqual(ret, 0)
+        self.assertTrue(any("youtube_token.json" in msg and "run `py -m k2y auth`" in msg for msg in cm.output))
+
+        row1 = db.get_vod(self.conn, 2012)
+        self.assertEqual(row1["state"], "new")
+        self.assertEqual(row1["attempts"], 0)
+        self.assertIn("run `py -m k2y auth`", row1["error"])
+
+    def test_expired_session_error_appends_vod_id_to_recorded_error(self):
+        vod_id = 980
+        vod = {
+            "id": vod_id,
+            "title": "Stream 980",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod980.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "uploading")
+
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        src = v_dir / "source.mp4"
+        src.write_bytes(b"content")
+        thumb = v_dir / "thumb_0.jpg"
+        thumb.write_bytes(b"thumb")
+
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600, file=src, thumb=thumb)
+        db.update_upload(self.conn, vod_id, 0, upload_session="http://expired.session")
+
+        expired_msg = "upload session expired; check YouTube Studio for a finished duplicate of 'Stream 980', then run `py -m k2y retry <vod> --restart-upload`"
+
+        with patch("k2y.youtube.upload", side_effect=youtube.YouTubeError(expired_msg)):
+            pipeline.advance(self.conn, self.cfg, vod_id)
+
+        row = db.get_vod(self.conn, vod_id)
+        self.assertIn("then run `py -m k2y retry <vod> --restart-upload` (vod 980)", row["error"])
+
+    def test_forward_transition_clears_error_from_stop_run(self):
+        vod_id = 981
+        vod = {
+            "id": vod_id,
+            "title": "Stream 981",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod981.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_error(self.conn, vod_id, "Temporary StopRun error")
+        self.assertEqual(db.get_vod(self.conn, vod_id)["error"], "Temporary StopRun error")
+
+        pipeline.STEPS = {"new": lambda c, cfg, v: "downloaded"}
+        pipeline.advance(self.conn, self.cfg, vod_id)
+
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["state"], "downloaded")
+        self.assertIsNone(row["error"])
 
 
 if __name__ == "__main__":

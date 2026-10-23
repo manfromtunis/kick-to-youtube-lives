@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 from k2y.kick import KickError
 from k2y.media import (
     _escape_font_path,
-    _filter_path,
     chapters,
     cut,
     full_description,

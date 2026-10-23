@@ -20,10 +20,9 @@ MAX_IMAGE_BYTES = 2 * 1024 * 1024
 def _escape_font_path(p: Path) -> str:
     """Convert path to forward slashes, escaping colons and single quotes for ffmpeg filter syntax."""
     s = str(p).replace("\\", "/")
-    return s.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+    return s.replace(":", r"\:").replace("'", r"\'")
 
 
-_filter_path = _escape_font_path
 
 
 def _find_font() -> Path | None:

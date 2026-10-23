@@ -46,16 +46,18 @@ All commands (`py -m k2y ...`) must be run from the repository root folder (`kic
 Run all commands from the `kick-to-youtube-lives` root directory:
 - `py -m k2y status` (or `py -m k2y status --json`): view pipeline status, state, upload progress, attempts, and errors.
 - `py -m k2y plan <vod_id>`: run download (if needed) and generate thematic segmentation parts preview without uploading.
-- `py -m k2y retry <vod_id>`: clear errors and reset failed or errored VODs to re-process.
+- `py -m k2y retry <vod_id> [--restart-upload]`: clear errors and reset failed or errored VODs to re-process. Passing `--restart-upload` also clears unfinished upload sessions on rows without a YouTube ID so they can start fresh.
+- `py -m k2y set-upload <vod_id> <idx> <youtube_id>`: record that an upload part (0 for full VOD, 1+ for thematic parts) is already on YouTube, clearing any upload session for that part. Refuses if the row does not exist.
 - `py -m k2y skip <vod_id>`: mark a VOD as skipped to ignore it (cleans up any existing work directory for that VOD).
 - `py -m k2y backfill <vod_id>`: fetch and process an older Kick VOD from before the `since` cutoff.
 
 ### Logs
-Logs are kept in `%USERPROFILE%\.local\share\k2y\`:
-- `k2y.log`: pipeline state machine and execution logs, including any uncaught exceptions from `k2y-task.pyw` (5 MB max, 3 backups, UTF-8).
+Logs are kept in `%USERPROFILE%\.local\share\k2y\` (or `$HOME/.local/share/k2y` / `work_dir`):
+- `k2y.log`: pipeline state machine and execution logs, including any uncaught exceptions from `cli.main` or `k2y-task.pyw` (5 MB max, 3 backups, UTF-8).
 - `k2y-task.log`: crontab redirect log on Linux.
 
 ### Privacy & Quotas
 - **Private-only**: All videos are uploaded strictly with `privacyStatus: private`. There is no option to publish publicly.
 - **YouTube Quota**: Limited to ~6 uploads/day (10,000 units/day). If `quotaExceeded` occurs, the run stops cleanly without marking attempts and resumes the next day.
+- **Channel Verification (Thumbnails)**: A `ThumbnailsForbidden` stop blocks every run until the channel is phone-verified at https://www.youtube.com/verify. To check if a run is blocked by this, run `py -m k2y status` to view the recorded error.
 - **Gemini Billing**: Gemini API requires billing enabled to support inline multi-chunk audio processing for long streams without hitting free tier daily limits.

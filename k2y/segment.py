@@ -551,7 +551,7 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         failed_event = threading.Event()
 
-        def _describe(i: int, cp: Path) -> dict:
+        def _describe(i: int, cp: Path) -> dict | None:
             if failed_event.is_set():
                 return None
             try:

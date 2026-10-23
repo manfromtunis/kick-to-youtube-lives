@@ -71,13 +71,8 @@ def expected_upload_count(plan: list) -> int:
 def step_download(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     dest = cfg.vod_dir(vod_id) / "source.mp4"
-    res = kick.download(dict(vod), dest)
-    if isinstance(res, tuple) and len(res) >= 2 and isinstance(res[1], (int, float)):
-        dur = int(res[1])
-    elif isinstance(res, (int, float)):
-        dur = int(res)
-    else:
-        dur = int(kick.probe_duration(dest))
+    kick.download(dict(vod), dest)
+    dur = int(kick.probe_duration(dest))
     db.set_duration(conn, vod_id, dur)
     return "downloaded"
 
@@ -154,10 +149,13 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
     existing_uploads = db.uploads(conn, vod_id)
     for r in existing_uploads:
         if r["idx"] >= expected:
-            if r["youtube_id"] or r["upload_session"]:
-                id_val = r["youtube_id"] or r["upload_session"]
+            if r["youtube_id"]:
                 raise RuntimeError(
-                    f"stale upload row idx {r['idx']} already on YouTube as {id_val}; resolve manually"
+                    f"stale upload row idx {r['idx']} already on YouTube as {r['youtube_id']}; resolve manually"
+                )
+            if r["upload_session"]:
+                raise RuntimeError(
+                    f"stale upload row idx {r['idx']} upload in progress; resolve manually"
                 )
             with conn:
                 conn.execute(
@@ -311,29 +309,44 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
             break
         try:
             next_state = step_fn(conn, cfg, vod)
-        except StopRun:
+        except StopRun as sr:
+            db.set_error(conn, vod_id, str(sr))
             raise
         except Exception as e:
             if isinstance(e, youtube.AuthRequired):
-                logger.error(str(e))
-                raise StopRun(str(e)) from e
+                msg = str(e)
+                logger.error(msg)
+                db.set_error(conn, vod_id, msg)
+                raise StopRun(msg) from e
 
             if isinstance(e, config.MissingSecret):
                 err_text = str(e)
-                if "youtube_token.json" in err_text or "client_secret.json" in err_text:
-                    logger.error(f"{err_text} - run `py -m k2y auth`")
+                if "youtube_token.json" in err_text:
+                    hint = f"{err_text} - run `py -m k2y auth`"
+                elif "client_secret.json" in err_text:
+                    hint = f"{err_text} - put the Google OAuth Desktop client file at that path (spec section 5)"
+                elif "gemini.key" in err_text:
+                    hint = f"{err_text} - put the API key there"
                 else:
-                    logger.error(err_text)
-                raise StopRun(err_text) from e
+                    hint = err_text
+                logger.error(hint)
+                db.set_error(conn, vod_id, hint)
+                raise StopRun(hint) from e
 
-            if hasattr(youtube, "ThumbnailsForbidden") and isinstance(e, youtube.ThumbnailsForbidden):
-                logger.error(str(e))
-                raise StopRun(str(e)) from e
+            if isinstance(e, youtube.ThumbnailsForbidden):
+                msg = str(e)
+                logger.error(msg)
+                db.set_error(conn, vod_id, msg)
+                raise StopRun(msg) from e
 
             if isinstance(e, (youtube.QuotaExceeded, segment.DailyQuota)):
-                raise StopRun(str(e)) from e
+                msg = str(e)
+                db.set_error(conn, vod_id, msg)
+                raise StopRun(msg) from e
 
             err_msg = f"{type(e).__name__}: {e}"
+            if "retry <vod> --restart-upload" in err_msg:
+                err_msg += f" (vod {vod_id})"
             logger.error(f"vod {vod_id}: step {state} error: {err_msg}")
             db.record_error(conn, vod_id, err_msg)
             break
@@ -350,7 +363,7 @@ def advance(conn, cfg: config.Config, vod_id: int) -> None:
                 break
 
 
-_OPEN_LOCKS: dict[Path, list[Any]] = {}
+_lock_file: Any | None = None
 
 
 def acquire_lock(lock_path: Path) -> bool:
@@ -360,6 +373,7 @@ def acquire_lock(lock_path: Path) -> bool:
     POSIX: fcntl.flock(fd, LOCK_EX | LOCK_NB)
     Returns True if acquired, False if already held.
     """
+    global _lock_file
     if not isinstance(lock_path, Path):
         lock_path = Path(lock_path)
     try:
@@ -382,34 +396,17 @@ def acquire_lock(lock_path: Path) -> bool:
         f.close()
         return False
 
-    _OPEN_LOCKS.setdefault(lock_path, []).append(f)
+    _lock_file = f
     return True
 
 
-def release_lock(lock_path: Path | Any) -> None:
+def release_lock(lock_path: Any = None) -> None:
     """Release run lock (unlock + close; never delete the file)."""
-    if hasattr(lock_path, "fileno"):
-        f = lock_path
-        for p, handles in list(_OPEN_LOCKS.items()):
-            if f in handles:
-                handles.remove(f)
-                if not handles:
-                    del _OPEN_LOCKS[p]
-    else:
-        if not isinstance(lock_path, Path):
-            lock_path = Path(lock_path)
-        try:
-            path = lock_path.resolve()
-        except (NotImplementedError, OSError):
-            path = lock_path
-
-        handles = _OPEN_LOCKS.get(path)
-        if not handles:
-            return
-        f = handles.pop()
-        if not handles:
-            del _OPEN_LOCKS[path]
-
+    global _lock_file
+    f = _lock_file
+    _lock_file = None
+    if f is None:
+        return
     fd = f.fileno()
     try:
         if os.name == "nt":
@@ -445,15 +442,14 @@ def run(cfg: config.Config | None = None) -> int:
         try:
             vods = kick.list_vods(cfg.channel)
             for v in vods:
-                if not v.get("is_live"):
-                    v_date = str(v.get("started_at", ""))[:10]
-                    since_date = str(cfg.since)[:10] if cfg.since else ""
-                    if not since_date or v_date >= since_date:
-                        try:
-                            db.upsert_vod(conn, v)
-                        except Exception as e:
-                            v_id = v.get("id") if isinstance(v, dict) else "?"
-                            logger.warning(f"skipping Kick VOD {v_id}: {e}")
+                v_date = str(v.get("started_at", ""))[:10]
+                since_date = str(cfg.since)[:10] if cfg.since else ""
+                if not since_date or v_date >= since_date:
+                    try:
+                        db.upsert_vod(conn, v)
+                    except Exception as e:
+                        v_id = v.get("id") if isinstance(v, dict) else "?"
+                        logger.warning(f"skipping Kick VOD {v_id}: {e}")
         except kick.KickError as e:
             logger.warning(f"Kick discovery error: {e}")
 

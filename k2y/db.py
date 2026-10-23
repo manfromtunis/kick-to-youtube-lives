@@ -105,11 +105,20 @@ def set_state(
 
 
 def set_duration(conn: sqlite3.Connection, vod_id: int, duration_s: int) -> None:
-    """Update duration_s for a VOD."""
+    """Update probed duration of a VOD."""
     with conn:
         conn.execute(
             "UPDATE vods SET duration_s = ?, updated_at = ? WHERE id = ?",
             (duration_s, _now_iso(), vod_id),
+        )
+
+
+def set_error(conn: sqlite3.Connection, vod_id: int, error: str) -> None:
+    """Set error message for a VOD without incrementing attempts or changing state."""
+    with conn:
+        conn.execute(
+            "UPDATE vods SET error = ?, updated_at = ? WHERE id = ?",
+            (error, _now_iso(), vod_id),
         )
 
 
@@ -154,12 +163,12 @@ def upsert_upload(
     title: str,
     start_s: int,
     end_s: int,
-    file: str | Path | None = None,
-    thumb: str | Path | None = None,
+    file: Path | None = None,
+    thumb: Path | None = None,
 ) -> None:
-    """Insert or update an upload row, preserving existing upload progress."""
-    file_str = str(file) if file is not None else None
-    thumb_str = str(thumb) if thumb is not None else None
+    """Insert or update upload plan item."""
+    file_str = str(file) if file else None
+    thumb_str = str(thumb) if thumb else None
     with conn:
         conn.execute(
             """
@@ -195,11 +204,6 @@ def delete_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
 
     Raises RuntimeError if any rows with youtube_id or upload_session remain for that VOD.
     """
-    with conn:
-        conn.execute(
-            "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL AND upload_session IS NULL",
-            (vod_id,),
-        )
     remaining = conn.execute(
         "SELECT idx, youtube_id, upload_session FROM uploads WHERE vod_id = ? AND (youtube_id IS NOT NULL OR upload_session IS NOT NULL)",
         (vod_id,),
@@ -207,6 +211,36 @@ def delete_uploads(conn: sqlite3.Connection, vod_id: int) -> None:
     if remaining:
         raise RuntimeError(
             f"cannot delete uploads for VOD {vod_id}: {len(remaining)} uploaded or in-progress rows remain"
+        )
+    with conn:
+        conn.execute(
+            "DELETE FROM uploads WHERE vod_id = ? AND youtube_id IS NULL AND upload_session IS NULL",
+            (vod_id,),
+        )
+
+
+def clear_upload_sessions(conn: sqlite3.Connection, vod_id: int) -> int:
+    """Clear upload_session (set to NULL) for upload rows without youtube_id. Returns number of rows updated."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE uploads SET upload_session = NULL WHERE vod_id = ? AND youtube_id IS NULL AND upload_session IS NOT NULL",
+            (vod_id,),
+        )
+        return cur.rowcount
+
+
+def get_upload(conn: sqlite3.Connection, vod_id: int, idx: int) -> sqlite3.Row | None:
+    """Return upload row for (vod_id, idx) or None if not found."""
+    cur = conn.execute("SELECT * FROM uploads WHERE vod_id = ? AND idx = ?", (vod_id, idx))
+    return cur.fetchone()
+
+
+def set_upload_youtube_id(conn: sqlite3.Connection, vod_id: int, idx: int, youtube_id: str) -> None:
+    """Record that an upload row is on YouTube: set youtube_id, clear upload_session, keep thumb_done."""
+    with conn:
+        conn.execute(
+            "UPDATE uploads SET youtube_id = ?, upload_session = NULL WHERE vod_id = ? AND idx = ?",
+            (youtube_id, vod_id, idx),
         )
 
 

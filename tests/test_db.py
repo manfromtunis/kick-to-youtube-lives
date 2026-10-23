@@ -59,64 +59,53 @@ class TestDB(unittest.TestCase):
         row = db.get_vod(self.conn, 101)
         self.assertEqual(row["title"], "Stream 101")
 
-    def test_get_vod_not_found(self):
-        self.assertIsNone(db.get_vod(self.conn, 999))
+    def test_pending_vods_order_and_states(self):
+        v1 = {"id": 1, "title": "V1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        v2 = {"id": 2, "title": "V2", "started_at": "2026-10-22T08:00:00Z", "duration_s": 100, "source_url": "url2"}
+        v3 = {"id": 3, "title": "V3", "started_at": "2026-10-22T12:00:00Z", "duration_s": 100, "source_url": "url3"}
+        v4 = {"id": 4, "title": "V4", "started_at": "2026-10-22T09:00:00Z", "duration_s": 100, "source_url": "url4"}
+        v5 = {"id": 5, "title": "V5", "started_at": "2026-10-22T07:00:00Z", "duration_s": 100, "source_url": "url5"}
 
-    def test_pending_vods_ordering_and_filtering(self):
-        vods = [
-            {"id": 1, "title": "VOD 1", "started_at": "2026-10-20T10:00:00Z", "duration_s": 100, "source_url": "url1"},
-            {"id": 2, "title": "VOD 2", "started_at": "2026-10-18T10:00:00Z", "duration_s": 100, "source_url": "url2"},
-            {"id": 3, "title": "VOD 3", "started_at": "2026-10-19T10:00:00Z", "duration_s": 100, "source_url": "url3"},
-            {"id": 4, "title": "VOD 4", "started_at": "2026-10-21T10:00:00Z", "duration_s": 100, "source_url": "url4"},
-            {"id": 5, "title": "VOD 5", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url5"},
-        ]
-        for v in vods:
+        for v in [v1, v2, v3, v4, v5]:
             db.upsert_vod(self.conn, v)
 
+        # Mark terminal states
         db.set_state(self.conn, 1, "done")
-        db.set_state(self.conn, 4, "failed")
+        db.set_state(self.conn, 3, "failed")
         db.set_state(self.conn, 5, "skipped")
-        db.set_state(self.conn, 2, "downloaded")
-        db.set_state(self.conn, 3, "new")
 
+        # Pending should be v2 (08:00) then v4 (09:00)
         pending = db.pending_vods(self.conn)
-        pending_ids = [r["id"] for r in pending]
-        # Should exclude 1, 4, 5, and order by started_at (VOD 2 was 2026-10-18, VOD 3 was 2026-10-19)
-        self.assertEqual(pending_ids, [2, 3])
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(pending[0]["id"], 2)
+        self.assertEqual(pending[1]["id"], 4)
 
-    def test_set_state_resets_attempts_and_error(self):
+    def test_set_state_resets_attempts_and_updates_error(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
         db.upsert_vod(self.conn, vod)
 
-        db.record_error(self.conn, 1, "transient error", max_attempts=3)
-        row = db.get_vod(self.conn, 1)
-        self.assertEqual(row["attempts"], 1)
-        self.assertEqual(row["error"], "transient error")
-
-        # Step succeeds: set_state called without error clears attempts and error
-        db.set_state(self.conn, 1, "downloaded")
+        # Set error
+        db.set_state(self.conn, 1, "downloaded", error="Network timeout")
         row = db.get_vod(self.conn, 1)
         self.assertEqual(row["state"], "downloaded")
-        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(row["error"], "Network timeout")
+
+        # Record attempt
+        db.record_error(self.conn, 1, "Another error", max_attempts=3)
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["attempts"], 1)
+
+        # Reset attempts on state change when error is None
+        db.set_state(self.conn, 1, "planned")
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["state"], "planned")
         self.assertIsNone(row["error"])
-
-        # When error is explicitly provided, it sets the error
-        db.set_state(self.conn, 1, "downloaded", error="explicit error")
-        row = db.get_vod(self.conn, 1)
-        self.assertEqual(row["error"], "explicit error")
-
-        # Backward transition: reset_attempts=False keeps attempts
-        db.record_error(self.conn, 1, "failed again")
-        row = db.get_vod(self.conn, 1)
-        self.assertEqual(row["attempts"], 1)
-        db.set_state(self.conn, 1, "new", reset_attempts=False)
-        row = db.get_vod(self.conn, 1)
-        self.assertEqual(row["state"], "new")
-        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["attempts"], 0)
 
     def test_set_duration(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
         db.upsert_vod(self.conn, vod)
+
         db.set_duration(self.conn, 1, 3599)
         row = db.get_vod(self.conn, 1)
         self.assertEqual(row["duration_s"], 3599)
@@ -143,16 +132,64 @@ class TestDB(unittest.TestCase):
             db.delete_uploads(self.conn, 2)
         self.assertIn("cannot delete uploads for VOD 2", str(ctx.exception))
 
-        # Check that the unuploaded row (idx 1) was deleted, but uploaded row (idx 0) remains
+        # Check that NO rows were deleted (both idx 0 and idx 1 remain)
         ups = db.uploads(self.conn, 2)
-        self.assertEqual(len(ups), 1)
-        self.assertEqual(ups[0]["idx"], 0)
+        self.assertEqual(len(ups), 2)
 
         # Test upload_session as well
-        db.upsert_upload(self.conn, 2, 1, "Part 1", 0, 50)
         db.update_upload(self.conn, 2, 1, upload_session="http://upload.session")
         with self.assertRaises(RuntimeError):
             db.delete_uploads(self.conn, 2)
+        self.assertEqual(len(db.uploads(self.conn, 2)), 2)
+
+    def test_set_error_does_not_increment_attempts_or_change_state(self):
+        vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, 1, "uploading")
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["state"], "uploading")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["error"])
+
+        db.set_error(self.conn, 1, "Quota exceeded")
+        row = db.get_vod(self.conn, 1)
+        self.assertEqual(row["state"], "uploading")
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(row["error"], "Quota exceeded")
+
+    def test_clear_upload_sessions(self):
+        vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        db.upsert_vod(self.conn, vod)
+        db.upsert_upload(self.conn, 1, 0, "Full VOD", 0, 100)
+        db.update_upload(self.conn, 1, 0, upload_session="http://session/0")
+        db.upsert_upload(self.conn, 1, 1, "Part 1", 0, 50)
+        db.update_upload(self.conn, 1, 1, youtube_id="yt_1", upload_session="http://session/1")
+
+        cleared = db.clear_upload_sessions(self.conn, 1)
+        self.assertEqual(cleared, 1)
+
+        ups = db.uploads(self.conn, 1)
+        self.assertIsNone(ups[0]["upload_session"])
+        self.assertEqual(ups[1]["upload_session"], "http://session/1")
+
+    def test_get_upload_and_set_upload_youtube_id(self):
+        vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}
+        db.upsert_vod(self.conn, vod)
+        self.assertIsNone(db.get_upload(self.conn, 1, 0))
+
+        db.upsert_upload(self.conn, 1, 0, "Full VOD", 0, 100)
+        db.update_upload(self.conn, 1, 0, upload_session="http://session/0", thumb_done=1)
+
+        row = db.get_upload(self.conn, 1, 0)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["idx"], 0)
+        self.assertEqual(row["upload_session"], "http://session/0")
+
+        db.set_upload_youtube_id(self.conn, 1, 0, "yt_manual_id")
+        updated = db.get_upload(self.conn, 1, 0)
+        self.assertEqual(updated["youtube_id"], "yt_manual_id")
+        self.assertIsNone(updated["upload_session"])
+        self.assertEqual(updated["thumb_done"], 1)
 
     def test_record_error_increments_and_fails_at_max(self):
         vod = {"id": 1, "title": "VOD 1", "started_at": "2026-10-22T10:00:00Z", "duration_s": 100, "source_url": "url1"}

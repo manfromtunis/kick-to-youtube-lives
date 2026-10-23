@@ -33,10 +33,19 @@ class TestCLI(unittest.TestCase):
             "since": "2026-10-22",
         }), encoding="utf-8")
 
+        self.stderr_patcher = patch("sys.stderr", io.StringIO())
+        self.mock_stderr = self.stderr_patcher.start()
+
         self.cfg = config.load()
         self.conn = db.connect(self.cfg.db_path)
 
     def tearDown(self):
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
+            h.close()
+        pipeline._logging_configured = False
+        self.stderr_patcher.stop()
+
         config.CONFIG_DIR = self.orig_config_dir
         self.conn.close()
         # Clean up any leftover locks
@@ -266,10 +275,10 @@ class TestCLI(unittest.TestCase):
         self.assertTrue(pipeline.acquire_lock(lock_path))
 
         try:
-            for cmd in ["plan", "retry", "skip", "backfill"]:
+            for cmd_args in [["plan", "123"], ["retry", "123"], ["skip", "123"], ["backfill", "123"], ["auth"], ["set-upload", "123", "0", "yt_1"]]:
                 stderr = io.StringIO()
                 with patch("sys.stderr", stderr):
-                    ret = cli.main([cmd, "123"])
+                    ret = cli.main(cmd_args)
                 self.assertEqual(ret, 1)
                 self.assertIn("a run is in progress, try again later", stderr.getvalue())
         finally:
@@ -382,7 +391,9 @@ class TestCLI(unittest.TestCase):
         fake_pythonw = r"C:\Program Files\Python 3.12\pythonw.exe"
         fake_repo = Path(r"C:\Users\User Name\Projects\kick-to-youtube-lives")
 
+        import pathlib
         with patch("k2y.cli._is_windows", return_value=True), \
+             patch("k2y.cli.Path", pathlib.PureWindowsPath), \
              patch("sys.executable", fake_python), \
              patch("os.path.exists", return_value=True), \
              patch("k2y.cli.REPO_DIR", fake_repo), \
@@ -451,6 +462,96 @@ class TestCLI(unittest.TestCase):
         with patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
             self.assertEqual(cli.main([]), 2)
             self.assertEqual(cli.main(["retry", "9999"]), 1)
+
+    def test_retry_restart_upload_clears_sessions(self):
+        vod = {
+            "id": 750,
+            "title": "VOD 750",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/750",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.upsert_upload(self.conn, 750, 0, "Full VOD", 0, 3600)
+        db.update_upload(self.conn, 750, 0, upload_session="http://session/0")
+        db.upsert_upload(self.conn, 750, 1, "Part 1", 0, 1800)
+        db.update_upload(self.conn, 750, 1, youtube_id="yt_1", upload_session="http://session/1")
+
+        # Plain retry does NOT clear upload sessions
+        with patch("sys.stdout", io.StringIO()):
+            ret = cli.main(["retry", "750"])
+        self.assertEqual(ret, 0)
+        ups = db.uploads(self.conn, 750)
+        self.assertEqual(ups[0]["upload_session"], "http://session/0")
+
+        # Retry with --restart-upload clears sessions on rows without youtube_id
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout):
+            ret = cli.main(["retry", "750", "--restart-upload"])
+        self.assertEqual(ret, 0)
+        self.assertIn("Cleared 1 upload session(s) for VOD 750", stdout.getvalue())
+
+        ups = db.uploads(self.conn, 750)
+        self.assertIsNone(ups[0]["upload_session"])
+        self.assertEqual(ups[1]["upload_session"], "http://session/1")
+
+    def test_set_upload_command(self):
+        vod = {
+            "id": 760,
+            "title": "VOD 760",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/760",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.upsert_upload(self.conn, 760, 0, "Full VOD", 0, 3600)
+        db.update_upload(self.conn, 760, 0, upload_session="http://session/0", thumb_done=1)
+
+        # Successful set-upload
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout):
+            ret = cli.main(["set-upload", "760", "0", "yt_already_there"])
+        self.assertEqual(ret, 0)
+        self.assertIn("Recorded VOD 760 part 0 as yt_already_there", stdout.getvalue())
+
+        row = db.get_upload(self.conn, 760, 0)
+        self.assertEqual(row["youtube_id"], "yt_already_there")
+        self.assertIsNone(row["upload_session"])
+        self.assertEqual(row["thumb_done"], 1)
+
+        # Refuses non-existent row
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["set-upload", "760", "99", "yt_fake"])
+        self.assertEqual(ret, 1)
+        self.assertIn("Upload row 99 for VOD 760 does not exist", stderr.getvalue())
+
+    def test_cli_main_tolerates_none_stderr(self):
+        with patch("sys.stderr", None), patch("sys.stdout", io.StringIO()):
+            # Help when no command
+            self.assertEqual(cli.main([]), 2)
+            # Failure on unknown VOD
+            self.assertEqual(cli.main(["retry", "99999"]), 1)
+
+    def test_cli_main_logs_to_k2y_log_on_config_failure(self):
+        # Write broken config.json
+        (self.config_dir / "config.json").write_text(
+            '{\n  "work_dir": "' + str(self.work_dir) + '",\n  "broken": \n}',
+            encoding="utf-8",
+        )
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            ret = cli.main(["run"])
+        self.assertEqual(ret, 1)
+
+        log_file = self.work_dir / "k2y.log"
+        self.assertTrue(log_file.exists())
+        log_content = log_file.read_text(encoding="utf-8")
+        self.assertIn("JSONDecodeError", log_content)
 
 
 if __name__ == "__main__":
