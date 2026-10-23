@@ -10,6 +10,7 @@ import textwrap
 from .kick import FFMPEG, probe_duration
 
 FONT_CANDIDATES = [
+    Path("C:/Windows/Fonts/impact.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
     Path("C:/Windows/Fonts/arialbd.ttf"),
     Path("C:/Windows/Fonts/arial.ttf"),
@@ -21,8 +22,6 @@ def _escape_font_path(p: Path) -> str:
     """Convert path to forward slashes, escaping colons and single quotes for ffmpeg filter syntax."""
     s = str(p).replace("\\", "/")
     return s.replace(":", r"\:").replace("'", r"\'")
-
-
 
 
 def _find_font() -> Path | None:
@@ -106,8 +105,85 @@ def wrap_title(title: str) -> str:
     return f"{first_line}\n{second_line}"
 
 
-def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
-    """Grab frame at at_s, scale/pad to 1280x720, overlay title with drawtext, output JPEG < 2MB."""
+def sanitize_hook(text: str | None, fallback_title: str = "") -> str:
+    """Sanitise hook text: strip, upper-case, remove <> and newlines, cut at 22 chars on word boundary.
+
+    Fallback (empty text or None): first 3 words of fallback_title, upper-cased.
+    """
+    cleaned = (text or "").strip()
+    cleaned = cleaned.replace("<", "").replace(">", "")
+    cleaned = re.sub(r"[\r\n]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if not cleaned:
+        fb = (fallback_title or "").strip()
+        fb = fb.replace("<", "").replace(">", "")
+        fb = re.sub(r"[\r\n]+", " ", fb).strip()
+        words = fb.split()[:3]
+        cleaned = " ".join(words)
+
+    cleaned = cleaned.upper()
+    if len(cleaned) > 22:
+        cut_text = cleaned[:22]
+        if cleaned[22] == " ":
+            cleaned = cut_text
+        elif " " in cut_text:
+            cleaned = cut_text.rsplit(" ", 1)[0]
+        else:
+            cleaned = cut_text
+    return cleaned.strip()
+
+
+def hook_lines(text: str) -> tuple[str, str]:
+    """Split hook into at most two lines: line 1 = first word (or first two if short), line 2 = rest."""
+    words = text.split()
+    if not words:
+        return ("", "")
+    if len(words) == 1:
+        return (words[0], "")
+    if len(words) == 2:
+        return (words[0], words[1])
+    if len(words[0]) <= 3 or (len(words[0]) + len(words[1]) <= 7):
+        return (f"{words[0]} {words[1]}", " ".join(words[2:]))
+    return (words[0], " ".join(words[1:]))
+
+
+def _estimate_text_width(text: str, fontsize: int, is_condensed: bool = False) -> float:
+    if not text:
+        return 0.0
+    factor = 0.55 if is_condensed else 0.80
+    w = 0.0
+    for c in text:
+        if c in "MW":
+            w += 1.15 * fontsize * (factor / 0.80)
+        elif c in "I 1!':.,":
+            w += 0.40 * fontsize * (factor / 0.80)
+        elif c in "JLFT":
+            w += 0.70 * fontsize * (factor / 0.80)
+        else:
+            w += factor * fontsize
+    return w + 20.0  # black border 10 on each side
+
+
+def _fit_fontsize(text: str, max_fontsize: int, max_w: int, font_file: Path | None) -> int:
+    if not text:
+        return max_fontsize
+    is_condensed = font_file is not None and "impact" in font_file.name.lower()
+    est = _estimate_text_width(text, max_fontsize, is_condensed=is_condensed)
+    if est <= max_w:
+        return max_fontsize
+    fitted = int(max_fontsize * (max_w / est))
+    return max(20, min(max_fontsize, fitted))
+
+
+def thumbnail(
+    src: Path,
+    at_s: int,
+    hook: str,
+    dest: Path,
+    face: Path | None = None,
+) -> Path:
+    """Generate 1280x720 thumbnail with background, reaction face, and hook text under 2MB."""
     src = Path(src).resolve()
     dest = Path(dest).resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -116,32 +192,78 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
     max_at = max(0, int(dur - 1))
     clamped_at_s = max(0, min(int(at_s), max_at))
 
-    wrapped = wrap_title(title)
+    sanitized = sanitize_hook(hook)
+    line1, line2 = hook_lines(sanitized)
 
-    # Sanitize dest stem to ASCII [A-Za-z0-9_-] for safe relative text file name
     safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", dest.stem) or "thumb"
-    tf_name = f"{safe_stem}.txt"
-    tf_path = dest.parent / tf_name
-    tf_path.write_text(wrapped, encoding="utf-8")
+    tf1_name = f"{safe_stem}_1.txt"
+    tf2_name = f"{safe_stem}_2.txt"
+    tf1_path = dest.parent / tf1_name
+    tf2_path = dest.parent / tf2_name
+
+    tf1_path.write_text(line1, encoding="utf-8")
+    tf2_path.write_text(line2, encoding="utf-8")
+
+    face_path = Path(face).resolve() if face and Path(face).exists() else None
 
     try:
         font_file = _find_font()
-        font_arg = f"fontfile='{_escape_font_path(font_file)}':" if font_file else ""
-        vf = (
-            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext={font_arg}textfile={tf_name}:"
-            "fontcolor=white:borderw=6:bordercolor=black:fontsize=72:text_align=center:"
-            "x=(w-text_w)/2:y=h*2/3+(h/3-text_h)/2:expansion=none"
+        if font_file:
+            font_esc = (
+                _escape_font_path(font_file)
+                .replace(",", r"\,")
+                .replace("[", r"\[")
+                .replace("]", r"\]")
+                .replace(" ", r"\ ")
+            )
+            font_arg = f"fontfile={font_esc}:"
+        else:
+            font_arg = ""
+
+        # Layout rules: text fits in left 60% starting at x=50
+        max_w = (1280 - 100) if face_path is None else (int(1280 * 0.60) - 50)
+        fs1 = _fit_fontsize(line1, 160, max_w, font_file)
+        fs2 = _fit_fontsize(line2, 110, max_w, font_file)
+
+        dt1 = (
+            f"drawtext={font_arg}textfile={tf1_name}:"
+            f"fontsize={fs1}:fontcolor=#FFD400:borderw=10:bordercolor=black:x=50:y=210"
         )
-        cmd = [
-            *FFMPEG,
-            "-ss", str(clamped_at_s),
-            "-i", str(src),
-            "-vf", vf,
-            "-frames:v", "1",
-            "-q:v", "3",
-            str(dest),
-        ]
+        dt2 = (
+            f"drawtext={font_arg}textfile={tf2_name}:"
+            f"fontsize={fs2}:fontcolor=white:borderw=10:bordercolor=black:x=50:y=400"
+        )
+
+        if face_path is not None:
+            filter_complex = (
+                "[0]scale=1280:720,boxblur=6,eq=brightness=-0.25[bg];"
+                "[1]scale=-1:760,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='min(255, 255*X/(W*0.35))'[face];"
+                f"[bg][face]overlay=x=W-w+40:y=-20,{dt1},{dt2}"
+            )
+            cmd = [
+                *FFMPEG,
+                "-ss", str(clamped_at_s),
+                "-i", str(src),
+                "-i", str(face_path),
+                "-filter_complex", filter_complex,
+                "-frames:v", "1",
+                "-q:v", "3",
+                str(dest),
+            ]
+        else:
+            vf = (
+                f"scale=1280:720,boxblur=6,eq=brightness=-0.25,{dt1},{dt2}"
+            )
+            cmd = [
+                *FFMPEG,
+                "-ss", str(clamped_at_s),
+                "-i", str(src),
+                "-vf", vf,
+                "-frames:v", "1",
+                "-q:v", "3",
+                str(dest),
+            ]
+
         try:
             res = subprocess.run(cmd, cwd=dest.parent, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
@@ -157,7 +279,7 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
             dest.unlink(missing_ok=True)
             raise RuntimeError(f"Thumbnail generation failed: destination file {dest} is missing or empty")
 
-        # If file is over 2MB, re-encode with higher q until under 2MB
+        # Re-encode loop under 2MB
         q = 3
         while dest.stat().st_size > MAX_IMAGE_BYTES and q < 31:
             q += 2
@@ -187,7 +309,8 @@ def thumbnail(src: Path, at_s: int, title: str, dest: Path) -> Path:
 
         return dest
     finally:
-        tf_path.unlink(missing_ok=True)
+        tf1_path.unlink(missing_ok=True)
+        tf2_path.unlink(missing_ok=True)
 
 
 def _fit(text: str, suffix: str) -> str:
