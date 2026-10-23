@@ -752,5 +752,98 @@ class TestPlan(unittest.TestCase):
             self.assertFalse(chunk_2_ran)
 
 
+class TestDescriptionsV2InSegment(unittest.TestCase):
+    def test_merge_schema_includes_descriptions_v2_fields(self):
+        props = segment.MERGE_SCHEMA["properties"]
+        self.assertIn("vod_hook", props)
+        self.assertIn("vod_tags", props)
+        self.assertIn("vod_hashtags", props)
+        self.assertIn("vod_thumb_text", props)
+        part_props = props["parts"]["items"]["properties"]
+        self.assertIn("hook", part_props)
+        self.assertIn("tags", part_props)
+        self.assertIn("hashtags", part_props)
+        self.assertIn("thumb_text", part_props)
+
+    def test_repair_preserves_hook_tags_hashtags(self):
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Intro",
+                "description": "Desc 1",
+                "thumb_text": "THUMB ONE",
+                "hook": "Hook 1",
+                "tags": ["tag1", "tag2"],
+                "hashtags": ["#hash1"],
+                "key_moments": [{"at_s": 100, "what": "Moment 1"}],
+            },
+            {
+                "start_s": 2000,
+                "title": "Middle",
+                "description": "Desc 2",
+                "thumb_text": "THUMB TWO",
+                "hook": "Hook 2",
+                "tags": ["tag3"],
+                "hashtags": ["#hash2"],
+                "key_moments": [{"at_s": 2100, "what": "Moment 2"}],
+            },
+        ]
+        repaired = segment.repair(parts, duration_s=4000, allowed_s=[0, 2000], min_part_s=900)
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(repaired[0]["hook"], "Hook 1")
+        self.assertEqual(repaired[0]["tags"], ["tag1", "tag2"])
+        self.assertEqual(repaired[0]["hashtags"], ["#hash1"])
+        self.assertEqual(repaired[1]["hook"], "Hook 2")
+        self.assertEqual(repaired[1]["tags"], ["tag3"])
+        self.assertEqual(repaired[1]["hashtags"], ["#hash2"])
+
+    def test_repair_short_part_merge_preserves_dominant_metadata(self):
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Long part",
+                "description": "Desc long",
+                "thumb_text": "THUMB LONG",
+                "hook": "Hook long",
+                "tags": ["dominant"],
+                "hashtags": ["#dominant"],
+                "key_moments": [{"at_s": 100, "what": "M1"}],
+            },
+            {
+                "start_s": 3000,
+                "title": "Short part",
+                "description": "Desc short",
+                "thumb_text": "THUMB SHORT",
+                "hook": "Hook short",
+                "tags": ["minor"],
+                "hashtags": ["#minor"],
+                "key_moments": [{"at_s": 3100, "what": "M2"}],
+            },
+        ]
+        repaired = segment.repair(parts, duration_s=3600, allowed_s=[0, 3000], min_part_s=1200)
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["title"], "Long part")
+        self.assertEqual(repaired[0]["hook"], "Hook long")
+        self.assertEqual(repaired[0]["tags"], ["dominant"])
+        self.assertEqual(repaired[0]["hashtags"], ["#dominant"])
+
+    @patch("k2y.segment.generate")
+    def test_fill_metadata_calls_generate(self, mock_generate):
+        mock_generate.return_value = {
+            "vod_hook": "Full hook",
+            "vod_tags": ["tag1"],
+            "vod_hashtags": ["#vod"],
+            "parts": [
+                {"idx": 1, "hook": "Part 1 hook", "tags": ["p1"], "hashtags": ["#p1"]},
+            ],
+        }
+        parts = [{"title": "Part 1", "description": "Desc", "key_moments": []}]
+        res = segment.fill_metadata("Live Test", 3600, parts, ["m1"])
+        self.assertEqual(res["vod_hook"], "Full hook")
+        self.assertEqual(mock_generate.call_count, 1)
+        call_schema = mock_generate.call_args[0][1]
+        self.assertEqual(call_schema, segment.REFRESH_SCHEMA)
+
+
 if __name__ == "__main__":
     unittest.main()
