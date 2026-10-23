@@ -18,6 +18,8 @@ from k2y.media import (
     part_description,
     part_title,
     probe_duration,
+    hook_lines,
+    sanitize_hook,
     thumbnail,
     wrap_title,
 )
@@ -228,6 +230,52 @@ class TestWrapTitle(unittest.TestCase):
             self.assertLessEqual(len(line), 24)
 
 
+
+class TestHookSanitizing(unittest.TestCase):
+    def test_sanitize_hook_normal(self):
+        self.assertEqual(sanitize_hook("top 1 solo carry"), "TOP 1 SOLO CARRY")
+
+    def test_sanitize_hook_strips_and_removes_brackets_and_newlines(self):
+        self.assertEqual(sanitize_hook("  <tag> \n hello \r\n world > "), "TAG HELLO WORLD")
+
+    def test_sanitize_hook_fallback_when_empty_or_none(self):
+        self.assertEqual(sanitize_hook("", "Chill gaming session | Stream du 22/10/2026"), "CHILL GAMING SESSION")
+        self.assertEqual(sanitize_hook(None, "My Great Stream"), "MY GREAT STREAM")
+        self.assertEqual(sanitize_hook("   <> \n ", "Short title"), "SHORT TITLE")
+
+    def test_sanitize_hook_cuts_at_22_chars_on_word_boundary(self):
+        # 21 chars fits exactly
+        self.assertEqual(sanitize_hook("un tournoi incroyable", ""), "UN TOURNOI INCROYABLE")
+        # 34 chars cut at 22 word boundary -> "UN TOURNOI INCROYABLE"
+        self.assertEqual(sanitize_hook("un tournoi incroyable avec les amis", ""), "UN TOURNOI INCROYABLE")
+        self.assertLessEqual(len(sanitize_hook("un tournoi incroyable avec les amis", "")), 22)
+
+    def test_sanitize_hook_cuts_single_long_word(self):
+        self.assertEqual(sanitize_hook("supercalifragilisticexpialidocious", ""), "SUPERCALIFRAGILISTICEX")
+
+
+class TestHookLines(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(hook_lines(""), ("", ""))
+
+    def test_single_word(self):
+        self.assertEqual(hook_lines("MOMENT"), ("MOMENT", ""))
+
+    def test_two_words(self):
+        self.assertEqual(hook_lines("TOP 1"), ("TOP", "1"))
+        self.assertEqual(hook_lines("BIG WIN"), ("BIG", "WIN"))
+
+    def test_three_words_short_first_word(self):
+        self.assertEqual(hook_lines("LE BOSS ARRIVE"), ("LE BOSS", "ARRIVE"))
+        self.assertEqual(hook_lines("UN GRAND LIVE"), ("UN GRAND", "LIVE"))
+
+    def test_three_words_long_first_word(self):
+        self.assertEqual(hook_lines("INCROYABLE FIN STREAM"), ("INCROYABLE", "FIN STREAM"))
+
+    def test_four_words(self):
+        self.assertEqual(hook_lines("UN TRES BEAU LIVE"), ("UN TRES", "BEAU LIVE"))
+        self.assertEqual(hook_lines("MOMENT UNIQUE DU JOUR"), ("MOMENT", "UNIQUE DU JOUR"))
+
 class TestFilterPath(unittest.TestCase):
     def test_windows_path_conversion_and_escaping(self):
         p = Path(r"C:\Windows\Fonts\arialbd.ttf")
@@ -240,12 +288,9 @@ class TestFilterPath(unittest.TestCase):
         self.assertEqual(filtered, r"C\:/Users/Melek\'s Files/font.ttf")
 
     def test_font_fallback_omits_fontfile(self):
-        with patch("k2y.media._find_font", return_value=None), \
-             patch("k2y.media.probe_duration", return_value=20.0), \
-             patch("subprocess.run") as mock_run:
+        with patch("k2y.media._find_font", return_value=None),              patch("k2y.media.probe_duration", return_value=20.0),              patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            with tempfile.NamedTemporaryFile(suffix=".mp4") as src, \
-                 tempfile.NamedTemporaryFile(suffix=".jpg") as dst:
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as src,                  tempfile.NamedTemporaryFile(suffix=".jpg") as dst:
                 dst.write(b"fake jpeg content")
                 dst.flush()
                 thumbnail(Path(src.name), 10, "Title", Path(dst.name))
@@ -254,10 +299,10 @@ class TestFilterPath(unittest.TestCase):
                 vf_str = args[vf_idx + 1]
                 self.assertNotIn("fontfile=", vf_str)
                 self.assertIn("textfile=", vf_str)
-                # Verify textfile is a relative name, not a full path
-                self.assertIn("textfile=" + Path(dst.name).stem + ".txt:", vf_str)
+                safe_stem = Path(dst.name).stem
+                self.assertIn(f"textfile={safe_stem}_1.txt", vf_str)
+                self.assertIn(f"textfile={safe_stem}_2.txt", vf_str)
                 self.assertEqual(mock_run.call_args.kwargs.get("cwd"), Path(dst.name).resolve().parent)
-
 
 class TestMediaTimeouts(unittest.TestCase):
     @patch("subprocess.run")
@@ -372,7 +417,7 @@ class TestMediaFFmpeg(unittest.TestCase):
     def test_thumbnail_clamps_at_s_and_verifies_non_empty(self):
         # probed_duration is ~20s, max allowed at_s is 19
         dest = self.temp_dir / "thumb_clamped.jpg"
-        out_path = thumbnail(self.synthetic_video, at_s=500, title="Far out", dest=dest)
+        out_path = thumbnail(self.synthetic_video, at_s=500, hook="Far out", dest=dest)
         self.assertEqual(out_path, dest)
         self.assertTrue(dest.exists())
         self.assertGreater(dest.stat().st_size, 0)
@@ -398,13 +443,15 @@ class TestMediaFFmpeg(unittest.TestCase):
         shutil.copy(dejavu, font_copy)
 
         dest1 = self.temp_dir / "thumb_font_test.jpg"
-        txt1 = dest1.parent / f"{dest1.stem}.txt"
+        txt1_1 = dest1.parent / f"{dest1.stem}_1.txt"
+        txt1_2 = dest1.parent / f"{dest1.stem}_2.txt"
 
         with patch("k2y.media._find_font", return_value=font_copy):
-            out1 = thumbnail(self.synthetic_video, at_s=2, title="Font Path Test", dest=dest1)
+            out1 = thumbnail(self.synthetic_video, at_s=2, hook="Font Path Test", dest=dest1)
         self.assertEqual(out1, dest1)
         self.assertTrue(dest1.exists())
-        self.assertFalse(txt1.exists())
+        self.assertFalse(txt1_1.exists())
+        self.assertFalse(txt1_2.exists())
 
         probe_cmd = [
             "ffprobe", "-v", "error",
@@ -422,12 +469,14 @@ class TestMediaFFmpeg(unittest.TestCase):
         out_dir = self.temp_dir / "out, [y] l'a"
         out_dir.mkdir(parents=True, exist_ok=True)
         dest2 = out_dir / "thumb_dest_test.jpg"
-        txt2 = dest2.parent / f"{dest2.stem}.txt"
+        txt2_1 = dest2.parent / f"{dest2.stem}_1.txt"
+        txt2_2 = dest2.parent / f"{dest2.stem}_2.txt"
 
-        out2 = thumbnail(self.synthetic_video, at_s=2, title="Dest Path Test", dest=dest2)
+        out2 = thumbnail(self.synthetic_video, at_s=2, hook="Dest Path Test", dest=dest2)
         self.assertEqual(out2, dest2)
         self.assertTrue(dest2.exists())
-        self.assertFalse(txt2.exists())
+        self.assertFalse(txt2_1.exists())
+        self.assertFalse(txt2_2.exists())
 
         info2 = json.loads(subprocess.run([
             "ffprobe", "-v", "error",
@@ -439,6 +488,55 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertEqual(info2["streams"][0]["codec_name"], "mjpeg")
         self.assertEqual(info2["streams"][0]["width"], 1280)
         self.assertEqual(info2["streams"][0]["height"], 720)
+
+
+
+    def test_thumbnail_real_ffmpeg_with_and_without_face_in_hostile_dir(self):
+        hostile_dir = self.temp_dir / "out, [y] l'a"
+        hostile_dir.mkdir(parents=True, exist_ok=True)
+
+        face_path = hostile_dir / "face.png"
+        cmd_face = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=blue:s=500x600",
+            "-frames:v", "1",
+            str(face_path),
+        ]
+        subprocess.run(cmd_face, check=True)
+
+        # 1. With face
+        dest_face = hostile_dir / "thumb_with_face.jpg"
+        out1 = thumbnail(self.synthetic_video, at_s=2, hook="LE BOSS ARRIVE", dest=dest_face, face=face_path)
+        self.assertEqual(out1, dest_face)
+        self.assertTrue(dest_face.exists())
+        self.assertLess(dest_face.stat().st_size, 2 * 1024 * 1024)
+        info1 = json.loads(subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name", "-of", "json",
+            str(dest_face),
+        ], check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(info1["streams"][0]["width"], 1280)
+        self.assertEqual(info1["streams"][0]["height"], 720)
+        self.assertEqual(info1["streams"][0]["codec_name"], "mjpeg")
+        self.assertFalse((hostile_dir / f"{dest_face.stem}_1.txt").exists())
+        self.assertFalse((hostile_dir / f"{dest_face.stem}_2.txt").exists())
+
+        # 2. Without face
+        dest_noface = hostile_dir / "thumb_no_face.jpg"
+        out2 = thumbnail(self.synthetic_video, at_s=2, hook="LE BOSS ARRIVE", dest=dest_noface, face=None)
+        self.assertEqual(out2, dest_noface)
+        self.assertTrue(dest_noface.exists())
+        self.assertLess(dest_noface.stat().st_size, 2 * 1024 * 1024)
+        info2 = json.loads(subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name", "-of", "json",
+            str(dest_noface),
+        ], check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(info2["streams"][0]["width"], 1280)
+        self.assertEqual(info2["streams"][0]["height"], 720)
+        self.assertEqual(info2["streams"][0]["codec_name"], "mjpeg")
+        self.assertFalse((hostile_dir / f"{dest_noface.stem}_1.txt").exists())
+        self.assertFalse((hostile_dir / f"{dest_noface.stem}_2.txt").exists())
 
 
 if __name__ == "__main__":

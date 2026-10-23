@@ -25,6 +25,27 @@ class TestDocstring(unittest.TestCase):
 
 
 class TestRepair(unittest.TestCase):
+    def test_repair_preserves_thumb_text(self):
+        duration_s = 3600
+        parts = [
+            {"start_s": 0, "title": "P1", "thumb_text": "HOOK ONE", "description": "", "key_moments": []},
+            {"start_s": 1800, "title": "P2", "thumb_text": "HOOK TWO", "description": "", "key_moments": []},
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 1800], min_part_s=600)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["thumb_text"], "HOOK ONE")
+        self.assertEqual(res[1]["thumb_text"], "HOOK TWO")
+
+    def test_repair_preserves_thumb_text_when_merging_short_parts(self):
+        duration_s = 4000
+        parts = [
+            {"start_s": 0, "title": "Part 1", "thumb_text": "HOOK 1", "description": "D1", "key_moments": []},
+            {"start_s": 2000, "title": "Short Part", "thumb_text": "SHORT HOOK", "description": "DS", "key_moments": []},
+            {"start_s": 2200, "title": "Part 3", "thumb_text": "HOOK 3", "description": "D3", "key_moments": []},
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 2000, 2200], min_part_s=900)
+        self.assertEqual(len(res), 2)
+        self.assertTrue(any(p["thumb_text"] in ("HOOK 1", "SHORT HOOK", "HOOK 3") for p in res))
     def test_repair_short_vod_returns_one_part(self):
         duration_s = 18 * 60  # 18 minutes < 20 minutes
         parts = [
@@ -578,8 +599,13 @@ class TestMerge(unittest.TestCase):
             }
         ]
         res = segment.merge(chunks, duration_s=3600, models=["m1"])
-        self.assertEqual(len(res), 1)
-        self.assertEqual(res[0]["title"], "Stream khedma fel gueyla")
+        self.assertIn("parts", res)
+        self.assertEqual(len(res["parts"]), 1)
+        self.assertEqual(res["parts"][0]["title"], "Stream khedma fel gueyla")
+        # Check that MERGE_PROMPT contains the new rules
+        self.assertIn("Melek", segment.MERGE_PROMPT)
+        self.assertIn("thumb_text", segment.MERGE_PROMPT)
+        self.assertIn("vod_thumb_text", segment.MERGE_PROMPT)
 
 
 class TestPlan(unittest.TestCase):
@@ -621,11 +647,13 @@ class TestPlan(unittest.TestCase):
 
             self.assertTrue(any("Merge failed twice" in m and "Merge 2 failed" in m for m in cm.output))
             self.assertEqual(mock_merge.call_count, 2)
-            self.assertEqual(len(res), 1)
-            self.assertEqual(res[0]["start_s"], 0)
-            self.assertEqual(res[0]["end_s"], duration_s)
-            self.assertEqual(res[0]["title"], "Stream complet")
-            self.assertEqual(res[0]["description"], "")
+            self.assertIn("parts", res)
+            self.assertEqual(len(res["parts"]), 1)
+            self.assertEqual(res["parts"][0]["start_s"], 0)
+            self.assertEqual(res["parts"][0]["end_s"], duration_s)
+            self.assertEqual(res["parts"][0]["title"], "Stream complet")
+            self.assertEqual(res["parts"][0]["description"], "")
+            self.assertEqual(res.get("vod_thumb_text"), "")
             self.assertFalse(chunk_file.exists())
 
     @patch("k2y.segment.chunk_audio")

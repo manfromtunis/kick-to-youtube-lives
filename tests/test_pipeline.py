@@ -1017,5 +1017,132 @@ class TestPipeline(unittest.TestCase):
         self.assertIsNone(row["error"])
 
 
+
+    def test_pick_face_deterministic_and_different_per_idx(self):
+        faces_dir = self.config_dir / "faces"
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        (faces_dir / "b.png").write_bytes(b"b")
+        (faces_dir / "a.jpg").write_bytes(b"a")
+        (faces_dir / "d.webp").write_bytes(b"d")
+        (faces_dir / "c.jpeg").write_bytes(b"c")
+        (faces_dir / "ignore.txt").write_bytes(b"ignore")
+
+        # sorted files: a.jpg, b.png, c.jpeg, d.webp (length 4)
+        vod_id = 12
+        # (12 * 31 + 0) % 4 = 372 % 4 = 0 -> a.jpg
+        face0 = pipeline.pick_face(vod_id, 0, faces_dir=faces_dir)
+        self.assertEqual(face0.name, "a.jpg")
+
+        # (12 * 31 + 1) % 4 = 373 % 4 = 1 -> b.png
+        face1 = pipeline.pick_face(vod_id, 1, faces_dir=faces_dir)
+        self.assertEqual(face1.name, "b.png")
+        self.assertNotEqual(face0, face1)
+
+        # Deterministic: repeated call returns identical path
+        self.assertEqual(pipeline.pick_face(vod_id, 0, faces_dir=faces_dir), face0)
+
+    def test_pick_face_empty_or_missing_warns_once(self):
+        pipeline.reset_faces_warned()
+        missing_dir = self.config_dir / "non_existent_faces"
+
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            res1 = pipeline.pick_face(1, 0, faces_dir=missing_dir)
+            res2 = pipeline.pick_face(1, 1, faces_dir=missing_dir)
+
+        self.assertIsNone(res1)
+        self.assertIsNone(res2)
+        # Warning logged only once
+        self.assertEqual(len([m for m in cm.output if "Faces directory" in m]), 1)
+
+        # Reset and test empty dir
+        pipeline.reset_faces_warned()
+        empty_dir = self.config_dir / "empty_faces"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+        with self.assertLogs("k2y", level="WARNING") as cm2:
+            res3 = pipeline.pick_face(2, 0, faces_dir=empty_dir)
+        self.assertIsNone(res3)
+        self.assertEqual(len([m for m in cm2.output if "Faces directory" in m]), 1)
+
+    def test_load_plan_legacy_list_and_v2_dict(self):
+        self.assertEqual(pipeline.load_plan(None), ([], ""))
+        self.assertEqual(pipeline.load_plan(""), ([], ""))
+        self.assertEqual(pipeline.load_plan("not-json"), ([], ""))
+
+        # Legacy plan format (list)
+        legacy_json = json.dumps([{"start_s": 0, "end_s": 100, "title": "Part 1"}])
+        parts, vod_thumb = pipeline.load_plan(legacy_json)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["title"], "Part 1")
+        self.assertEqual(vod_thumb, "")
+
+        # v2 plan format (dict)
+        v2_json = json.dumps({
+            "parts": [{"start_s": 0, "end_s": 100, "title": "Part 1", "thumb_text": "HOOK P1"}],
+            "vod_thumb_text": "HOOK VOD"
+        })
+        parts_v2, vod_thumb_v2 = pipeline.load_plan(v2_json)
+        self.assertEqual(len(parts_v2), 1)
+        self.assertEqual(parts_v2[0]["thumb_text"], "HOOK P1")
+        self.assertEqual(vod_thumb_v2, "HOOK VOD")
+
+    def test_expected_upload_count_with_dict(self):
+        self.assertEqual(pipeline.expected_upload_count({"parts": []}), 1)
+        self.assertEqual(pipeline.expected_upload_count({"parts": [{"title": "P1"}]}), 1)
+        self.assertEqual(pipeline.expected_upload_count({"parts": [{"title": "P1"}, {"title": "P2"}]}), 3)
+
+    def test_step_cut_with_legacy_and_v2_plans(self):
+        faces_dir = self.config_dir / "faces"
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        (faces_dir / "face1.png").write_bytes(b"fake face")
+
+        # 1. Test with legacy plan
+        vod_id = 991
+        vod = {
+            "id": vod_id,
+            "title": "Stream Titre Important",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod991.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        legacy_plan = [
+            {"start_s": 0, "end_s": 1800, "title": "Partie Un Epique"},
+            {"start_s": 1800, "end_s": 3600, "title": "Partie Deux Finale"},
+        ]
+        db.save_plan(self.conn, vod_id, legacy_plan)
+
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "source.mp4").write_bytes(b"fake video")
+
+        row = db.get_vod(self.conn, vod_id)
+        thumb_calls = []
+
+        def fake_thumb(src, at_s, hook, dest, face=None):
+            thumb_calls.append((dest.name, hook, face.name if face else None))
+            dest.write_bytes(b"fake thumb")
+            return dest
+
+        with (
+            patch("k2y.media.cut", return_value=v_dir / "part_1.mp4"),
+            patch("k2y.media.thumbnail", side_effect=fake_thumb),
+        ):
+            res = pipeline.step_cut(self.conn, self.cfg, row)
+            self.assertEqual(res, "cut")
+
+        # Full VOD (thumb_0) hook falls back to stream title, parts fall back to part titles
+        self.assertEqual(len(thumb_calls), 3)
+        self.assertEqual(thumb_calls[0][0], "thumb_0.jpg")
+        self.assertEqual(thumb_calls[0][1], "STREAM TITRE IMPORTANT")
+        self.assertEqual(thumb_calls[0][2], "face1.png")
+
+        self.assertEqual(thumb_calls[1][0], "thumb_1.jpg")
+        self.assertEqual(thumb_calls[1][1], "PARTIE UN EPIQUE")
+
+        self.assertEqual(thumb_calls[2][0], "thumb_2.jpg")
+        self.assertEqual(thumb_calls[2][1], "PARTIE DEUX FINALE")
+
 if __name__ == "__main__":
     unittest.main()
