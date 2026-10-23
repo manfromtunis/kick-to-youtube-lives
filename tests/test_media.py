@@ -797,5 +797,15 @@ class TestMediaFFmpeg(unittest.TestCase):
         self.assertFalse((hostile_dir / f"{dest_noface.stem}_2.txt").exists())
 
 
+class TestHookCut(unittest.TestCase):
+    def test_long_hook_cut_on_word_boundary(self):
+        from k2y.media import _assemble_and_trim_description
+        hook = ("mot " * 80).strip()  # 319 chars
+        out = _assemble_and_trim_description(hook, "", "", [], "", "")
+        first = out.split("\n")[0]
+        self.assertTrue(first.endswith("mot…"), first[-10:])
+        self.assertLessEqual(len(first), 200)
+
+
 if __name__ == "__main__":
     unittest.main()

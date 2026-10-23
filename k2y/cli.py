@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     elif not vod["plan_json"]:
                         target = "downloaded"
                     else:
-                        plan = json.loads(vod["plan_json"])
+                        plan = pipeline.load_plan_data(vod["plan_json"])["parts"]
                         expected = pipeline.expected_upload_count(plan)
                         ups = db.uploads(conn, args.vod_id)
                         indices = {u["idx"] for u in ups}

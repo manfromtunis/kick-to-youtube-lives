@@ -1067,7 +1067,12 @@ class TestPipeline(unittest.TestCase):
     def test_load_plan_legacy_list_and_v2_dict(self):
         self.assertEqual(pipeline.load_plan(None), ([], ""))
         self.assertEqual(pipeline.load_plan(""), ([], ""))
-        self.assertEqual(pipeline.load_plan("not-json"), ([], ""))
+        # Corrupt JSON must raise: an empty plan would upload one wrong video.
+        with self.assertRaises(json.JSONDecodeError):
+            pipeline.load_plan("not-json")
+        # Keys stored as null are tolerated.
+        d = pipeline.load_plan_data('{"parts": [], "vod_tags": null, "vod_hook": null}')
+        self.assertEqual((d["vod_tags"], d["vod_hook"]), ([], ""))
 
         # Legacy plan format (list)
         legacy_json = json.dumps([{"start_s": 0, "end_s": 100, "title": "Part 1"}])
@@ -1379,6 +1384,17 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(sent, ["yt0", "yt1", "yt2"])  # resumed, no resend of yt0/yt1
         parts = json.loads(db.get_vod(self.conn, 995)["plan_json"])["parts"]
         self.assertEqual([p["hook"] for p in parts], ["hook A", "hook B"])
+
+
+    def test_single_part_vod_hook_falls_back_to_part_text(self):
+        vod = {"id": 1, "category": "Gaming", "duration_s": 1200}
+        row = {"idx": 0, "title": "T", "youtube_id": "y"}
+        plan = {"parts": [{"start_s": 0, "end_s": 1200, "title": "P", "description": "Je teste un truc."}]}
+        meta = pipeline._row_meta(self.cfg, vod, row, [row], plan)
+        self.assertTrue(meta["description"].startswith("Je teste un truc."))
+        plan["parts"][0]["hook"] = "Le hook."
+        meta = pipeline._row_meta(self.cfg, vod, row, [row], plan)
+        self.assertTrue(meta["description"].startswith("Le hook."))
 
 
 if __name__ == "__main__":

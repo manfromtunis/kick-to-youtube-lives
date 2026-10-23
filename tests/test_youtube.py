@@ -266,7 +266,7 @@ class TestYouTube(unittest.TestCase):
         init_payload = json.loads(init_req.data.decode("utf-8"))
         self.assertEqual(init_payload["status"]["privacyStatus"], "private")
         self.assertEqual(init_payload["status"]["selfDeclaredMadeForKids"], False)
-        self.assertEqual(init_payload["snippet"]["defaultLanguage"], "ar")
+        self.assertEqual(init_payload["snippet"]["defaultLanguage"], "fr")
         self.assertEqual(init_payload["snippet"]["defaultAudioLanguage"], "ar")
         self.assertEqual(init_payload["snippet"]["categoryId"], "20")
         self.assertEqual(init_payload["snippet"]["tags"], ["gaming", "kick"])
@@ -1022,7 +1022,7 @@ class TestUpdateSnippet(TestYouTube):
         self.assertEqual(snippet["title"], "Test Title")
         self.assertEqual(snippet["description"], "Test Desc")
         self.assertEqual(snippet["categoryId"], "20")
-        self.assertEqual(snippet["defaultLanguage"], "ar")
+        self.assertEqual(snippet["defaultLanguage"], "fr")
         self.assertEqual(snippet["defaultAudioLanguage"], "ar")
         self.assertEqual(snippet["tags"], ["gaming", "kick"])
 

@@ -43,8 +43,12 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     cur = conn.execute("PRAGMA table_info(uploads)")
     cols = {row["name"] for row in cur.fetchall()}
-    if "desc_done" not in cols:
-        conn.execute("ALTER TABLE uploads ADD COLUMN desc_done INTEGER NOT NULL DEFAULT 0")
+    if "desc_done" not in cols:  # in-place migration for databases made before descriptions v2
+        try:
+            conn.execute("ALTER TABLE uploads ADD COLUMN desc_done INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):  # another process migrated first
+                raise
     return conn
 
 

@@ -468,7 +468,7 @@ def _assemble_and_trim_description(
 ) -> str:
     hook = hook.replace("<", "").replace(">", "").strip()
     if len(hook) > 200:
-        hook = hook[:200].rstrip()
+        hook = hook[:199].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
 
     def _build(h: str, n_lines: list[str]) -> str:
         blocks = []

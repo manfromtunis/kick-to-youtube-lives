@@ -359,7 +359,7 @@ def build_snippet(meta: dict) -> dict[str, object]:
         "title": title,
         "description": description,
         "categoryId": str(meta.get("category_id", meta.get("categoryId", "22"))),
-        "defaultLanguage": "ar",
+        "defaultLanguage": "fr",  # titles and descriptions are French
         "defaultAudioLanguage": "ar",
     }
     if "tags" in meta and meta["tags"] is not None:

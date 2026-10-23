@@ -96,46 +96,29 @@ def pick_face(vod_id: int, idx: int, faces_dir: Path | None = None) -> Path | No
 
 
 def load_plan(plan_raw: str | None) -> tuple[list[dict], str]:
-    """Load plan JSON, supporting both v2 dict format and legacy list format."""
-    if not plan_raw:
-        return ([], "")
-    try:
-        data = json.loads(plan_raw)
-    except Exception:
-        return ([], "")
-    if isinstance(data, dict):
-        return (data.get("parts", []), str(data.get("vod_thumb_text", "")))
-    elif isinstance(data, list):
-        return (data, "")
-    return ([], "")
+    """(parts, vod_thumb_text) from plan JSON, v2 dict or legacy list."""
+    d = load_plan_data(plan_raw)
+    return d["parts"], d["vod_thumb_text"]
 
 
 def load_plan_data(plan_raw: str | None) -> dict:
-    """Load plan JSON returning dict with parts, vod_thumb_text, vod_hook, vod_tags, vod_hashtags."""
-    if not plan_raw:
-        return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
-    try:
-        data = json.loads(plan_raw)
-    except Exception:
-        return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
-    if isinstance(data, dict):
-        return {
-            "parts": data.get("parts", []),
-            "vod_thumb_text": str(data.get("vod_thumb_text", "")),
-            "vod_hook": str(data.get("vod_hook", "")),
-            "vod_tags": list(data.get("vod_tags", [])),
-            "vod_hashtags": list(data.get("vod_hashtags", [])),
-            "meta_filled": bool(data.get("meta_filled", False)),
-        }
-    elif isinstance(data, list):
-        return {
-            "parts": data,
-            "vod_thumb_text": "",
-            "vod_hook": "",
-            "vod_tags": [],
-            "vod_hashtags": [],
-        }
-    return {"parts": [], "vod_thumb_text": "", "vod_hook": "", "vod_tags": [], "vod_hashtags": []}
+    """Normalise plan JSON (v2 dict or legacy list) to one dict shape.
+
+    Corrupt JSON raises: an empty plan would upload a single, wrong video.
+    """
+    data = json.loads(plan_raw) if plan_raw else []
+    if isinstance(data, list):
+        data = {"parts": data}
+    if not isinstance(data, dict):
+        raise ValueError(f"plan_json must be a list or an object, got {type(data).__name__}")
+    return {
+        "parts": data.get("parts") or [],
+        "vod_thumb_text": str(data.get("vod_thumb_text") or ""),
+        "vod_hook": str(data.get("vod_hook") or ""),
+        "vod_tags": list(data.get("vod_tags") or []),
+        "vod_hashtags": list(data.get("vod_hashtags") or []),
+        "meta_filled": bool(data.get("meta_filled")),
+    }
 
 
 def expected_upload_count(plan: list | dict) -> int:
@@ -293,7 +276,9 @@ def _row_meta(cfg: config.Config, vod, row, ups: list, plan_data: dict) -> dict:
             plan,
             cfg.channel,
             links=cfg.links,
-            vod_hook=plan_data.get("vod_hook"),
+            # A single-part VOD only uploads idx 0: fall back to that part's text.
+            vod_hook=plan_data.get("vod_hook")
+            or (plan[0].get("hook") or plan[0].get("description") if plan else None),
             hashtags=plan_data.get("vod_hashtags"),
             part_videos=ups,
         )
