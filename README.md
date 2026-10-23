@@ -21,7 +21,22 @@ All commands (`py -m k2y ...`) must be run from the repository root folder (`kic
 3. Put credentials in `%USERPROFILE%\.config\k2y\` (see `docs/superpowers/specs/2026-10-22-vod-pipeline-design.md` section 5):
    - `gemini.key`: Gemini API key with billing enabled.
    - `client_secret.json`: Google OAuth Desktop client credentials.
-   - Optional `config.json`: `{"channel": "randomguy42", "work_dir": "~/.local/share/k2y", "model": "gemini-3.8-flash", "min_part_minutes": 15, "since": "YYYY-MM-DD"}`.
+   - Optional `config.json`:
+     ```json
+     {
+       "channel": "randomguy42",
+       "work_dir": "~/.local/share/k2y",
+       "model": "gemini-3.8-flash",
+       "min_part_minutes": 15,
+       "since": "YYYY-MM-DD",
+       "links": [
+         ["📸 Instagram", "https://instagram.com/ghmelek"],
+         ["⚡ AuraStack", "https://aurastack.ai"],
+         ["🎬 Clip2Earn", "https://clip2earn.ai"],
+         ["☕ Bakchich Instagram", "https://instagram.com/bakchich.app"]
+       ]
+     }
+     ```
 4. Authorize YouTube account:
    ```cmd
    py -m k2y auth
@@ -51,6 +66,7 @@ Run all commands from the `kick-to-youtube-lives` root directory:
 - `py -m k2y plan <vod_id>`: run download (if needed) and generate thematic segmentation parts preview without uploading.
 - `py -m k2y retry <vod_id> [--restart-upload]`: clear errors and reset failed or errored VODs to re-process. Passing `--restart-upload` also clears unfinished upload sessions on rows without a YouTube ID so they can start fresh.
 - `py -m k2y set-upload <vod_id> <idx> <youtube_id>`: record that an upload part (0 for full VOD, 1+ for thematic parts) is already on YouTube, clearing any upload session for that part. Refuses if the row does not exist.
+- `py -m k2y refresh-metadata <vod_id> | --all`: rebuild video descriptions, tags, and hashtags using the v2 layout and update snippets on YouTube for published VODs in `done` state. For older plans missing hooks/tags, calls Gemini once to backfill metadata into `plan_json`.
 - `py -m k2y skip <vod_id>`: mark a VOD as skipped to ignore it (cleans up any existing work directory for that VOD).
 - `py -m k2y backfill <vod_id>`: fetch and process an older Kick VOD from before the `since` cutoff.
 
