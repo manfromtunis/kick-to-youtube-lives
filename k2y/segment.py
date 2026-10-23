@@ -66,6 +66,7 @@ MERGE_SCHEMA = {
                     "title": {"type": "STRING"},
                     "description": {"type": "STRING"},
                     "summary_en": {"type": "STRING"},
+                    "thumb_text": {"type": "STRING"},
                     "key_moments": {
                         "type": "ARRAY",
                         "items": {
@@ -78,14 +79,15 @@ MERGE_SCHEMA = {
                         },
                     },
                 },
-                "required": ["start_s", "title", "description", "summary_en", "key_moments"],
+                "required": ["start_s", "title", "description", "summary_en", "key_moments", "thumb_text"],
             },
         },
+        "vod_thumb_text": {"type": "STRING"},
     },
-    "required": ["parts"],
+    "required": ["parts", "vod_thumb_text"],
 }
 
-MERGE_PROMPT = """You are a video editor assembling thematic YouTube videos from a Kick livestream.
+MERGE_PROMPT = """You are a video editor assembling thematic YouTube videos from a Kick livestream by streamer Melek.
 The stream was {dur} long. Here is the chronological timeline of what happened:
 {timeline}
 
@@ -95,9 +97,11 @@ Instructions:
 3. Do not cut exactly at chunk boundaries (00:00, 10:00, etc.) unless the topic really changes there.
 4. "start_s" for each part MUST be chosen from one of the "at_s" timestamps in the timeline. The first part MUST start at 0.
 5. "title": short, catchy title in French or Latin-script Tunisian darija (max 60 chars).
-6. "description": 1-2 paragraphs in French summarizing this part.
+6. "description": 1-2 paragraphs in French summarizing this part (the streamer's name is Melek).
 7. "summary_en": 1 sentence in English summarizing the part.
-8. "key_moments": 1 to 3 highlight moments in this part. Each "at_s" MUST be chosen from the timeline "at_s" timestamps that fall within this part. "what": short description in French."""
+8. "key_moments": 1 to 3 highlight moments in this part. Each "at_s" MUST be chosen from the timeline "at_s" timestamps that fall within this part. "what": short description in French.
+9. "thumb_text": thumbnail hook of 2 to 4 words, in the language of the stream title (French or Latin-script darija), punchy, no emoji, at most 22 characters.
+10. "vod_thumb_text": thumbnail hook for the full VOD (2 to 4 words, in the language of the stream title, punchy, no emoji, at most 22 characters)."""
 
 
 class SegmentError(Exception):
@@ -378,9 +382,15 @@ def merge(chunks: list[dict], duration_s: int, models: list[str]) -> list[dict]:
     prompt = MERGE_PROMPT.format(dur=_format_time(duration_s), timeline=timeline)
     result = generate([{"text": prompt}], MERGE_SCHEMA, models)
     if isinstance(result, dict) and "parts" in result:
-        return result["parts"]
+        return {
+            "parts": result["parts"],
+            "vod_thumb_text": str(result.get("vod_thumb_text", "")),
+        }
     elif isinstance(result, list):
-        return result
+        return {
+            "parts": result,
+            "vod_thumb_text": "",
+        }
     raise SegmentError(f"Unexpected merge response format: {type(result)}")
 
 
@@ -404,12 +414,15 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
     if duration_s < 20 * 60:
         first_title = ""
         first_desc = ""
+        first_thumb = ""
         all_km = []
         for p in parts:
             if not first_title and p.get("title", "").strip():
                 first_title = p.get("title", "").strip()
             if not first_desc and p.get("description", "").strip():
                 first_desc = p.get("description", "").strip()
+            if not first_thumb and p.get("thumb_text", "").strip():
+                first_thumb = p.get("thumb_text", "").strip()
             for km in p.get("key_moments", []):
                 at_s = _snap(km.get("at_s", 0), allowed_s)
                 if 0 <= at_s < duration_s:
@@ -419,6 +432,7 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "end_s": duration_s,
             "title": first_title if first_title else "Partie 1",
             "description": first_desc,
+            "thumb_text": first_thumb,
             "key_moments": _top_moments(all_km),
         }]
 
@@ -428,6 +442,7 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "end_s": duration_s,
             "title": "Partie 1",
             "description": "",
+            "thumb_text": "",
             "key_moments": [],
         }]
 
@@ -442,6 +457,7 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "start_s": start_s,
             "title": p.get("title", ""),
             "description": p.get("description", ""),
+            "thumb_text": p.get("thumb_text", ""),
             "key_moments": kms,
         })
 
@@ -491,9 +507,11 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
         if len_left >= len_right:
             title = p_left.get("title") or p_right.get("title") or ""
             desc = p_left.get("description") or p_right.get("description") or ""
+            thumb = p_left.get("thumb_text") or p_right.get("thumb_text") or ""
         else:
             title = p_right.get("title") or p_left.get("title") or ""
             desc = p_right.get("description") or p_left.get("description") or ""
+            thumb = p_right.get("thumb_text") or p_left.get("thumb_text") or ""
 
         combined_km = p_left.get("key_moments", []) + p_right.get("key_moments", [])
 
@@ -502,6 +520,7 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "end_s": p_right["end_s"],
             "title": title,
             "description": desc,
+            "thumb_text": thumb,
             "key_moments": combined_km,
         }
         cleaned[left_idx:right_idx + 1] = [merged_part]
@@ -523,6 +542,7 @@ def repair(parts: list[dict], duration_s: int, allowed_s: list[int], min_part_s:
             "end_s": p_end,
             "title": title,
             "description": desc,
+            "thumb_text": p.get("thumb_text", "").strip(),
             "key_moments": _top_moments(kms),
         })
     return result
@@ -544,9 +564,14 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
                 "end_s": duration_s,
                 "title": "Stream complet",
                 "description": "",
+                "thumb_text": "",
                 "key_moments": [],
             }]
-            return repair(parts, duration_s, [0], min_part_s=min_part_minutes * 60)
+            repaired = repair(parts, duration_s, [0], min_part_s=min_part_minutes * 60)
+            return {
+                "parts": repaired,
+                "vod_thumb_text": "",
+            }
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         failed_event = threading.Event()
@@ -586,28 +611,41 @@ def plan(src: Path, workdir: Path, duration_s: int, min_part_minutes: int, model
             allowed_s.append(0)
         allowed_s = sorted(set(allowed_s))
 
-        parts = None
+        merge_result = None
         last_merge_err = None
         for attempt in range(2):
             try:
-                parts = merge(chunks, duration_s, models)
+                merge_result = merge(chunks, duration_s, models)
                 break
             except (DailyQuota, config.MissingSecret):
                 raise
             except Exception as e:
                 last_merge_err = e
 
-        if parts is None:
+        if merge_result is None:
             logger.warning(f"Merge failed twice, falling back to single part: {last_merge_err}")
             parts = [{
                 "start_s": 0,
                 "end_s": duration_s,
                 "title": "Stream complet",
                 "description": "",
+                "thumb_text": "",
                 "key_moments": [],
             }]
+            vod_thumb_text = ""
+        else:
+            if isinstance(merge_result, dict):
+                parts = merge_result.get("parts", [])
+                vod_thumb_text = merge_result.get("vod_thumb_text", "")
+            else:
+                parts = merge_result
+                vod_thumb_text = ""
 
-        return repair(parts, duration_s, allowed_s, min_part_s=min_part_minutes * 60)
+        repaired = repair(parts, duration_s, allowed_s, min_part_s=min_part_minutes * 60)
+        return {
+            "parts": repaired,
+            "vod_thumb_text": vod_thumb_text,
+        }
     finally:
         for cp in chunk_paths:
             try:
