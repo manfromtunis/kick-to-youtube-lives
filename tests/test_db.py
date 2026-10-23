@@ -297,7 +297,7 @@ class TestDB(unittest.TestCase):
         self.assertEqual(row["desc_done"], 0)
 
         # Set desc_done to 1
-        db.set_upload_desc_done(migrated_conn, 1, 0, 1)
+        db.update_upload(migrated_conn, 1, 0, desc_done=1)
         row = db.get_upload(migrated_conn, 1, 0)
         self.assertEqual(row["desc_done"], 1)
 

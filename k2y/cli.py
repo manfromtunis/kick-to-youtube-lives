@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Install Task Scheduler task on Windows or print crontab line",
     )
 
-        # refresh-metadata
+    # refresh-metadata
     p_refresh = subparsers.add_parser(
         "refresh-metadata",
         help="Rebuild descriptions and update YouTube metadata for published VODs",
@@ -330,8 +330,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
             def do_refresh():
-                conn = db.connect(cfg.db_path)
                 if args.all:
+                    conn = db.connect(cfg.db_path)
                     vods = [v for v in db.all_vods(conn) if v["state"] == "done"]
                     if not vods:
                         print("No VODs in done state to refresh.")
@@ -353,12 +353,11 @@ def main(argv: list[str] | None = None) -> int:
                     except pipeline.StopRun as sr:
                         _print_err(f"Stopped: {sr}")
                         return 1
+                    except (youtube.QuotaExceeded, youtube.AuthRequired, segment.DailyQuota) as e:
+                        db.set_error(conn, v["id"], str(e))
+                        _print_err(f"Error on VOD {v['id']}: {e}")
+                        return 1
                     except Exception as e:
-                        if isinstance(e, (youtube.QuotaExceeded, youtube.AuthRequired, segment.DailyQuota)):
-                            msg = str(e)
-                            db.set_error(conn, v["id"], msg)
-                            _print_err(f"Error on VOD {v['id']}: {msg}")
-                            return 1
                         logger.exception(f"Error refreshing metadata for VOD {v['id']}: {e}")
                         _print_err(f"Error refreshing metadata for VOD {v['id']}: {e}")
                         return 1

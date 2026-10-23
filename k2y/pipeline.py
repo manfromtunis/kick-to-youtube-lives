@@ -276,86 +276,58 @@ def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     return "uploading"
 
 
-def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> None:
-    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout."""
-    if isinstance(plan_data, dict):
-        plan = plan_data.get("parts", [])
-        vod_hook = plan_data.get("vod_hook", "")
-        vod_tags = plan_data.get("vod_tags", [])
-        vod_hashtags = plan_data.get("vod_hashtags", [])
-    else:
-        plan = plan_data
-        vod_hook = ""
-        vod_tags = []
-        vod_hashtags = []
+_NON_GAME_CATEGORIES = frozenset({
+    "Just Chatting", "IRL", "Cooking", "Music", "Art", "Talk Shows & Podcasts",
+    "Science & Technology", "Software & Game Development", None, "",
+})
 
-    non_game_categories = {
-        "Just Chatting",
-        "IRL",
-        "Cooking",
-        "Music",
-        "Art",
-        "Talk Shows & Podcasts",
-        "Science & Technology",
-        "Software & Game Development",
-        None,
-        "",
-    }
-    cat = vod["category"]
-    category_id = "22" if cat in non_game_categories else "20"
 
+def _row_meta(cfg: config.Config, vod, row, ups: list, plan_data: dict) -> dict:
+    """YouTube metadata (title, v2 description, tags, category) for one upload row."""
+    plan = plan_data.get("parts", [])
     row_0 = next((u for u in ups if u["idx"] == 0), None)
     full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
+    if row["idx"] == 0:
+        desc = media.full_description(
+            plan,
+            cfg.channel,
+            links=cfg.links,
+            vod_hook=plan_data.get("vod_hook"),
+            hashtags=plan_data.get("vod_hashtags"),
+            part_videos=ups,
+        )
+        tags = media.sanitize_tags(plan_data.get("vod_tags"))
+    else:
+        part_dict = plan[row["idx"] - 1] if row["idx"] - 1 < len(plan) else {}
+        desc = media.part_description(
+            part_dict,
+            full_youtube_id,
+            cfg.channel,
+            part_index=row["idx"],
+            total_parts=len(plan),
+            all_parts=ups,
+            full_duration_s=int(vod["duration_s"]),
+            links=cfg.links,
+            hashtags=part_dict.get("hashtags"),
+        )
+        tags = media.sanitize_tags(part_dict.get("tags"))
+    return {
+        "title": row["title"],
+        "description": desc,
+        "category_id": "22" if vod["category"] in _NON_GAME_CATEGORIES else "20",
+        "tags": tags,
+    }
 
-    vod_id = vod["id"]
+
+def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> None:
+    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout."""
+    if not isinstance(plan_data, dict):
+        plan_data = {"parts": plan_data}
     for row in ups:
-        if hasattr(row, "keys") and "desc_done" in row.keys() and row["desc_done"]:
+        if row["desc_done"] or not row["youtube_id"]:
             continue
-        try:
-            if row["desc_done"]:
-                continue
-        except (IndexError, KeyError, TypeError):
-            pass
-
-        video_id = row["youtube_id"]
-        if not video_id:
-            continue
-
-        if row["idx"] == 0:
-            desc = media.full_description(
-                plan,
-                cfg.channel,
-                links=cfg.links,
-                vod_hook=vod_hook,
-                hashtags=vod_hashtags,
-                part_videos=ups,
-            )
-            tags = media.sanitize_tags(vod_tags)
-        else:
-            part_idx = row["idx"] - 1
-            part_dict = plan[part_idx] if part_idx < len(plan) else {}
-            desc = media.part_description(
-                part_dict,
-                full_youtube_id,
-                cfg.channel,
-                part_index=row["idx"],
-                total_parts=len(plan),
-                all_parts=ups,
-                full_duration_s=int(vod["duration_s"]),
-                links=cfg.links,
-                hashtags=part_dict.get("hashtags"),
-            )
-            tags = media.sanitize_tags(part_dict.get("tags"))
-
-        meta = {
-            "title": row["title"],
-            "description": desc,
-            "category_id": category_id,
-            "tags": tags,
-        }
-
-        youtube.update_snippet(video_id, meta)
-        db.update_upload(conn, vod_id, row["idx"], desc_done=1)
+        youtube.update_snippet(row["youtube_id"], _row_meta(cfg, vod, row, ups, plan_data))
+        db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
 
 
 def refresh_metadata(conn, cfg: config.Config, vod_id: int) -> None:
@@ -434,59 +406,10 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
             return "new"
         return "planned"
 
-    non_game_categories = {
-        "Just Chatting",
-        "IRL",
-        "Cooking",
-        "Music",
-        "Art",
-        "Talk Shows & Podcasts",
-        "Science & Technology",
-        "Software & Game Development",
-        None,
-        "",
-    }
-    cat = vod["category"]
-    category_id = "22" if cat in non_game_categories else "20"
-
-    row_0 = next((u for u in ups if u["idx"] == 0), None)
-    full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
-
     for row in ups:
         video_id = row["youtube_id"]
         if not video_id:
-            if row["idx"] == 0:
-                desc = media.full_description(
-                    plan,
-                    cfg.channel,
-                    links=cfg.links,
-                    vod_hook=plan_data.get("vod_hook"),
-                    hashtags=plan_data.get("vod_hashtags"),
-                    part_videos=ups,
-                )
-                tags = media.sanitize_tags(plan_data.get("vod_tags"))
-            else:
-                part_idx = row["idx"] - 1
-                part_dict = plan[part_idx] if part_idx < len(plan) else {}
-                desc = media.part_description(
-                    part_dict,
-                    full_youtube_id,
-                    cfg.channel,
-                    part_index=row["idx"],
-                    total_parts=len(plan),
-                    all_parts=ups,
-                    full_duration_s=int(vod["duration_s"]),
-                    links=cfg.links,
-                    hashtags=part_dict.get("hashtags"),
-                )
-                tags = media.sanitize_tags(part_dict.get("tags"))
-
-            meta = {
-                "title": row["title"],
-                "description": desc,
-                "category_id": category_id,
-                "tags": tags,
-            }
+            meta = _row_meta(cfg, vod, row, ups, plan_data)
 
             def on_session(session_url: str) -> None:
                 db.update_upload(conn, vod_id, row["idx"], upload_session=session_url)
@@ -498,8 +421,8 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
                 on_session,
             )
             db.update_upload(conn, vod_id, row["idx"], youtube_id=video_id)
-            if row["idx"] == 0:
-                full_youtube_id = video_id
+            # Later parts link to the full VOD as soon as it has an id (loop keeps the old list).
+            ups = db.uploads(conn, vod_id)
 
         if not row["thumb_done"] and row["thumb"]:
             youtube.set_thumbnail(video_id, Path(row["thumb"]))

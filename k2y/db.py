@@ -269,14 +269,6 @@ def update_upload(conn: sqlite3.Connection, vod_id: int, idx: int, **fields) -> 
         )
 
 
-def set_upload_desc_done(conn: sqlite3.Connection, vod_id: int, idx: int, desc_done: int = 1) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE uploads SET desc_done = ? WHERE vod_id = ? AND idx = ?",
-            (desc_done, vod_id, idx),
-        )
-
-
 def clear_desc_done(conn: sqlite3.Connection, vod_id: int) -> int:
     with conn:
         cur = conn.execute(
