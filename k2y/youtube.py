@@ -350,7 +350,7 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _init_upload_session(total_size: int, meta: dict) -> str:
+def build_snippet(meta: dict) -> dict[str, object]:
     title = str(meta.get("title", "")).replace("<", "").replace(">", "")[:100]
     description = str(meta.get("description", "")).replace("<", "").replace(">", "")
     description = _truncate_utf8(description, 5000)
@@ -364,7 +364,36 @@ def _init_upload_session(total_size: int, meta: dict) -> str:
     }
     if "tags" in meta and meta["tags"] is not None:
         snippet["tags"] = list(meta["tags"])
+    return snippet
 
+
+def update_snippet(video_id: str, meta: dict) -> dict:
+    snippet = build_snippet(meta)
+    body = {
+        "id": video_id,
+        "snippet": snippet,
+    }
+    body_bytes = json.dumps(body).encode("utf-8")
+    url = "https://www.googleapis.com/youtube/v3/videos?part=snippet"
+
+    def _put(tok: str) -> dict:
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method="PUT")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read().decode("utf-8")
+            return json.loads(data) if data else {}
+
+    try:
+        return _authed(_put)
+    except urllib.error.HTTPError as e:
+        raise _parse_youtube_error(e)
+
+
+def _init_upload_session(total_size: int, meta: dict) -> str:
+    snippet = build_snippet(meta)
     body = {
         "snippet": snippet,
         "status": {

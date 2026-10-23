@@ -990,5 +990,82 @@ class TestYouTube(unittest.TestCase):
         self.assertEqual(actual, expected)
 
 
+class TestUpdateSnippet(TestYouTube):
+    @patch("urllib.request.urlopen")
+    def test_update_snippet_request_shape(self, mock_urlopen: MagicMock) -> None:
+        recorded_reqs: list[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
+            recorded_reqs.append(req)
+            return MockResponse(200, {}, json.dumps({"id": "vid123", "snippet": {}}).encode("utf-8"))
+
+        mock_urlopen.side_effect = fake_urlopen
+        meta = {
+            "title": "Test Title",
+            "description": "Test Desc",
+            "category_id": "20",
+            "tags": ["gaming", "kick"],
+        }
+        res = youtube.update_snippet("vid123", meta)
+        self.assertEqual(res.get("id"), "vid123")
+        self.assertEqual(len(recorded_reqs), 1)
+
+        req = recorded_reqs[0]
+        self.assertEqual(req.get_method(), "PUT")
+        self.assertEqual(req.full_url, "https://www.googleapis.com/youtube/v3/videos?part=snippet")
+        self.assertEqual(req.headers.get("Authorization"), "Bearer mock_access_token")
+        self.assertEqual(req.headers.get("Content-type"), "application/json; charset=UTF-8")
+
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(body["id"], "vid123")
+        snippet = body["snippet"]
+        self.assertEqual(snippet["title"], "Test Title")
+        self.assertEqual(snippet["description"], "Test Desc")
+        self.assertEqual(snippet["categoryId"], "20")
+        self.assertEqual(snippet["defaultLanguage"], "ar")
+        self.assertEqual(snippet["defaultAudioLanguage"], "ar")
+        self.assertEqual(snippet["tags"], ["gaming", "kick"])
+
+    @patch("urllib.request.urlopen")
+    def test_update_snippet_strips_brackets_and_truncates(self, mock_urlopen: MagicMock) -> None:
+        recorded_reqs: list[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
+            recorded_reqs.append(req)
+            return MockResponse(200, {}, b"{}")
+
+        mock_urlopen.side_effect = fake_urlopen
+        long_title = "<Title> " + ("T" * 150)
+        long_desc = "<Desc> " + ("D" * 6000)
+        youtube.update_snippet("vid123", {"title": long_title, "description": long_desc})
+
+        body = json.loads(recorded_reqs[0].data.decode("utf-8"))
+        res_title = body["snippet"]["title"]
+        res_desc = body["snippet"]["description"]
+
+        self.assertNotIn("<", res_title)
+        self.assertNotIn(">", res_title)
+        self.assertNotIn("<", res_desc)
+        self.assertNotIn(">", res_desc)
+        self.assertLessEqual(len(res_title), 100)
+        self.assertLessEqual(len(res_desc.encode("utf-8")), 5000)
+
+    @patch("urllib.request.urlopen")
+    def test_update_snippet_quota_error_raises_quota_exceeded(self, mock_urlopen: MagicMock) -> None:
+        err_body = json.dumps({
+            "error": {
+                "errors": [{"reason": "quotaExceeded", "message": "Quota exceeded"}],
+                "message": "The request cannot be completed because you have exceeded your quota.",
+            }
+        }).encode("utf-8")
+
+        def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> MockResponse:
+            raise _make_http_error(403, "Forbidden", err_body)
+
+        mock_urlopen.side_effect = fake_urlopen
+        with self.assertRaises(youtube.QuotaExceeded):
+            youtube.update_snippet("vid123", {"title": "Title"})
+
+
 if __name__ == "__main__":
     unittest.main()
