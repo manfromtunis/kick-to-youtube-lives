@@ -265,5 +265,48 @@ class TestDB(unittest.TestCase):
         self.assertEqual(row["youtube_id"], "yt_123")
 
 
+    def test_desc_done_column_and_migration(self):
+        # Create a database manually with old schema (without desc_done)
+        old_db_path = Path(self.tmp_dir.name) / "old_k2y.db"
+        import sqlite3
+        raw_conn = sqlite3.connect(old_db_path)
+        raw_conn.executescript("""
+        CREATE TABLE vods (
+          id INTEGER PRIMARY KEY, title TEXT, started_at TEXT, duration_s INTEGER,
+          source_url TEXT, category TEXT, state TEXT, error TEXT, attempts INTEGER DEFAULT 0,
+          plan_json TEXT, updated_at TEXT
+        );
+        CREATE TABLE uploads (
+          vod_id INTEGER, idx INTEGER, title TEXT, start_s INTEGER, end_s INTEGER,
+          file TEXT, thumb TEXT, youtube_id TEXT, upload_session TEXT, thumb_done INTEGER DEFAULT 0,
+          PRIMARY KEY (vod_id, idx)
+        );
+        """)
+        raw_conn.execute("INSERT INTO vods (id, title, started_at, duration_s, source_url, state, updated_at) VALUES (1, 't', 's', 10, 'u', 'done', 'now')")
+        raw_conn.execute("INSERT INTO uploads (vod_id, idx, title, start_s, end_s) VALUES (1, 0, 'full', 0, 10)")
+        raw_conn.commit()
+        raw_conn.close()
+
+        # Connect with k2y.db.connect - triggers migration
+        migrated_conn = db.connect(old_db_path)
+        cols = {row["name"] for row in migrated_conn.execute("PRAGMA table_info(uploads)").fetchall()}
+        self.assertIn("desc_done", cols)
+
+        # Check existing row has desc_done = 0
+        row = db.get_upload(migrated_conn, 1, 0)
+        self.assertEqual(row["desc_done"], 0)
+
+        # Set desc_done to 1
+        db.set_upload_desc_done(migrated_conn, 1, 0, 1)
+        row = db.get_upload(migrated_conn, 1, 0)
+        self.assertEqual(row["desc_done"], 1)
+
+        # Clear desc_done
+        db.clear_desc_done(migrated_conn, 1)
+        row = db.get_upload(migrated_conn, 1, 0)
+        self.assertEqual(row["desc_done"], 0)
+        migrated_conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
