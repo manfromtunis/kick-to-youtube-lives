@@ -38,6 +38,28 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(loaded.model, "custom_model")
         self.assertFalse(hasattr(loaded, "unknown_extra_key_1"))
 
+    def test_default_links_and_frozen_safety(self):
+        cfg = config.Config()
+        self.assertEqual(len(cfg.links), 4)
+        self.assertEqual(cfg.links[0], ("📸 Instagram", "https://www.instagram.com/ghmelek/"))
+        self.assertEqual(cfg.links[1], ("🛠️ AuraStack", "https://aurastack.link/"))
+        self.assertEqual(cfg.links[2], ("💸 Clip2Earn", "https://www.clip2earn.money/"))
+        self.assertEqual(cfg.links[3], ("📱 Bakchich", "https://www.instagram.com/bakchich.app/"))
+
+    def test_load_links_from_json_list(self):
+        cfg_file = self.config_dir / "config.json"
+        custom_links = [
+            ["Custom Site", "https://example.com"],
+            ["Twitter", "https://twitter.com/test"],
+        ]
+        cfg_file.write_text(json.dumps({
+            "channel": "custom_channel",
+            "links": custom_links,
+        }), encoding="utf-8")
+
+        loaded = config.load()
+        self.assertEqual(loaded.links, custom_links)
+
     def test_load_reads_with_utf8_sig_bom(self):
         cfg_file = self.config_dir / "config.json"
         # Write JSON with UTF-8 BOM
