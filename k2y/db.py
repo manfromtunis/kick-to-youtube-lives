@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS uploads (
   youtube_id TEXT,
   upload_session TEXT,
   thumb_done INTEGER NOT NULL DEFAULT 0,
+  desc_done INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (vod_id, idx)
 );
 """
@@ -40,6 +41,14 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    cur = conn.execute("PRAGMA table_info(uploads)")
+    cols = {row["name"] for row in cur.fetchall()}
+    if "desc_done" not in cols:  # in-place migration for databases made before descriptions v2
+        try:
+            conn.execute("ALTER TABLE uploads ADD COLUMN desc_done INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):  # another process migrated first
+                raise
     return conn
 
 
@@ -262,3 +271,12 @@ def update_upload(conn: sqlite3.Connection, vod_id: int, idx: int, **fields) -> 
             f"UPDATE uploads SET {set_clause} WHERE vod_id = ? AND idx = ?",
             [*valid.values(), vod_id, idx],
         )
+
+
+def clear_desc_done(conn: sqlite3.Connection, vod_id: int) -> int:
+    with conn:
+        cur = conn.execute(
+            "UPDATE uploads SET desc_done = 0 WHERE vod_id = ?",
+            (vod_id,),
+        )
+        return cur.rowcount

@@ -15,6 +15,13 @@ class MissingSecret(RuntimeError):
 
 CONFIG_DIR = Path(os.environ.get("K2Y_CONFIG_DIR", Path.home() / ".config/k2y"))
 
+DEFAULT_LINKS: tuple[tuple[str, str], ...] = (
+    ("📸 Instagram", "https://www.instagram.com/ghmelek/"),
+    ("🛠️ AuraStack", "https://aurastack.link/"),
+    ("💸 Clip2Earn", "https://www.clip2earn.money/"),
+    ("📱 Bakchich", "https://www.instagram.com/bakchich.app/"),
+)
+
 
 @dataclass(frozen=True)
 class Config:
@@ -23,6 +30,7 @@ class Config:
     model: str = "gemini-3.8-flash"
     min_part_minutes: int = 15
     since: str | None = None  # ISO date; None = set on first `k2y run`
+    links: tuple | list = DEFAULT_LINKS
 
     @property
     def db_path(self) -> Path:

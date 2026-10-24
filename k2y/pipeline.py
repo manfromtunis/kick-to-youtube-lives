@@ -63,9 +63,78 @@ def _thumb_moment_for_part(part: dict) -> int:
     return int(part.get("start_s", 0)) + 60
 
 
-def expected_upload_count(plan: list) -> int:
-    """Compute expected number of upload rows from a plan."""
-    return len(plan) + 1 if len(plan) >= 2 else 1
+_faces_warned = False
+
+
+def reset_faces_warned() -> None:
+    global _faces_warned
+    _faces_warned = False
+
+
+# Melek's cut-out reaction photos ship with the repo; a non-empty CONFIG_DIR/faces overrides them.
+REPO_FACES = Path(__file__).resolve().parent.parent / "assets" / "faces"
+
+
+def pick_face(vod_id: int, idx: int, faces_dir: Path | None = None) -> Path | None:
+    """Pick deterministic face photo for (vod_id, idx).
+
+    Looks in faces_dir if given, else CONFIG_DIR/faces then the repo's assets/faces.
+    Formula: sorted(files)[(vod_id * 31 + idx) % len(files)]
+    Warns once per run when no folder has photos.
+    """
+    global _faces_warned
+    dirs = [faces_dir] if faces_dir is not None else [config.CONFIG_DIR / "faces", REPO_FACES]
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    files = []
+    for d in dirs:
+        if d.is_dir():
+            files = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+        if files:
+            break
+    if not files:
+        if not _faces_warned:
+            logger.warning(
+                f"No reaction photos in {', '.join(map(str, dirs))}; thumbnails will be generated without a face"
+            )
+            _faces_warned = True
+        return None
+    sorted_files = sorted(files)
+    return sorted_files[(vod_id * 31 + idx) % len(sorted_files)]
+
+
+def load_plan(plan_raw: str | None) -> tuple[list[dict], str]:
+    """(parts, vod_thumb_text) from plan JSON, v2 dict or legacy list."""
+    d = load_plan_data(plan_raw)
+    return d["parts"], d["vod_thumb_text"]
+
+
+def load_plan_data(plan_raw: str | None) -> dict:
+    """Normalise plan JSON (v2 dict or legacy list) to one dict shape.
+
+    Corrupt JSON raises: an empty plan would upload a single, wrong video.
+    """
+    data = json.loads(plan_raw) if plan_raw else []
+    if isinstance(data, list):
+        data = {"parts": data}
+    if not isinstance(data, dict):
+        raise ValueError(f"plan_json must be a list or an object, got {type(data).__name__}")
+    return {
+        **data,  # keep keys this function doesn't know (desc_ver, future fields)
+        "parts": data.get("parts") or [],
+        "vod_thumb_text": str(data.get("vod_thumb_text") or ""),
+        "vod_hook": str(data.get("vod_hook") or ""),
+        "vod_tags": list(data.get("vod_tags") or []),
+        "vod_hashtags": list(data.get("vod_hashtags") or []),
+    } | ({"meta_filled": True} if data.get("meta_filled") else {})
+
+
+def expected_upload_count(plan: list | dict) -> int:
+    """Compute expected number of upload rows from a plan (list or dict)."""
+    if isinstance(plan, dict):
+        parts = plan.get("parts", [])
+    else:
+        parts = plan
+    return len(parts) + 1 if len(parts) >= 2 else 1
 
 
 def step_download(conn, cfg: config.Config, vod) -> str:
@@ -104,7 +173,7 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
     plan_raw = vod["plan_json"]
     if not plan_raw:
         return "downloaded"
-    plan = json.loads(plan_raw)
+    plan, vod_thumb_text = load_plan(plan_raw)
 
     vod_dir = cfg.vod_dir(vod_id)
     vod_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +182,9 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
     full_thumb_at = _thumb_moment_for_part(plan[0]) if plan else 60
     full_title = media.full_title(vod["title"], vod["started_at"])
     thumb_0 = vod_dir / "thumb_0.jpg"
-    media.thumbnail(src, full_thumb_at, full_title, thumb_0)
+    hook_0 = media.sanitize_hook(vod_thumb_text, fallback_title=vod["title"])
+    face_0 = pick_face(vod_id, 0)
+    media.thumbnail(src, full_thumb_at, hook_0, thumb_0, face=face_0)
     db.upsert_upload(
         conn,
         vod_id=vod_id,
@@ -133,7 +204,9 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
             p_title = media.part_title(part.get("title", ""), i, len(plan))
             p_thumb = vod_dir / f"thumb_{i}.jpg"
             p_moment = _thumb_moment_for_part(part)
-            media.thumbnail(src, p_moment, p_title, p_thumb)
+            p_hook = media.sanitize_hook(part.get("thumb_text"), fallback_title=part.get("title", ""))
+            face_i = pick_face(vod_id, i)
+            media.thumbnail(src, p_moment, p_hook, p_thumb, face=face_i)
             db.upsert_upload(
                 conn,
                 vod_id=vod_id,
@@ -169,7 +242,7 @@ def step_cut(conn, cfg: config.Config, vod) -> str:
 def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     src = cfg.vod_dir(vod_id) / "source.mp4"
-    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    plan, _ = load_plan(vod["plan_json"])
     expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
     indices = {u["idx"] for u in ups}
@@ -194,10 +267,152 @@ def step_cut_ready(conn, cfg: config.Config, vod) -> str:
     return "uploading"
 
 
+_NON_GAME_CATEGORIES = frozenset({
+    "Just Chatting", "IRL", "Cooking", "Music", "Art", "Talk Shows & Podcasts",
+    "Science & Technology", "Software & Game Development", None, "",
+})
+
+
+def _row_meta(cfg: config.Config, vod, row, ups: list, plan_data: dict) -> dict:
+    """YouTube metadata (title, v2 description, tags, category) for one upload row."""
+    plan = plan_data.get("parts", [])
+    row_0 = next((u for u in ups if u["idx"] == 0), None)
+    full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
+    if row["idx"] == 0:
+        desc = media.full_description(
+            plan,
+            cfg.channel,
+            links=cfg.links,
+            # A single-part VOD only uploads idx 0: fall back to that part's text.
+            vod_hook=plan_data.get("vod_hook")
+            or (plan[0].get("hook") or plan[0].get("description") if len(plan) == 1 else None),
+            hashtags=plan_data.get("vod_hashtags"),
+            part_videos=ups,
+        )
+        tags = media.sanitize_tags(plan_data.get("vod_tags"))
+    else:
+        part_dict = plan[row["idx"] - 1] if row["idx"] - 1 < len(plan) else {}
+        desc = media.part_description(
+            part_dict,
+            full_youtube_id,
+            cfg.channel,
+            part_index=row["idx"],
+            total_parts=len(plan),
+            all_parts=ups,
+            full_duration_s=int(vod["duration_s"]),
+            links=cfg.links,
+            hashtags=part_dict.get("hashtags"),
+        )
+        tags = media.sanitize_tags(part_dict.get("tags"))
+    return {
+        "title": row["title"],
+        "description": desc,
+        "category_id": "22" if vod["category"] in _NON_GAME_CATEGORIES else "20",
+        "tags": tags,
+    }
+
+
+# Bump when the description layout changes, so refresh-metadata --all re-sends old VODs.
+DESC_VERSION = 2
+
+
+def _permanent(e: Exception) -> bool:
+    """A YouTube error that retrying the same request won't fix (bad metadata, deleted video)."""
+    reasons = getattr(e, "reasons", ()) or (str(e),)
+    transient = any("ratelimit" in r.lower() or "backend" in r.lower() for r in reasons)
+    return getattr(e, "status", None) in (400, 403, 404) and not transient
+
+
+def apply_final_descriptions(conn, cfg: config.Config, vod, ups: list, plan_data: dict | list) -> int:
+    """Final description pass: update snippet for each upload with full navigation, tags, and v2 layout.
+
+    Returns how many videos YouTube permanently refused (logged and skipped). Quota, auth and
+    transient errors propagate, so the run stops and the next run resumes the unfinished rows.
+    """
+    if not isinstance(plan_data, dict):
+        plan_data = {"parts": plan_data}
+    refused = 0
+    for row in ups:
+        if row["desc_done"] or not row["youtube_id"]:
+            continue
+        try:
+            youtube.update_snippet(row["youtube_id"], _row_meta(cfg, vod, row, ups, plan_data))
+        except youtube.YouTubeError as e:
+            if not _permanent(e):
+                raise
+            logger.warning("VOD %s: YouTube refused the snippet for video %s: %s", vod["id"], row["youtube_id"], e)
+            refused += 1
+        db.update_upload(conn, vod["id"], row["idx"], desc_done=1)
+    if plan_data.get("desc_ver") != DESC_VERSION:
+        plan_data["desc_ver"] = DESC_VERSION
+        db.save_plan(conn, vod["id"], plan_data)
+    return refused
+
+
+def refresh_metadata(conn, cfg: config.Config, vod_id: int, force: bool = False) -> int:
+    """Refresh metadata and descriptions for a published VOD in 'done' state."""
+    vod = db.get_vod(conn, vod_id)
+    if not vod:
+        raise RuntimeError(f"VOD {vod_id} not found in database")
+    if vod["state"] != "done":
+        raise RuntimeError(f"Cannot refresh metadata for VOD {vod_id}: state is {vod['state']} (must be 'done')")
+
+    plan_raw = vod["plan_json"]
+    if not plan_raw:
+        raise RuntimeError(f"Cannot refresh metadata for VOD {vod_id}: plan_json is empty")
+
+    plan_data = load_plan_data(plan_raw)
+    parts = plan_data.get("parts", [])
+
+    # Legacy plans (no v2 fields) get one Gemini fill, recorded by meta_filled.
+    needs_gemini = not (
+        plan_data.get("meta_filled") or plan_data.get("vod_hook") or any(p.get("hook") for p in parts)
+    )
+
+    if needs_gemini:
+        logger.info(f"VOD {vod_id}: plan lacks descriptions v2 fields; calling Gemini to fill metadata")
+        raw_models = [cfg.model] + segment.FALLBACK_MODELS
+        models = list(dict.fromkeys(raw_models))
+        meta_result = segment.fill_metadata(
+            vod_title=vod["title"],
+            duration_s=int(vod["duration_s"]),
+            parts=parts,
+            models=models,
+        )
+        plan_data["vod_hook"] = str(meta_result.get("vod_hook", ""))
+        plan_data["vod_tags"] = list(meta_result.get("vod_tags", []))
+        plan_data["vod_hashtags"] = list(meta_result.get("vod_hashtags", []))
+
+        part_results = meta_result.get("parts", [])
+        by_idx = {p.get("idx"): p for p in part_results}
+        if set(by_idx) != set(range(1, len(parts) + 1)) and len(part_results) == len(parts):
+            by_idx = dict(enumerate(part_results, 1))  # Gemini ignored the 1-based idx
+        for i, part in enumerate(parts, 1):
+            res_p = by_idx.get(i)
+            if res_p:
+                part["hook"] = res_p.get("hook", part.get("hook", ""))
+                part["tags"] = res_p.get("tags", part.get("tags", []))
+                part["hashtags"] = res_p.get("hashtags", part.get("hashtags", []))
+
+        plan_data["meta_filled"] = True
+        plan_data.pop("desc_ver", None)  # new hooks: the live descriptions are stale
+        db.save_plan(conn, vod_id, plan_data)
+
+    # Rows already at the current layout stay done, so a quota stop (or --all over several
+    # days) resumes instead of re-sending finished videos. force re-sends everything.
+    ups = db.uploads(conn, vod_id)
+    stale = plan_data.get("desc_ver") != DESC_VERSION and all(u["desc_done"] for u in ups)
+    if force or stale:
+        db.clear_desc_done(conn, vod_id)
+        ups = db.uploads(conn, vod_id)
+    return apply_final_descriptions(conn, cfg, vod, ups, plan_data)
+
+
 def step_upload(conn, cfg: config.Config, vod) -> str:
     vod_id = vod["id"]
     src = cfg.vod_dir(vod_id) / "source.mp4"
-    plan = json.loads(vod["plan_json"]) if vod["plan_json"] else []
+    plan_data = load_plan_data(vod["plan_json"])
+    plan = plan_data.get("parts", [])
     expected = expected_upload_count(plan)
     ups = db.uploads(conn, vod_id)
     indices = {u["idx"] for u in ups}
@@ -219,39 +434,10 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
             return "new"
         return "planned"
 
-    non_game_categories = {
-        "Just Chatting",
-        "IRL",
-        "Cooking",
-        "Music",
-        "Art",
-        "Talk Shows & Podcasts",
-        "Science & Technology",
-        "Software & Game Development",
-        None,
-        "",
-    }
-    cat = vod["category"]
-    category_id = "22" if cat in non_game_categories else "20"
-
-    row_0 = next((u for u in ups if u["idx"] == 0), None)
-    full_youtube_id = row_0["youtube_id"] if row_0 and row_0["youtube_id"] else None
-
     for row in ups:
         video_id = row["youtube_id"]
         if not video_id:
-            if row["idx"] == 0:
-                desc = media.full_description(plan, cfg.channel)
-            else:
-                part_idx = row["idx"] - 1
-                part_dict = plan[part_idx] if part_idx < len(plan) else {}
-                desc = media.part_description(part_dict, full_youtube_id, cfg.channel)
-
-            meta = {
-                "title": row["title"],
-                "description": desc,
-                "category_id": category_id,
-            }
+            meta = _row_meta(cfg, vod, row, ups, plan_data)
 
             def on_session(session_url: str) -> None:
                 db.update_upload(conn, vod_id, row["idx"], upload_session=session_url)
@@ -263,12 +449,16 @@ def step_upload(conn, cfg: config.Config, vod) -> str:
                 on_session,
             )
             db.update_upload(conn, vod_id, row["idx"], youtube_id=video_id)
-            if row["idx"] == 0:
-                full_youtube_id = video_id
+            # Later parts link to the full VOD as soon as it has an id (loop keeps the old list).
+            ups = db.uploads(conn, vod_id)
 
         if not row["thumb_done"] and row["thumb"]:
             youtube.set_thumbnail(video_id, Path(row["thumb"]))
             db.update_upload(conn, vod_id, row["idx"], thumb_done=1)
+
+    # Final description pass
+    ups = db.uploads(conn, vod_id)
+    apply_final_descriptions(conn, cfg, vod, ups, plan_data)
 
     vod_dir = cfg.vod_dir(vod_id)
     if vod_dir.exists():
@@ -427,6 +617,7 @@ def run(cfg: config.Config | None = None) -> int:
         cfg = config.load()
 
     setup_logging(cfg.work_dir)
+    reset_faces_warned()
 
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.work_dir / "k2y.lock"

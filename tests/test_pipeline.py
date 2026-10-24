@@ -647,7 +647,7 @@ class TestPipeline(unittest.TestCase):
         db.update_upload(self.conn, vod_id, 0, youtube_id="yt_already", thumb_done=1)
 
         row = db.get_vod(self.conn, vod_id)
-        with patch("shutil.rmtree", side_effect=OSError("permission denied")), self.assertLogs("k2y", level="WARNING") as cm:
+        with patch("shutil.rmtree", side_effect=OSError("permission denied")), patch("k2y.youtube.update_snippet"), self.assertLogs("k2y", level="WARNING") as cm:
             res = pipeline.step_upload(self.conn, self.cfg, row)
             self.assertEqual(res, "done")
             self.assertTrue(any("Failed to remove VOD directory" in msg for msg in cm.output))
@@ -880,7 +880,8 @@ class TestPipeline(unittest.TestCase):
             thumb_calls.append((video_id, Path(path).name))
 
         with patch("k2y.youtube.upload", side_effect=fake_upload), \
-             patch("k2y.youtube.set_thumbnail", side_effect=fake_thumb):
+             patch("k2y.youtube.set_thumbnail", side_effect=fake_thumb), \
+             patch("k2y.youtube.update_snippet"):
             row = db.get_vod(self.conn, vod_id)
             res = pipeline.step_upload(self.conn, self.cfg, row)
 
@@ -1015,6 +1016,439 @@ class TestPipeline(unittest.TestCase):
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(row["state"], "downloaded")
         self.assertIsNone(row["error"])
+
+
+
+    def test_pick_face_deterministic_and_different_per_idx(self):
+        faces_dir = self.config_dir / "faces"
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        (faces_dir / "b.png").write_bytes(b"b")
+        (faces_dir / "a.jpg").write_bytes(b"a")
+        (faces_dir / "d.webp").write_bytes(b"d")
+        (faces_dir / "c.jpeg").write_bytes(b"c")
+        (faces_dir / "ignore.txt").write_bytes(b"ignore")
+
+        # sorted files: a.jpg, b.png, c.jpeg, d.webp (length 4)
+        vod_id = 12
+        # (12 * 31 + 0) % 4 = 372 % 4 = 0 -> a.jpg
+        face0 = pipeline.pick_face(vod_id, 0, faces_dir=faces_dir)
+        self.assertEqual(face0.name, "a.jpg")
+
+        # (12 * 31 + 1) % 4 = 373 % 4 = 1 -> b.png
+        face1 = pipeline.pick_face(vod_id, 1, faces_dir=faces_dir)
+        self.assertEqual(face1.name, "b.png")
+        self.assertNotEqual(face0, face1)
+
+        # Deterministic: repeated call returns identical path
+        self.assertEqual(pipeline.pick_face(vod_id, 0, faces_dir=faces_dir), face0)
+
+    def test_pick_face_falls_back_to_repo_photos(self):
+        # Empty CONFIG_DIR/faces: the photos shipped in assets/faces are used.
+        repo = self.config_dir / "repo_faces"
+        repo.mkdir()
+        (repo / "r.png").write_bytes(b"x")
+        with patch("k2y.config.CONFIG_DIR", self.config_dir), patch("k2y.pipeline.REPO_FACES", repo):
+            self.assertEqual(pipeline.pick_face(1, 0).name, "r.png")
+            # A photo in CONFIG_DIR/faces overrides the repo ones.
+            (self.config_dir / "faces").mkdir(exist_ok=True)
+            (self.config_dir / "faces" / "mine.jpg").write_bytes(b"x")
+            self.assertEqual(pipeline.pick_face(1, 0).name, "mine.jpg")
+
+    def test_pick_face_empty_or_missing_warns_once(self):
+        pipeline.reset_faces_warned()
+        missing_dir = self.config_dir / "non_existent_faces"
+
+        with self.assertLogs("k2y", level="WARNING") as cm:
+            res1 = pipeline.pick_face(1, 0, faces_dir=missing_dir)
+            res2 = pipeline.pick_face(1, 1, faces_dir=missing_dir)
+
+        self.assertIsNone(res1)
+        self.assertIsNone(res2)
+        # Warning logged only once
+        self.assertEqual(len([m for m in cm.output if "No reaction photos" in m]), 1)
+
+        # Reset and test empty dir
+        pipeline.reset_faces_warned()
+        empty_dir = self.config_dir / "empty_faces"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+        with self.assertLogs("k2y", level="WARNING") as cm2:
+            res3 = pipeline.pick_face(2, 0, faces_dir=empty_dir)
+        self.assertIsNone(res3)
+        self.assertEqual(len([m for m in cm2.output if "No reaction photos" in m]), 1)
+
+    def test_load_plan_legacy_list_and_v2_dict(self):
+        self.assertEqual(pipeline.load_plan(None), ([], ""))
+        self.assertEqual(pipeline.load_plan(""), ([], ""))
+        # Corrupt JSON must raise: an empty plan would upload one wrong video.
+        with self.assertRaises(json.JSONDecodeError):
+            pipeline.load_plan("not-json")
+        # Keys stored as null are tolerated.
+        d = pipeline.load_plan_data('{"parts": [], "vod_tags": null, "vod_hook": null}')
+        self.assertEqual((d["vod_tags"], d["vod_hook"]), ([], ""))
+
+        # Legacy plan format (list)
+        legacy_json = json.dumps([{"start_s": 0, "end_s": 100, "title": "Part 1"}])
+        parts, vod_thumb = pipeline.load_plan(legacy_json)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["title"], "Part 1")
+        self.assertEqual(vod_thumb, "")
+
+        # v2 plan format (dict)
+        v2_json = json.dumps({
+            "parts": [{"start_s": 0, "end_s": 100, "title": "Part 1", "thumb_text": "HOOK P1"}],
+            "vod_thumb_text": "HOOK VOD"
+        })
+        parts_v2, vod_thumb_v2 = pipeline.load_plan(v2_json)
+        self.assertEqual(len(parts_v2), 1)
+        self.assertEqual(parts_v2[0]["thumb_text"], "HOOK P1")
+        self.assertEqual(vod_thumb_v2, "HOOK VOD")
+
+    def test_expected_upload_count_with_dict(self):
+        self.assertEqual(pipeline.expected_upload_count({"parts": []}), 1)
+        self.assertEqual(pipeline.expected_upload_count({"parts": [{"title": "P1"}]}), 1)
+        self.assertEqual(pipeline.expected_upload_count({"parts": [{"title": "P1"}, {"title": "P2"}]}), 3)
+
+    def test_step_cut_with_legacy_and_v2_plans(self):
+        faces_dir = self.config_dir / "faces"
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        (faces_dir / "face1.png").write_bytes(b"fake face")
+
+        # 1. Test with legacy plan
+        vod_id = 991
+        vod = {
+            "id": vod_id,
+            "title": "Stream Titre Important",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod991.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        legacy_plan = [
+            {"start_s": 0, "end_s": 1800, "title": "Partie Un Epique"},
+            {"start_s": 1800, "end_s": 3600, "title": "Partie Deux Finale"},
+        ]
+        db.save_plan(self.conn, vod_id, legacy_plan)
+
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "source.mp4").write_bytes(b"fake video")
+
+        row = db.get_vod(self.conn, vod_id)
+        thumb_calls = []
+
+        def fake_thumb(src, at_s, hook, dest, face=None):
+            thumb_calls.append((dest.name, hook, face.name if face else None))
+            dest.write_bytes(b"fake thumb")
+            return dest
+
+        with (
+            patch("k2y.media.cut", return_value=v_dir / "part_1.mp4"),
+            patch("k2y.media.thumbnail", side_effect=fake_thumb),
+        ):
+            res = pipeline.step_cut(self.conn, self.cfg, row)
+            self.assertEqual(res, "cut")
+
+        # Full VOD (thumb_0) hook falls back to stream title, parts fall back to part titles
+        self.assertEqual(len(thumb_calls), 3)
+        self.assertEqual(thumb_calls[0][0], "thumb_0.jpg")
+        self.assertEqual(thumb_calls[0][1], "STREAM TITRE IMPORTANT")
+        self.assertEqual(thumb_calls[0][2], "face1.png")
+
+        self.assertEqual(thumb_calls[1][0], "thumb_1.jpg")
+        self.assertEqual(thumb_calls[1][1], "PARTIE UN EPIQUE")
+
+        self.assertEqual(thumb_calls[2][0], "thumb_2.jpg")
+        self.assertEqual(thumb_calls[2][1], "PARTIE DEUX FINALE")
+
+
+    def test_final_description_pass_idempotent_and_resumes(self):
+        vod_id = 992
+        vod = {
+            "id": vod_id,
+            "title": "Stream Final Pass",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod992.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        plan_data = {
+            "parts": [
+                {"start_s": 0, "end_s": 1800, "title": "Part 1", "hook": "H1", "tags": ["t1"], "hashtags": ["#h1"]},
+                {"start_s": 1800, "end_s": 3600, "title": "Part 2", "hook": "H2", "tags": ["t2"], "hashtags": ["#h2"]},
+            ],
+            "vod_hook": "VOD HOOK",
+            "vod_tags": ["vtag"],
+            "vod_hashtags": ["#vhash"],
+        }
+        db.save_plan(self.conn, vod_id, plan_data)
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600)
+        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_0", desc_done=1)
+        db.upsert_upload(self.conn, vod_id, 1, "Part 1", 0, 1800)
+        db.update_upload(self.conn, vod_id, 1, youtube_id="yt_1", desc_done=0)
+        db.upsert_upload(self.conn, vod_id, 2, "Part 2", 1800, 3600)
+        db.update_upload(self.conn, vod_id, 2, youtube_id="yt_2", desc_done=0)
+
+        updated_snippets = []
+        def fake_update(video_id, meta):
+            updated_snippets.append((video_id, meta))
+
+        with patch("k2y.youtube.update_snippet", side_effect=fake_update):
+            ups = db.uploads(self.conn, vod_id)
+            pipeline.apply_final_descriptions(self.conn, self.cfg, vod, ups, plan_data)
+
+        # yt_0 was desc_done=1, so only yt_1 and yt_2 should have been updated
+        self.assertEqual(len(updated_snippets), 2)
+        self.assertEqual(updated_snippets[0][0], "yt_1")
+        self.assertEqual(updated_snippets[1][0], "yt_2")
+
+        # Now all rows should have desc_done=1
+        ups2 = db.uploads(self.conn, vod_id)
+        self.assertTrue(all(u["desc_done"] == 1 for u in ups2))
+
+        # Calling again should be a no-op (idempotent)
+        updated_snippets.clear()
+        with patch("k2y.youtube.update_snippet", side_effect=fake_update):
+            pipeline.apply_final_descriptions(self.conn, self.cfg, vod, ups2, plan_data)
+        self.assertEqual(len(updated_snippets), 0)
+
+    def test_final_description_pass_quota_error_raises_stop_run(self):
+        vod_id = 993
+        vod = {
+            "id": vod_id,
+            "title": "Stream Quota Error",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod993.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "uploading")
+        plan_data = {
+            "parts": [{"start_s": 0, "end_s": 3600, "title": "Part 1"}],
+        }
+        db.save_plan(self.conn, vod_id, plan_data)
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "source.mp4").write_bytes(b"src")
+        (v_dir / "thumb_0.jpg").write_bytes(b"thumb0")
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600, file=v_dir / "source.mp4", thumb=v_dir / "thumb_0.jpg")
+        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_0", thumb_done=1, desc_done=0)
+
+        with patch("k2y.youtube.update_snippet", side_effect=youtube.QuotaExceeded("quota exceeded")):
+            with self.assertRaises(pipeline.StopRun):
+                pipeline.advance(self.conn, self.cfg, vod_id)
+
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["state"], "uploading")
+        self.assertEqual(row["error"], "quota exceeded")
+
+    def test_final_description_pass_youtube_error_logs_and_marks_done(self):
+        vod_id = 995
+        vod = {
+            "id": vod_id,
+            "title": "Stream 400 Error",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod995.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "uploading")
+        plan_data = {
+            "parts": [
+                {"start_s": 0, "end_s": 1800, "title": "Part 1"},
+                {"start_s": 1800, "end_s": 3600, "title": "Part 2"},
+            ],
+        }
+        db.save_plan(self.conn, vod_id, plan_data)
+        v_dir = self.cfg.vod_dir(vod_id)
+        v_dir.mkdir(parents=True, exist_ok=True)
+        (v_dir / "source.mp4").write_bytes(b"src")
+        (v_dir / "thumb_0.jpg").write_bytes(b"thumb0")
+        (v_dir / "thumb_1.jpg").write_bytes(b"thumb1")
+        (v_dir / "thumb_2.jpg").write_bytes(b"thumb2")
+        (v_dir / "part_1.mp4").write_bytes(b"p1")
+        (v_dir / "part_2.mp4").write_bytes(b"p2")
+
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600, file=v_dir / "source.mp4", thumb=v_dir / "thumb_0.jpg")
+        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_bad", thumb_done=1, desc_done=0)
+
+        db.upsert_upload(self.conn, vod_id, 1, "Part 1", 0, 1800, file=v_dir / "part_1.mp4", thumb=v_dir / "thumb_1.jpg")
+        db.update_upload(self.conn, vod_id, 1, youtube_id="yt_good_1", thumb_done=1, desc_done=0)
+
+        db.upsert_upload(self.conn, vod_id, 2, "Part 2", 1800, 3600, file=v_dir / "part_2.mp4", thumb=v_dir / "thumb_2.jpg")
+        db.update_upload(self.conn, vod_id, 2, youtube_id="yt_good_2", thumb_done=1, desc_done=0)
+
+        updated_ids = []
+        def fake_update(video_id, meta):
+            if video_id == "yt_bad":
+                raise youtube.YouTubeError("400 Bad Request", status=400)
+            updated_ids.append(video_id)
+
+        with patch("k2y.youtube.update_snippet", side_effect=fake_update):
+            with self.assertLogs("k2y", level="WARNING") as cm:
+                pipeline.advance(self.conn, self.cfg, vod_id)
+
+        self.assertTrue(any("yt_bad" in msg and "400 Bad Request" in msg for msg in cm.output))
+        self.assertEqual(updated_ids, ["yt_good_1", "yt_good_2"])
+        ups = db.uploads(self.conn, vod_id)
+        self.assertTrue(all(u["desc_done"] == 1 for u in ups))
+        row = db.get_vod(self.conn, vod_id)
+        self.assertEqual(row["state"], "done")
+        self.assertEqual(row["attempts"], 0)
+
+    def test_refresh_metadata_legacy_plan_calls_gemini_and_updates_db_and_youtube(self):
+        vod_id = 994
+        vod = {
+            "id": vod_id,
+            "title": "Stream Legacy Refresh",
+            "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600,
+            "source_url": "http://kick.com/vod994.m3u8",
+            "category": "Gaming",
+            "is_live": False,
+        }
+        db.upsert_vod(self.conn, vod)
+        db.set_state(self.conn, vod_id, "done")
+        legacy_plan = [
+            {"start_s": 0, "end_s": 1800, "title": "Legacy Part 1", "description": "Old desc 1"},
+            {"start_s": 1800, "end_s": 3600, "title": "Legacy Part 2", "description": "Old desc 2"},
+        ]
+        db.save_plan(self.conn, vod_id, legacy_plan)
+        db.upsert_upload(self.conn, vod_id, 0, "Full VOD", 0, 3600)
+        db.update_upload(self.conn, vod_id, 0, youtube_id="yt_full", desc_done=1)
+        db.upsert_upload(self.conn, vod_id, 1, "Legacy Part 1", 0, 1800)
+        db.update_upload(self.conn, vod_id, 1, youtube_id="yt_p1", desc_done=1)
+        db.upsert_upload(self.conn, vod_id, 2, "Legacy Part 2", 1800, 3600)
+        db.update_upload(self.conn, vod_id, 2, youtube_id="yt_p2", desc_done=1)
+
+        fake_gemini_meta = {
+            "vod_hook": "VOD HOOK GEMINI",
+            "vod_tags": ["vodtag1", "vodtag2"],
+            "vod_hashtags": ["#vod1", "#vod2"],
+            "parts": [
+                {"idx": 1, "hook": "P1 HOOK GEMINI", "tags": ["p1tag"], "hashtags": ["#p1hash"]},
+                {"idx": 2, "hook": "P2 HOOK GEMINI", "tags": ["p2tag"], "hashtags": ["#p2hash"]},
+            ],
+        }
+
+        updated_snippets = []
+        def fake_update(video_id, meta):
+            updated_snippets.append((video_id, meta))
+
+        with patch("k2y.segment.fill_metadata", return_value=fake_gemini_meta) as mock_fill, \
+             patch("k2y.youtube.update_snippet", side_effect=fake_update):
+            pipeline.refresh_metadata(self.conn, self.cfg, vod_id)
+
+        mock_fill.assert_called_once()
+        updated_vod = db.get_vod(self.conn, vod_id)
+        plan_dict = json.loads(updated_vod["plan_json"])
+        self.assertEqual(plan_dict["vod_hook"], "VOD HOOK GEMINI")
+        self.assertEqual(plan_dict["parts"][0]["hook"], "P1 HOOK GEMINI")
+        self.assertEqual(plan_dict["parts"][1]["hook"], "P2 HOOK GEMINI")
+
+        self.assertEqual(len(updated_snippets), 3)
+        self.assertEqual(updated_snippets[0][0], "yt_full")
+        self.assertIn("VOD HOOK GEMINI", updated_snippets[0][1]["description"])
+        self.assertIn("#vod1", updated_snippets[0][1]["description"])
+        self.assertEqual(updated_snippets[1][0], "yt_p1")
+        self.assertIn("P1 HOOK GEMINI", updated_snippets[1][1]["description"])
+        self.assertEqual(updated_snippets[2][0], "yt_p2")
+        self.assertIn("P2 HOOK GEMINI", updated_snippets[2][1]["description"])
+
+    def _legacy_done_vod(self, vod_id, desc_done=(1, 1, 1)):
+        db.upsert_vod(self.conn, {
+            "id": vod_id, "title": "Legacy", "started_at": "2026-10-23T10:00:00Z",
+            "duration_s": 3600, "source_url": "u", "category": "Gaming", "is_live": False,
+        })
+        db.set_state(self.conn, vod_id, "done")
+        db.save_plan(self.conn, vod_id, [
+            {"start_s": 0, "end_s": 1800, "title": "A", "description": "desc A"},
+            {"start_s": 1800, "end_s": 3600, "title": "B", "description": "desc B"},
+        ])
+        for idx, (title, a, b) in enumerate([("Full", 0, 3600), ("A", 0, 1800), ("B", 1800, 3600)]):
+            db.upsert_upload(self.conn, vod_id, idx, title, a, b)
+            db.update_upload(self.conn, vod_id, idx, youtube_id=f"yt{idx}", desc_done=desc_done[idx])
+
+    def test_refresh_metadata_resumes_after_quota_and_calls_gemini_once(self):
+        self._legacy_done_vod(995)
+        # Gemini ignores the 1-based idx: results map by position.
+        meta = {"vod_hook": "H", "vod_tags": [], "vod_hashtags": [], "parts": [
+            {"idx": 0, "hook": "hook A"}, {"idx": 1, "hook": "hook B"}]}
+        sent, quota_hit = [], []
+        def quota_on_third(vid, m):
+            if vid == "yt2" and not quota_hit:
+                quota_hit.append(1)
+                raise youtube.QuotaExceeded("quota")
+            sent.append(vid)
+        with patch("k2y.segment.fill_metadata", return_value=meta) as fill, \
+             patch("k2y.youtube.update_snippet", side_effect=quota_on_third):
+            with self.assertRaises(youtube.QuotaExceeded):
+                pipeline.refresh_metadata(self.conn, self.cfg, 995)
+            pipeline.refresh_metadata(self.conn, self.cfg, 995)
+        fill.assert_called_once()
+        self.assertEqual(sent, ["yt0", "yt1", "yt2"])  # resumed, no resend of yt0/yt1
+        parts = json.loads(db.get_vod(self.conn, 995)["plan_json"])["parts"]
+        self.assertEqual([p["hook"] for p in parts], ["hook A", "hook B"])
+
+
+    def test_single_part_vod_hook_falls_back_to_part_text(self):
+        vod = {"id": 1, "category": "Gaming", "duration_s": 1200}
+        row = {"idx": 0, "title": "T", "youtube_id": "y"}
+        plan = {"parts": [{"start_s": 0, "end_s": 1200, "title": "P", "description": "Je teste un truc."}]}
+        meta = pipeline._row_meta(self.cfg, vod, row, [row], plan)
+        self.assertTrue(meta["description"].startswith("Je teste un truc."))
+        plan["parts"][0]["hook"] = "Le hook."
+        meta = pipeline._row_meta(self.cfg, vod, row, [row], plan)
+        self.assertTrue(meta["description"].startswith("Le hook."))
+
+
+    def test_final_pass_transient_youtube_error_propagates_and_resumes(self):
+        self._legacy_done_vod(996, desc_done=(0, 0, 0))
+        calls = []
+        def flaky(vid, m):
+            calls.append(vid)
+            if vid == "yt1" and calls.count("yt1") == 1:
+                raise youtube.YouTubeError("HTTP 503: backendError", status=503)
+        filled = {"vod_hook": "H", "parts": [{"idx": 1, "hook": "a"}, {"idx": 2, "hook": "b"}]}
+        with patch("k2y.youtube.update_snippet", side_effect=flaky), \
+             patch("k2y.segment.fill_metadata", return_value=filled):
+            with self.assertRaises(youtube.YouTubeError):
+                pipeline.refresh_metadata(self.conn, self.cfg, 996)
+            self.assertEqual(db.get_upload(self.conn, 996, 1)["desc_done"], 0)
+            self.assertEqual(pipeline.refresh_metadata(self.conn, self.cfg, 996), 0)
+        self.assertEqual(calls, ["yt0", "yt1", "yt1", "yt2"])
+        # Finished at the current layout: --all on a later day sends nothing.
+        with patch("k2y.youtube.update_snippet", side_effect=flaky) as again:
+            pipeline.refresh_metadata(self.conn, self.cfg, 996)
+            again.assert_not_called()
+
+
+    def test_permanent_only_for_real_refusals(self):
+        E = youtube.YouTubeError
+        self.assertTrue(pipeline._permanent(E("HTTP 400: invalidTags", 400, ("invalidTags",))))
+        self.assertTrue(pipeline._permanent(E("HTTP 404: videoNotFound", 404, ("videoNotFound",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 403: userRateLimitExceeded", 403, ("userRateLimitExceeded",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 403: rateLimitExceeded", 403, ("rateLimitExceeded",))))
+        self.assertFalse(pipeline._permanent(E("HTTP 503: backendError", 503, ("backendError",))))
+        self.assertFalse(pipeline._permanent(E("no status")))
+
+    def test_refresh_after_gemini_fill_resends_finished_vod(self):
+        # Finished by the pipeline (desc_ver set) with a legacy plan: the fill must go live.
+        self._legacy_done_vod(997)
+        plan = json.loads(db.get_vod(self.conn, 997)["plan_json"])
+        db.save_plan(self.conn, 997, {"parts": plan, "desc_ver": pipeline.DESC_VERSION})
+        filled = {"vod_hook": "H", "parts": [{"idx": 1, "hook": "a"}, {"idx": 2, "hook": "b"}]}
+        with patch("k2y.segment.fill_metadata", return_value=filled), \
+             patch("k2y.youtube.update_snippet") as upd:
+            pipeline.refresh_metadata(self.conn, self.cfg, 997)
+        self.assertEqual(upd.call_count, 3)
 
 
 if __name__ == "__main__":

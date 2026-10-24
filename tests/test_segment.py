@@ -25,6 +25,27 @@ class TestDocstring(unittest.TestCase):
 
 
 class TestRepair(unittest.TestCase):
+    def test_repair_preserves_thumb_text(self):
+        duration_s = 3600
+        parts = [
+            {"start_s": 0, "title": "P1", "thumb_text": "HOOK ONE", "description": "", "key_moments": []},
+            {"start_s": 1800, "title": "P2", "thumb_text": "HOOK TWO", "description": "", "key_moments": []},
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 1800], min_part_s=600)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["thumb_text"], "HOOK ONE")
+        self.assertEqual(res[1]["thumb_text"], "HOOK TWO")
+
+    def test_repair_preserves_thumb_text_when_merging_short_parts(self):
+        duration_s = 4000
+        parts = [
+            {"start_s": 0, "title": "Part 1", "thumb_text": "HOOK 1", "description": "D1", "key_moments": []},
+            {"start_s": 2000, "title": "Short Part", "thumb_text": "SHORT HOOK", "description": "DS", "key_moments": []},
+            {"start_s": 2200, "title": "Part 3", "thumb_text": "HOOK 3", "description": "D3", "key_moments": []},
+        ]
+        res = segment.repair(parts, duration_s=duration_s, allowed_s=[0, 2000, 2200], min_part_s=900)
+        self.assertEqual(len(res), 2)
+        self.assertTrue(any(p["thumb_text"] in ("HOOK 1", "SHORT HOOK", "HOOK 3") for p in res))
     def test_repair_short_vod_returns_one_part(self):
         duration_s = 18 * 60  # 18 minutes < 20 minutes
         parts = [
@@ -578,8 +599,13 @@ class TestMerge(unittest.TestCase):
             }
         ]
         res = segment.merge(chunks, duration_s=3600, models=["m1"])
-        self.assertEqual(len(res), 1)
-        self.assertEqual(res[0]["title"], "Stream khedma fel gueyla")
+        self.assertIn("parts", res)
+        self.assertEqual(len(res["parts"]), 1)
+        self.assertEqual(res["parts"][0]["title"], "Stream khedma fel gueyla")
+        # Check that MERGE_PROMPT contains the new rules
+        self.assertIn("Melek", segment.MERGE_PROMPT)
+        self.assertIn("thumb_text", segment.MERGE_PROMPT)
+        self.assertIn("vod_thumb_text", segment.MERGE_PROMPT)
 
 
 class TestPlan(unittest.TestCase):
@@ -621,11 +647,13 @@ class TestPlan(unittest.TestCase):
 
             self.assertTrue(any("Merge failed twice" in m and "Merge 2 failed" in m for m in cm.output))
             self.assertEqual(mock_merge.call_count, 2)
-            self.assertEqual(len(res), 1)
-            self.assertEqual(res[0]["start_s"], 0)
-            self.assertEqual(res[0]["end_s"], duration_s)
-            self.assertEqual(res[0]["title"], "Stream complet")
-            self.assertEqual(res[0]["description"], "")
+            self.assertIn("parts", res)
+            self.assertEqual(len(res["parts"]), 1)
+            self.assertEqual(res["parts"][0]["start_s"], 0)
+            self.assertEqual(res["parts"][0]["end_s"], duration_s)
+            self.assertEqual(res["parts"][0]["title"], "Stream complet")
+            self.assertEqual(res["parts"][0]["description"], "")
+            self.assertEqual(res.get("vod_thumb_text"), "")
             self.assertFalse(chunk_file.exists())
 
     @patch("k2y.segment.chunk_audio")
@@ -722,6 +750,99 @@ class TestPlan(unittest.TestCase):
                     model="gemini-3.8-flash",
                 )
             self.assertFalse(chunk_2_ran)
+
+
+class TestDescriptionsV2InSegment(unittest.TestCase):
+    def test_merge_schema_includes_descriptions_v2_fields(self):
+        props = segment.MERGE_SCHEMA["properties"]
+        self.assertIn("vod_hook", props)
+        self.assertIn("vod_tags", props)
+        self.assertIn("vod_hashtags", props)
+        self.assertIn("vod_thumb_text", props)
+        part_props = props["parts"]["items"]["properties"]
+        self.assertIn("hook", part_props)
+        self.assertIn("tags", part_props)
+        self.assertIn("hashtags", part_props)
+        self.assertIn("thumb_text", part_props)
+
+    def test_repair_preserves_hook_tags_hashtags(self):
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Intro",
+                "description": "Desc 1",
+                "thumb_text": "THUMB ONE",
+                "hook": "Hook 1",
+                "tags": ["tag1", "tag2"],
+                "hashtags": ["#hash1"],
+                "key_moments": [{"at_s": 100, "what": "Moment 1"}],
+            },
+            {
+                "start_s": 2000,
+                "title": "Middle",
+                "description": "Desc 2",
+                "thumb_text": "THUMB TWO",
+                "hook": "Hook 2",
+                "tags": ["tag3"],
+                "hashtags": ["#hash2"],
+                "key_moments": [{"at_s": 2100, "what": "Moment 2"}],
+            },
+        ]
+        repaired = segment.repair(parts, duration_s=4000, allowed_s=[0, 2000], min_part_s=900)
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(repaired[0]["hook"], "Hook 1")
+        self.assertEqual(repaired[0]["tags"], ["tag1", "tag2"])
+        self.assertEqual(repaired[0]["hashtags"], ["#hash1"])
+        self.assertEqual(repaired[1]["hook"], "Hook 2")
+        self.assertEqual(repaired[1]["tags"], ["tag3"])
+        self.assertEqual(repaired[1]["hashtags"], ["#hash2"])
+
+    def test_repair_short_part_merge_preserves_dominant_metadata(self):
+        parts = [
+            {
+                "start_s": 0,
+                "title": "Long part",
+                "description": "Desc long",
+                "thumb_text": "THUMB LONG",
+                "hook": "Hook long",
+                "tags": ["dominant"],
+                "hashtags": ["#dominant"],
+                "key_moments": [{"at_s": 100, "what": "M1"}],
+            },
+            {
+                "start_s": 3000,
+                "title": "Short part",
+                "description": "Desc short",
+                "thumb_text": "THUMB SHORT",
+                "hook": "Hook short",
+                "tags": ["minor"],
+                "hashtags": ["#minor"],
+                "key_moments": [{"at_s": 3100, "what": "M2"}],
+            },
+        ]
+        repaired = segment.repair(parts, duration_s=3600, allowed_s=[0, 3000], min_part_s=1200)
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["title"], "Long part")
+        self.assertEqual(repaired[0]["hook"], "Hook long")
+        self.assertEqual(repaired[0]["tags"], ["dominant"])
+        self.assertEqual(repaired[0]["hashtags"], ["#dominant"])
+
+    @patch("k2y.segment.generate")
+    def test_fill_metadata_calls_generate(self, mock_generate):
+        mock_generate.return_value = {
+            "vod_hook": "Full hook",
+            "vod_tags": ["tag1"],
+            "vod_hashtags": ["#vod"],
+            "parts": [
+                {"idx": 1, "hook": "Part 1 hook", "tags": ["p1"], "hashtags": ["#p1"]},
+            ],
+        }
+        parts = [{"title": "Part 1", "description": "Desc", "key_moments": []}]
+        res = segment.fill_metadata("Live Test", 3600, parts, ["m1"])
+        self.assertEqual(res["vod_hook"], "Full hook")
+        self.assertEqual(mock_generate.call_count, 1)
+        call_schema = mock_generate.call_args[0][1]
+        self.assertEqual(call_schema, segment.REFRESH_SCHEMA)
 
 
 if __name__ == "__main__":

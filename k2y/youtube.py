@@ -44,8 +44,12 @@ class QuotaExceeded(Exception):
 
 
 class YouTubeError(Exception):
-    """General YouTube API error."""
-    pass
+    """General YouTube API error. status is the HTTP code when there is one."""
+
+    def __init__(self, msg: str, status: int | None = None, reasons: tuple[str, ...] = ()):
+        super().__init__(msg)
+        self.status = status
+        self.reasons = reasons
 
 
 class ThumbnailsForbidden(Exception):
@@ -63,6 +67,7 @@ _RETRYABLE = (OSError, http.client.HTTPException)
 def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None) -> Exception:
     code = e.code
     reason = str(getattr(e, "reason", "HTTPError"))
+    parsed_reasons: tuple[str, ...] = ()
     msg = ""
     try:
         raw = raw_body if raw_body is not None else e.read().decode("utf-8", errors="replace")
@@ -89,6 +94,10 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
                         for r in reasons:
                             if r in QUOTA_REASONS:
                                 return QuotaExceeded(f"{r}: {msg}")
+                    # 401 from the Data API, or a token without the upload scope: re-auth, don't retry.
+                    if code == 401 or "insufficientPermissions" in reasons:
+                        return AuthRequired(AUTH_REQUIRED_MSG)
+                    parsed_reasons = tuple(r for r in reasons if isinstance(r, str))
                     if reasons:
                         reason = ", ".join(reasons)
                 elif isinstance(err, str):
@@ -102,7 +111,7 @@ def _parse_youtube_error(e: urllib.error.HTTPError, raw_body: str | None = None)
     err_str = f"HTTP {code}: {reason}"
     if msg:
         err_str += f" - {msg}"
-    return YouTubeError(err_str)
+    return YouTubeError(err_str, status=code, reasons=parsed_reasons)
 
 
 def _load_client_secret() -> tuple[str, str, str, str]:
@@ -350,7 +359,7 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _init_upload_session(total_size: int, meta: dict) -> str:
+def build_snippet(meta: dict) -> dict[str, object]:
     title = str(meta.get("title", "")).replace("<", "").replace(">", "")[:100]
     description = str(meta.get("description", "")).replace("<", "").replace(">", "")
     description = _truncate_utf8(description, 5000)
@@ -359,12 +368,41 @@ def _init_upload_session(total_size: int, meta: dict) -> str:
         "title": title,
         "description": description,
         "categoryId": str(meta.get("category_id", meta.get("categoryId", "22"))),
-        "defaultLanguage": "ar",
+        "defaultLanguage": "fr",  # titles and descriptions are French
         "defaultAudioLanguage": "ar",
     }
     if "tags" in meta and meta["tags"] is not None:
         snippet["tags"] = list(meta["tags"])
+    return snippet
 
+
+def update_snippet(video_id: str, meta: dict) -> dict:
+    snippet = build_snippet(meta)
+    body = {
+        "id": video_id,
+        "snippet": snippet,
+    }
+    body_bytes = json.dumps(body).encode("utf-8")
+    url = "https://www.googleapis.com/youtube/v3/videos?part=snippet"
+
+    def _put(tok: str) -> dict:
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method="PUT")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read().decode("utf-8")
+            return json.loads(data) if data else {}
+
+    try:
+        return _authed(_put)
+    except urllib.error.HTTPError as e:
+        raise _parse_youtube_error(e)
+
+
+def _init_upload_session(total_size: int, meta: dict) -> str:
+    snippet = build_snippet(meta)
     body = {
         "snippet": snippet,
         "status": {
