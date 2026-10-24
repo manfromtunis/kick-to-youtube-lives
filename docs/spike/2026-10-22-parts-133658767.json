@@ -1,0 +1,592 @@
+{
+  "duration_s": 12044,
+  "merge_model": "gemini-3-flash-preview",
+  "chunks": [
+    {
+      "start_s": 0,
+      "summary_en": "The streamer welcomes his audience while performing technical adjustments for the livestream and discussing work-related topics. He shares insights about permanent labor contracts (CDI) and evaluates the performance of various open-source AI models.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 0,
+          "topic": "Stream setup and music intro"
+        },
+        {
+          "at_s": 241,
+          "topic": "Greetings and chat engagement"
+        },
+        {
+          "at_s": 555,
+          "topic": "Discussion on giveaways and settings"
+        },
+        {
+          "at_s": 611,
+          "topic": "Explaining permanent work contracts (CDI)"
+        },
+        {
+          "at_s": 801,
+          "topic": "Planning blog release and web tasks"
+        },
+        {
+          "at_s": 1008,
+          "topic": "Reviewing open-source AI model features"
+        },
+        {
+          "at_s": 1163,
+          "topic": "Final technical check and music transition"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 32023
+    },
+    {
+      "start_s": 1200,
+      "summary_en": "The streamer manages various technical projects and marketing campaigns, specifically discussing clipping rewards and budget. He compares different cloud and AI tools like Xfield and Kai.ai while explaining his current development roadmap and VPS setup.",
+      "activity": "coding/building",
+      "segments": [
+        {
+          "at_s": 1200,
+          "topic": "Intro and music while starting stream"
+        },
+        {
+          "at_s": 1305,
+          "topic": "Explaining clipping campaigns and rewards"
+        },
+        {
+          "at_s": 1470,
+          "topic": "Budgeting and view targets for campaign"
+        },
+        {
+          "at_s": 1575,
+          "topic": "Comparing Xfield and Atlas Cloud tools"
+        },
+        {
+          "at_s": 1680,
+          "topic": "Bakchich design system migration details"
+        },
+        {
+          "at_s": 1925,
+          "topic": "OraStack updates and bundle system development"
+        },
+        {
+          "at_s": 2130,
+          "topic": "Evaluating Kai.ai as an alternative tool"
+        },
+        {
+          "at_s": 2330,
+          "topic": "Managing agents and VPS server setup"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 31329
+    },
+    {
+      "start_s": 2400,
+      "summary_en": "The streamer provides a deep dive into his automated development workflow, showcasing how he uses multiple AI agents to handle project management, code releases, and bug fixes. He explains the technical nuances of setting merge permissions for agents and discusses broader tech topics like server scaling and AI video generation tools with his audience.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 2400,
+          "topic": "Intro music"
+        },
+        {
+          "at_s": 2418,
+          "topic": "Organizing AI agents for development"
+        },
+        {
+          "at_s": 2552,
+          "topic": "Managing software releases with agents"
+        },
+        {
+          "at_s": 2602,
+          "topic": "Handling AI context for features"
+        },
+        {
+          "at_s": 2670,
+          "topic": "Automated deployment and monitoring"
+        },
+        {
+          "at_s": 2743,
+          "topic": "Engineering wiki and incident tracking"
+        },
+        {
+          "at_s": 2879,
+          "topic": "Automating bug fixes via Sentry"
+        },
+        {
+          "at_s": 3014,
+          "topic": "Agent merge policies and permissions"
+        },
+        {
+          "at_s": 3180,
+          "topic": "Code reviews with LLMs"
+        },
+        {
+          "at_s": 3248,
+          "topic": "Streamer's plans for content creation"
+        },
+        {
+          "at_s": 3315,
+          "topic": "Chatting about server load and caching"
+        },
+        {
+          "at_s": 3410,
+          "topic": "Discussion on AI video generation"
+        },
+        {
+          "at_s": 3502,
+          "topic": "Brief break for food"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 31962
+    },
+    {
+      "start_s": 3600,
+      "summary_en": "The streamer eats a meal while discussing the best hardware and software configurations for AI video generation and local LLM execution. He reviews a video comparing the performance and cost-effectiveness of various AI models like Claude and DeepSeek for coding.",
+      "activity": "reacting to a video",
+      "segments": [
+        {
+          "at_s": 3600,
+          "topic": "Music and meal preparation"
+        },
+        {
+          "at_s": 3761,
+          "topic": "PC specs for local AI"
+        },
+        {
+          "at_s": 3858,
+          "topic": "AI video generation tools"
+        },
+        {
+          "at_s": 3932,
+          "topic": "Setting up local AI environments"
+        },
+        {
+          "at_s": 4016,
+          "topic": "Comparing Claude Opus and local models"
+        },
+        {
+          "at_s": 4199,
+          "topic": "DeepSeek vs Claude video reaction"
+        },
+        {
+          "at_s": 4505,
+          "topic": "Analyzing software engineering benchmarks"
+        },
+        {
+          "at_s": 4790,
+          "topic": "Eating and brief chat interaction"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 32078
+    },
+    {
+      "start_s": 4800,
+      "summary_en": "The streamer explores recent developments in AI, focusing on models like DeepSeek and Quen while comparing their efficiency and costs. He discusses the high hardware barriers for local deployment, specifically RAM requirements, and the market for private AI solutions.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 4800,
+          "topic": "Introduction and initial casual chat"
+        },
+        {
+          "at_s": 4824,
+          "topic": "DeepSeek performance versus other models"
+        },
+        {
+          "at_s": 4961,
+          "topic": "Casual discussion about travel to Paris"
+        },
+        {
+          "at_s": 5035,
+          "topic": "AI model cost efficiency analysis"
+        },
+        {
+          "at_s": 5141,
+          "topic": "Casual banter while exercising"
+        },
+        {
+          "at_s": 5269,
+          "topic": "Quen AI architecture and parameters"
+        },
+        {
+          "at_s": 5359,
+          "topic": "Running DeepSeek models locally"
+        },
+        {
+          "at_s": 5442,
+          "topic": "RAM requirements for large models"
+        },
+        {
+          "at_s": 5608,
+          "topic": "Renting versus buying hardware for AI"
+        },
+        {
+          "at_s": 5715,
+          "topic": "Business opportunities for private AI consulting"
+        },
+        {
+          "at_s": 5881,
+          "topic": "Open WebUI and server rental costs"
+        },
+        {
+          "at_s": 5971,
+          "topic": "Subscriber shoutouts and stream updates"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 33344
+    },
+    {
+      "start_s": 6000,
+      "summary_en": "The streamer begins by configuring his Kick stream settings and troubleshooting audio and overlay issues on his Mac. He then transitions to reacting to a video by The Primagen regarding the black market for AI tokens in China and the technical bypasses used. Throughout the video, he interacts with his chat in Tunisian Darija, answering technical questions and discussing coding practices.",
+      "activity": "reacting to a video",
+      "segments": [
+        {
+          "at_s": 6000,
+          "topic": "Configuring Kick dashboard and stream widgets"
+        },
+        {
+          "at_s": 6162,
+          "topic": "Setting up Botrix overlay in OBS"
+        },
+        {
+          "at_s": 6275,
+          "topic": "Troubleshooting Mac OS screen and audio"
+        },
+        {
+          "at_s": 6430,
+          "topic": "Performing database migrations and server setup"
+        },
+        {
+          "at_s": 6522,
+          "topic": "Reacting to Primagen's token black market video"
+        },
+        {
+          "at_s": 6735,
+          "topic": "Interacting with chat while watching video"
+        },
+        {
+          "at_s": 6905,
+          "topic": "Analyzing AI access bypasses in China"
+        },
+        {
+          "at_s": 7000,
+          "topic": "Recommending coding and system design resources"
+        },
+        {
+          "at_s": 7104,
+          "topic": "Video discussion on browser fingerprints and SMS"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 31735
+    },
+    {
+      "start_s": 7200,
+      "summary_en": "The streamer starts by exercising on a treadmill while chatting with his audience and reacting to a video about identity verification fraud and AI-generated IDs. He then transitions into a technical discussion about AI orchestration tools and coding agents like Claude. The second half of the stream features live coding and managing software releases for his personal projects while explaining development concepts to the chat.",
+      "activity": "coding/building",
+      "segments": [
+        {
+          "at_s": 7200,
+          "topic": "Talking about exercise routine and treadmill"
+        },
+        {
+          "at_s": 7233,
+          "topic": "Reacting to video about identity verification"
+        },
+        {
+          "at_s": 7311,
+          "topic": "Discussing treadmill heating issues while walking"
+        },
+        {
+          "at_s": 7342,
+          "topic": "Video reaction about crypto scams and KYC"
+        },
+        {
+          "at_s": 7470,
+          "topic": "Chatting with audience about Claude AI"
+        },
+        {
+          "at_s": 7610,
+          "topic": "Video about black market for identities"
+        },
+        {
+          "at_s": 7667,
+          "topic": "Chatting about treadmill maintenance and exercise"
+        },
+        {
+          "at_s": 7762,
+          "topic": "Comparing AI orchestration and coding agents"
+        },
+        {
+          "at_s": 7980,
+          "topic": "Live coding and updating personal projects"
+        },
+        {
+          "at_s": 8142,
+          "topic": "Talking about health supplements and AI"
+        },
+        {
+          "at_s": 8198,
+          "topic": "Managing software releases and coding tasks"
+        },
+        {
+          "at_s": 8350,
+          "topic": "Explaining design systems to the audience"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 32709
+    },
+    {
+      "start_s": 8400,
+      "summary_en": "The streamer explains the concepts of design systems and demonstrates the component library he developed for his project, Baqshish. He shows off creative scroll animations on a landing page and discusses the technical stack behind it. Later, he reacts to a video about Claude Projects, comparing its orchestration features to his own custom setup involving a high-RAM VPS and multiple AI agents.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 8400,
+          "topic": "Exploring design systems and Material Design"
+        },
+        {
+          "at_s": 8538,
+          "topic": "Presenting Baqshish brand guidelines and components"
+        },
+        {
+          "at_s": 8660,
+          "topic": "Reviewing landing page animations and tech stack"
+        },
+        {
+          "at_s": 8882,
+          "topic": "Reacting to Claude Projects secret features video"
+        },
+        {
+          "at_s": 9060,
+          "topic": "Detailed breakdown of personal VPS workflow"
+        },
+        {
+          "at_s": 9348,
+          "topic": "Discussion on scaling AI agent workflows"
+        },
+        {
+          "at_s": 9525,
+          "topic": "Persistence and memory in Claude Projects sessions"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 32126
+    },
+    {
+      "start_s": 9600,
+      "summary_en": "The streamer demonstrates the new Claude AI projects feature, comparing different model configurations like the coordinator and thread models. Throughout the session, he interacts with his audience, discusses technical benchmarks for AI-generated code, and explores a community project where Claude built a game engine from scratch. The video mixes technical tutorials with casual chat interaction and a humorous look at the streamer's browser history.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 9600,
+          "topic": "Comparing Claude projects versus sessions"
+        },
+        {
+          "at_s": 9624,
+          "topic": "Navigating the Claude project beta interface"
+        },
+        {
+          "at_s": 9689,
+          "topic": "Configuring coordinator and thread models"
+        },
+        {
+          "at_s": 9830,
+          "topic": "Chat interaction and technical troubleshooting"
+        },
+        {
+          "at_s": 10080,
+          "topic": "Exploring background sessions and Gemini comparison"
+        },
+        {
+          "at_s": 10200,
+          "topic": "Linux server management and UI customization"
+        },
+        {
+          "at_s": 10330,
+          "topic": "Humorous review of browser search history"
+        },
+        {
+          "at_s": 10440,
+          "topic": "Discussing Karpathy's Loop and productivity"
+        },
+        {
+          "at_s": 10500,
+          "topic": "Reacting to Claude benchmark videos"
+        },
+        {
+          "at_s": 10700,
+          "topic": "Deep dive into Claude-generated game engine"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 31473
+    },
+    {
+      "start_s": 10800,
+      "summary_en": "The streamer reacts to a video about an AI model that cloned the game EA Skate through a process of hill climbing and reward mechanisms. He explains the technical aspects of training models with LLMs as judges before transitioning to the 'Boat' tool for virtual machines. The session ends with a live giveaway where he selects a winner for a Gemini Pro subscription.",
+      "activity": "just chatting",
+      "segments": [
+        {
+          "at_s": 10800,
+          "topic": "Reacting to AI-generated EA Skate clone"
+        },
+        {
+          "at_s": 10944,
+          "topic": "Explaining reward mechanisms in AI training"
+        },
+        {
+          "at_s": 11143,
+          "topic": "Comparing AI game frames using LLMs"
+        },
+        {
+          "at_s": 11430,
+          "topic": "Exploring Boat tool and cloud VMs"
+        },
+        {
+          "at_s": 11618,
+          "topic": "Transitioning to the subscriber giveaway"
+        },
+        {
+          "at_s": 11758,
+          "topic": "Selection process for giveaway winner"
+        },
+        {
+          "at_s": 11948,
+          "topic": "Announcing giveaway winner and closing"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 31728
+    },
+    {
+      "start_s": 12000,
+      "summary_en": "The streamer greets his audience and mentions transitioning to other platforms like Gomez and Redcha. He wraps up the session by thanking the viewers for their support and wishing them well before concluding the stream.",
+      "activity": "outro",
+      "segments": [
+        {
+          "at_s": 12000,
+          "topic": "Initial greeting and platform transition"
+        },
+        {
+          "at_s": 12029,
+          "topic": "Final thanks and farewell to viewers"
+        }
+      ],
+      "model": "gemini-3-flash-preview",
+      "tokens": 2390
+    }
+  ],
+  "parts": [
+    {
+      "start_s": 0,
+      "title": "Les contrats CDI & Plan de clipping",
+      "description": "Introduction du stream avec une discussion sur le fonctionnement des contrats CDI et la mise en place d'une campagne de clipping pour les réseaux sociaux.",
+      "summary_en": "The streamer discusses permanent work contracts (CDI) and outlines his marketing strategy, including budget and rewards for content clipping.",
+      "key_moments": [
+        {
+          "at_s": 611,
+          "what": "Explication sur les contrats de travail CDI"
+        },
+        {
+          "at_s": 1305,
+          "what": "Détails de la campagne de clipping et récompenses"
+        },
+        {
+          "at_s": 1680,
+          "what": "Migration du design system de Bakchich"
+        }
+      ],
+      "end_s": 2400
+    },
+    {
+      "start_s": 2400,
+      "title": "Automating Dev avec les agents AI",
+      "description": "Plongée technique dans l'automatisation du développement logiciel via des agents IA, incluant le monitoring et la gestion des bugs.",
+      "summary_en": "A deep dive into automated development workflows, showing how AI agents handle software releases, bug fixes via Sentry, and code reviews.",
+      "key_moments": [
+        {
+          "at_s": 2418,
+          "what": "Organisation des agents AI pour le développement"
+        },
+        {
+          "at_s": 2879,
+          "what": "Automatisation des corrections de bugs avec Sentry"
+        },
+        {
+          "at_s": 4199,
+          "what": "Réaction au comparatif DeepSeek vs Claude"
+        }
+      ],
+      "end_s": 4800
+    },
+    {
+      "start_s": 4800,
+      "title": "DeepSeek local & Marché noir AI",
+      "description": "Analyse de la rentabilité du hardware pour l'IA locale et réaction sur le trafic de tokens en Chine.",
+      "summary_en": "Analysis of running DeepSeek models locally, hardware costs, and a reaction to Primagen's video about the AI token black market in China.",
+      "key_moments": [
+        {
+          "at_s": 5442,
+          "what": "Configuration RAM requise pour les modèles locaux"
+        },
+        {
+          "at_s": 6522,
+          "what": "Réaction au marché noir des tokens AI en Chine"
+        },
+        {
+          "at_s": 7000,
+          "what": "Ressources recommandées pour le System Design"
+        }
+      ],
+      "end_s": 7233
+    },
+    {
+      "start_s": 7233,
+      "title": "Fraude KYC & Baqshish Design System",
+      "description": "Discussion sur les arnaques d'identité numérique suivie d'une présentation technique du projet Baqshish.",
+      "summary_en": "A shift from reacting to identity verification fraud videos to a technical presentation of the Baqshish landing page and design system.",
+      "key_moments": [
+        {
+          "at_s": 7233,
+          "what": "Réaction aux fraudes de vérification d'identité"
+        },
+        {
+          "at_s": 8538,
+          "what": "Présentation des composants de Baqshish"
+        },
+        {
+          "at_s": 9060,
+          "what": "Breakdown du workflow personnel sur VPS"
+        }
+      ],
+      "end_s": 9600
+    },
+    {
+      "start_s": 9600,
+      "title": "Claude Projects & Giveaway Final",
+      "description": "Test de la beta de Claude Projects et conclusion du stream avec le tirage au sort du gagnant Gemini Pro.",
+      "summary_en": "Testing the new Claude AI projects interface and features, followed by a reaction to an AI-generated game clone and a subscriber giveaway.",
+      "key_moments": [
+        {
+          "at_s": 9624,
+          "what": "Navigation dans l'interface beta de Claude Projects"
+        },
+        {
+          "at_s": 10800,
+          "what": "Réaction au clone de EA Skate généré par IA"
+        },
+        {
+          "at_s": 11758,
+          "what": "Sélection du gagnant du giveaway Gemini Pro"
+        }
+      ],
+      "end_s": 12044
+    }
+  ]
+}
