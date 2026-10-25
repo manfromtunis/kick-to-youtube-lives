@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>k2y Setup Wizard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>k2y Setup Wizard</h1>
+      <p>Configure Kick to YouTube auto-upload pipeline</p>
+      <span class="local-badge" id="local-badge">Runs locally on 127.0.0.1</span>
+    </header>
+
+    <div class="wizard">
+      <div class="sidebar" id="sidebar">
+        <div class="step-item active" data-step="1"><div class="step-number">1</div><span>Intro &amp; Checks</span></div>
+        <div class="step-item" data-step="2"><div class="step-number">2</div><span>Credentials</span></div>
+        <div class="step-item" data-step="3"><div class="step-number">3</div><span>Reaction Images</span></div>
+        <div class="step-item" data-step="4"><div class="step-number">4</div><span>Channel &amp; Settings</span></div>
+        <div class="step-item" data-step="5"><div class="step-number">5</div><span>YouTube Auth</span></div>
+        <div class="step-item" data-step="6"><div class="step-number">6</div><span>Timer</span></div>
+        <div class="step-item" data-step="7"><div class="step-number">7</div><span>Done</span></div>
+      </div>
+
+      <div class="content">
+        <div class="step-content active" data-step="1">
+          <h2>Before you start</h2>
+          <p class="subtitle">k2y needs Python, ffmpeg, a Google OAuth client and a Gemini API key.</p>
+          <div class="info-box">
+            <p>This wizard writes only to your local config folder. Nothing leaves your machine except the Google API calls you authorize.</p>
+          </div>
+          <div class="section">
+            <div class="section-title">Checks</div>
+            <div class="check-list" id="check-list"></div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary spacer" id="to-credentials">Next: Credentials &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="2">
+          <h2>Credentials</h2>
+          <p class="subtitle">Upload your Google OAuth client and Gemini API key.</p>
+          <div class="info-box">
+            <p><strong>Need help?</strong> See <code>docs/SETUP.md</code> (Step 4 for the OAuth client, Step 5 for the Gemini key).</p>
+          </div>
+
+          <div class="section">
+            <div class="section-title">1. Google OAuth client (required)</div>
+            <p class="form-hint">Download as a "Desktop app" from Google Cloud Console.</p>
+            <div class="upload-zone" id="client-zone">
+              <div class="upload-icon">&#128193;</div>
+              <div class="upload-text">Drop client_secret.json here</div>
+              <div class="upload-hint">or click to browse</div>
+            </div>
+            <input type="file" id="client-file" accept=".json,application/json" hidden>
+            <div class="file-list" id="client-state"></div>
+            <div class="error-text" id="client-error"></div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">2. Gemini API key (required)</div>
+            <p class="form-hint">From Google AI Studio, with billing enabled.</p>
+            <div class="form-group">
+              <label class="form-label">Paste API key</label>
+              <input type="password" class="form-input" id="gemini-input" placeholder="AIza..." autocomplete="off">
+              <div class="form-hint">Or drop a file containing the key below.</div>
+            </div>
+            <div class="upload-zone" id="gemini-zone" style="padding: 20px;">
+              <div class="upload-text" style="font-size: 14px;">Drop gemini.key or .txt here</div>
+            </div>
+            <input type="file" id="gemini-file" hidden>
+            <div class="file-list" id="gemini-state"></div>
+            <div class="error-text" id="gemini-error"></div>
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-secondary" data-back="1">&larr; Back</button>
+            <button class="btn btn-primary spacer" id="to-faces">Next: Reaction Images &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="3">
+          <h2>Reaction images</h2>
+          <p class="subtitle">Optional photos used to build thumbnails.</p>
+          <div class="info-box">
+            <p>If you skip this, k2y uses the images in <code>assets/faces/</code> from the repository. Your uploads go to the config folder and take precedence.</p>
+          </div>
+          <div class="section">
+            <div class="section-title">Upload your images</div>
+            <p class="form-hint">JPG, PNG or WebP. You can select several files at once.</p>
+            <div class="upload-zone" id="faces-zone">
+              <div class="upload-icon">&#128444;</div>
+              <div class="upload-text">Drop images here</div>
+              <div class="upload-hint">or click to browse</div>
+            </div>
+            <input type="file" id="faces-file" accept="image/jpeg,image/png,image/webp" multiple hidden>
+            <div class="image-grid" id="faces-grid"></div>
+            <div class="error-text" id="faces-error"></div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary" data-back="2">&larr; Back</button>
+            <button class="btn btn-secondary" id="skip-faces">Skip</button>
+            <button class="btn btn-primary spacer" id="to-config">Next: Channel &amp; Settings &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="4">
+          <h2>Channel and settings</h2>
+          <p class="subtitle">Configure your Kick channel and processing options.</p>
+          <div class="form-group">
+            <label class="form-label" for="channel">Kick channel slug *</label>
+            <input type="text" class="form-input" id="channel" placeholder="e.g. randomguy42" autocomplete="off">
+            <div class="form-hint">From kick.com/your-channel-slug</div>
+            <div class="error-text" id="channel-error"></div>
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label" for="since">Start date</label>
+              <input type="date" class="form-input" id="since">
+              <div class="form-hint">Only process VODs from this date. Empty = today.</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="min-part">Min part length (minutes) *</label>
+              <input type="number" class="form-input" id="min-part" min="1" value="15">
+              <div class="form-hint">Shorter parts are merged.</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="work-dir">Work folder *</label>
+            <input type="text" class="form-input" id="work-dir">
+            <div class="form-hint">Downloads, database and logs.</div>
+            <div class="error-text" id="config-error"></div>
+          </div>
+          <div class="section">
+            <div class="section-title">Description links (optional)</div>
+            <p class="form-hint" style="margin-bottom: 12px;">Added to the bottom of every YouTube description.</p>
+            <div id="links"></div>
+            <button class="btn btn-secondary" id="add-link" style="font-size: 13px;">+ Add link</button>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary" data-back="3">&larr; Back</button>
+            <button class="btn btn-primary spacer" id="to-auth">Next: YouTube Auth &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="5">
+          <h2>YouTube authorization</h2>
+          <p class="subtitle">Connect the Google account that owns your YouTube channel.</p>
+          <div class="auth-box">
+            <div class="auth-icon">&#128272;</div>
+            <h3 style="color: #fff; margin-bottom: 10px;" id="auth-title">Ready to authorize</h3>
+            <p style="color: #aaa; margin-bottom: 30px; max-width: 430px; margin-left: auto; margin-right: auto;" id="auth-copy">
+              A browser window opens. Choose the Google account that owns your YouTube channel.
+              For a Brand Account, pick it in the account chooser.
+            </p>
+            <button class="btn btn-primary" id="auth-btn">Open browser for authorization</button>
+            <div class="error-text" id="auth-error"></div>
+            <div class="ok-text" id="auth-ok"></div>
+          </div>
+          <div class="info-box warn" style="margin-top: 20px;">
+            <p><strong>OAuth testing mode:</strong> if your Google Cloud app is in Testing mode, the token expires after 7 days. Re-run this step weekly or publish the app.</p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary" data-back="4">&larr; Back</button>
+            <button class="btn btn-primary spacer" id="to-timer">Next: Timer &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="6">
+          <h2>Schedule timer</h2>
+          <p class="subtitle">Run k2y every 10 minutes automatically.</p>
+          <div class="info-box">
+            <p>Your computer must be on and awake for the timer to run. Nothing runs in the cloud.</p>
+          </div>
+          <div class="section">
+            <div class="checkbox-group">
+              <input type="checkbox" id="install-timer" checked>
+              <label for="install-timer" style="color: #fff; cursor: pointer;">Install the timer (Task Scheduler on Windows, crontab line on Linux/macOS)</label>
+            </div>
+            <div class="form-hint" style="margin-top: 10px;">Every 10 minutes: discovers new VODs and processes unfinished ones.</div>
+          </div>
+          <div class="section">
+            <div class="section-title">Result</div>
+            <div class="mono" id="timer-out">Not installed yet.</div>
+            <div class="error-text" id="timer-error"></div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary" data-back="5">&larr; Back</button>
+            <button class="btn btn-primary spacer" id="finish">Finish setup &rarr;</button>
+          </div>
+        </div>
+
+        <div class="step-content" data-step="7">
+          <div class="success-icon">&#9989;</div>
+          <h2 style="text-align: center;">Setup complete</h2>
+          <p class="subtitle" style="text-align: center;">k2y is ready.</p>
+          <div class="section" style="max-width: 540px; margin: 0 auto 24px;" id="summary"></div>
+          <div class="info-box" style="max-width: 540px; margin: 0 auto 24px;">
+            <p><strong>Next steps</strong><br>
+              1. <code>py -m k2y status</code> checks the setup.<br>
+              2. <code>py -m k2y backfill &lt;vod_id&gt;</code> then <code>py -m k2y run</code> tests one VOD.<br>
+              3. Uploads appear in YouTube Studio as private. Publish them manually.</p>
+          </div>
+          <div class="section" style="max-width: 540px; margin: 0 auto;">
+            <div class="section-title">Config folder</div>
+            <div class="mono" id="done-config"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      k2y web wizard. Processing is local. No data is sent anywhere except the Google APIs you authorize.
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

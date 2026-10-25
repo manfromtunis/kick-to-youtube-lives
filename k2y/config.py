@@ -72,20 +72,20 @@ def load() -> Config:
     return Config(**filtered)
 
 
-def secret_path(name: str) -> Path:
+def secret_path(name: str, config_dir: Path | None = None) -> Path:
     """name: 'gemini.key' | 'client_secret.json' | 'youtube_token.json'."""
-    return CONFIG_DIR / name
+    return (config_dir or CONFIG_DIR) / name
 
 
-def read_secret(name: str) -> str:
-    p = secret_path(name)
+def read_secret(name: str, config_dir: Path | None = None) -> str:
+    p = secret_path(name, config_dir)
     if not p.exists():
-        raise MissingSecret(f"missing secret {p} (see docs/superpowers/specs/2026-10-22-vod-pipeline-design.md section 5)")
+        raise MissingSecret(f"missing secret {p} (see docs/SETUP.md)")
     return p.read_text(encoding="utf-8-sig").strip()
 
 
-def write_secret(name: str, text: str) -> None:
-    p = secret_path(name)
+def write_secret(name: str, text: str, config_dir: Path | None = None) -> None:
+    p = secret_path(name, config_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     temp_file = p.parent / f"{name}.{os.getpid()}.tmp"
     fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
