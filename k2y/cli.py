@@ -4,16 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
 import re
-import shlex
 import shutil
-import subprocess
 import sys
 from typing import Any
 
-from . import config, db, kick, pipeline, segment, youtube
+from . import config, db, kick, pipeline, segment, timer, youtube
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("k2y")
@@ -51,10 +48,6 @@ def _vod_or_err(cfg: config.Config, vod_id: int):
         _print_err(f"VOD {vod_id} not found in database")
         return conn, None
     return conn, vod
-
-
-def _is_windows() -> bool:
-    return os.name == "nt"
 
 
 def _with_lock(cfg: config.Config, action):
@@ -104,11 +97,21 @@ def main(argv: list[str] | None = None) -> int:
     p_status = subparsers.add_parser("status", help="Show pipeline status")
     p_status.add_argument("--json", action="store_true", help="Output as JSON")
 
+    p_prepare = subparsers.add_parser(
+        "prepare",
+        help="Download, plan, cut, and generate thumbnails/descriptions without uploading to YouTube",
+    )
+    p_prepare.add_argument("vod_id", type=int, help="Kick VOD ID")
+    p_prepare.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate files/plan even if they exist",
+    )
+    # plan
     # plan
     p_plan = subparsers.add_parser("plan", help="Plan segmentation without uploading")
     p_plan.add_argument("vod_id", type=int, help="Kick VOD ID")
-
-    # retry
+    p_plan = [p for p in []]  # placeholder
     p_retry = subparsers.add_parser("retry", help="Retry a failed or errored VOD")
     p_retry.add_argument("vod_id", type=int, help="Kick VOD ID")
     p_retry.add_argument(
@@ -144,6 +147,29 @@ def main(argv: list[str] | None = None) -> int:
         help="Install Task Scheduler task on Windows or print crontab line",
     )
 
+    # setup-web
+    p_web = subparsers.add_parser(
+        "setup-web",
+        help="Open a local web UI wizard for first-time setup",
+    )
+    p_web.add_argument(
+        "--config-dir",
+        type=Path,
+        default=None,
+        help="Use another configuration folder (default: ~/.config/k2y)",
+    )
+    p_web.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to listen on (default: 8765)",
+    )
+    p_web.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the browser automatically",
+    )
+
     # refresh-metadata
     p_refresh = subparsers.add_parser(
         "refresh-metadata",
@@ -158,6 +184,26 @@ def main(argv: list[str] | None = None) -> int:
         if sys.stderr is not None:
             parser.print_help(file=sys.stderr)
         return 2
+
+    if args.command == "setup":
+        from . import wizard
+        return wizard.run_setup(
+            config_dir=args.config_dir,
+            repo_dir=REPO_DIR,
+            do_auth=not args.no_auth,
+            do_timer=not args.no_timer,
+        )
+
+    if args.command == "setup-web":
+        from . import webwizard
+        webwizard.run_webwizard(
+            config_dir=args.config_dir,
+            repo_dir=REPO_DIR,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+        return 0
+
 
     try:
         try:
@@ -176,6 +222,101 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "run":
             return pipeline.run(cfg)
+
+        elif args.command == "prepare":
+            def do_prepare():
+                conn, vod = _vod_or_err(cfg, args.vod_id)
+                if not vod:
+                    return 1
+                if vod["state"] in ("done", "skipped"):
+                    _print_err(f"Cannot prepare VOD {args.vod_id}: state is {vod['state']}")
+                    return 1
+                ups = db.uploads(conn, args.vod_id)
+                if any(u["youtube_id"] or u["upload_session"] for u in ups):
+                    _print_err(f"Cannot prepare VOD {args.vod_id}: upload in progress or completed")
+                    return 1
+                if args.force:
+                    if vod["plan_json"]:
+                        with conn:
+                            conn.execute("UPDATE vods SET plan_json = NULL, updated_at = ? WHERE id = ?", (db._now_iso(), args.vod_id))
+                    for u in ups:
+                        with conn:
+                            conn.execute("DELETE FROM uploads WHERE vod_id = ? AND idx = ?", (args.vod_id, u["idx"]))
+                    db.reset(conn, args.vod_id, "new")
+                    vod = db.get_vod(conn, args.vod_id)
+                else:
+                    if vod["state"] == "failed":
+                        db.reset(conn, args.vod_id, "new")
+                        vod = db.get_vod(conn, args.vod_id)
+                    elif vod["state"] in ("cut", "uploading"):
+                        with conn:
+                            conn.execute("UPDATE vods SET state = 'cut', updated_at = ? WHERE id = ?", (db._now_iso(), args.vod_id))
+                try:
+                    for _ in range(100):
+                        v = db.get_vod(conn, args.vod_id)
+                        if v is None:
+                            break
+                        state = v["state"]
+                        if state in ("done", "skipped", "failed"):
+                            break
+                        if state == "cut":
+                            plan_data = pipeline.load_plan_data(v["plan_json"])
+                            plan = plan_data.get("parts", [])
+                            ups2 = db.uploads(conn, args.vod_id)
+                            if pipeline.expected_upload_count(plan) == len(ups2) and all(u["file"] and u["thumb"] for u in ups2):
+                                with conn:
+                                    conn.execute("UPDATE vods SET state = 'prepared', updated_at = ? WHERE id = ?", (db._now_iso(), args.vod_id))
+                                break
+                            try:
+                                pipeline.step_cut_ready(conn, cfg, v)
+                            except Exception:
+                                try:
+                                    pipeline.step_cut(conn, cfg, v)
+                                except Exception as e:
+                                    logger.exception("Prepare cut failed for VOD %s", args.vod_id)
+                                    db.record_error(conn, args.vod_id, str(e))
+                                    break
+                            continue
+                        step_fn = pipeline.STEPS.get(state)
+                        if step_fn is None:
+                            break
+                        try:
+                            next_state = step_fn(conn, cfg, v)
+                        except pipeline.StopRun as sr:
+                            db.set_error(conn, args.vod_id, str(sr))
+                            raise
+                        except config.MissingSecret as e:
+                            err_text = str(e)
+                            logger.error(err_text)
+                            db.set_error(conn, args.vod_id, err_text)
+                            return 1
+                        except Exception as e:
+                            if isinstance(e, youtube.AuthRequired):
+                                msg = str(e)
+                                logger.error(msg)
+                                db.set_error(conn, args.vod_id, msg)
+                                raise pipeline.StopRun(msg) from e
+                            logger.exception("Prepare failed for VOD %s", args.vod_id)
+                            db.record_error(conn, args.vod_id, str(e))
+                            break
+                        with conn:
+                            conn.execute("UPDATE vods SET state = ?, updated_at = ? WHERE id = ?", (next_state, db._now_iso(), args.vod_id))
+                finally:
+                    pass
+                v = db.get_vod(conn, args.vod_id)
+                if v and v["state"] == "prepared":
+                    print("Prepared. Files, thumbnails and descriptions are ready in the work folder.")
+                    ups3 = db.uploads(conn, args.vod_id)
+                    for u in ups3:
+                        print(f"  part {u['idx']}: {u['title']} -> {u['file']}")
+                        if u['thumb']:
+                            print(f"           thumb: {u['thumb']}")
+                    return 0
+                if v and v["state"] == "failed":
+                    _print_err(v["error"] or "Failed")
+                    return 1
+                print(f"State: {v['state'] if v else 'missing'}")
+                return 0
 
         elif args.command == "status":
             conn = db.connect(cfg.db_path)
@@ -389,37 +530,8 @@ def main(argv: list[str] | None = None) -> int:
             return _with_lock(cfg, do_refresh)
 
         elif args.command == "install-timer":
-            if _is_windows():
-                pythonw = Path(sys.executable).with_name("pythonw.exe")
-                python_exe = str(pythonw) if os.path.exists(pythonw) else sys.executable
-                task_script = str(REPO_DIR / "k2y-task.pyw").replace("/", "\\")
-                tr_val = f'"{python_exe}" "{task_script}"'
-                subprocess.run(
-                    [
-                        "schtasks",
-                        "/Create",
-                        "/F",
-                        "/SC",
-                        "MINUTE",
-                        "/MO",
-                        "10",
-                        "/TN",
-                        "k2y",
-                        "/TR",
-                        tr_val,
-                    ],
-                    check=True,
-                )
-                print("Task 'k2y' scheduled successfully.")
-                print("To check: schtasks /Query /TN k2y")
-                print("To remove: schtasks /Delete /TN k2y /F")
-                print("Battery note: Windows Task Scheduler runs on AC power only by default; see README to allow running on battery.")
-            else:
-                task_log = cfg.work_dir / "k2y-task.log"
-                repo_q = shlex.quote(str(REPO_DIR))
-                py_q = shlex.quote(sys.executable)
-                log_q = shlex.quote(str(task_log))
-                print(f"*/10 * * * * cd {repo_q} && {py_q} -m k2y run >> {log_q} 2>&1")
+            for line in timer.install_timer(REPO_DIR, cfg.work_dir):
+                print(line)
             return 0
 
     except config.MissingSecret as e:

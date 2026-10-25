@@ -383,6 +383,21 @@ class TestCLI(unittest.TestCase):
         row = db.get_vod(self.conn, vod_id)
         self.assertEqual(row["state"], "planned")
 
+    def test_setup_dispatches_before_config_load(self):
+        target = Path(self.tmp.name) / "elsewhere"
+        with patch("k2y.wizard.run_setup", return_value=0) as mock_setup:
+            ret = cli.main(
+                ["setup", "--config-dir", str(target), "--no-auth", "--no-timer"]
+            )
+
+        self.assertEqual(ret, 0)
+        mock_setup.assert_called_once_with(
+            config_dir=target,
+            repo_dir=cli.REPO_DIR,
+            do_auth=False,
+            do_timer=False,
+        )
+
     def test_install_timer_windows_exact_tr_with_spaces_and_battery_note(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -392,8 +407,8 @@ class TestCLI(unittest.TestCase):
         fake_repo = Path(r"C:\Users\User Name\Projects\kick-to-youtube-lives")
 
         import pathlib
-        with patch("k2y.cli._is_windows", return_value=True), \
-             patch("k2y.cli.Path", pathlib.PureWindowsPath), \
+        with patch("k2y.timer.is_windows", return_value=True), \
+             patch("k2y.timer.Path", pathlib.PureWindowsPath), \
              patch("sys.executable", fake_python), \
              patch("os.path.exists", return_value=True), \
              patch("k2y.cli.REPO_DIR", fake_repo), \
@@ -427,7 +442,7 @@ class TestCLI(unittest.TestCase):
     def test_install_timer_linux(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch("k2y.cli._is_windows", return_value=False), \
+        with patch("k2y.timer.is_windows", return_value=False), \
              patch("subprocess.run") as mock_run, \
              patch("sys.stdout", stdout), \
              patch("sys.stderr", stderr):

@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>k2y Setup Wizard - Web UI Mockup</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+                'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+                sans-serif;
+            background: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 30px;
+            background: linear-gradient(135deg, #1e1e1e 0%, #252525 100%);
+            border-radius: 12px;
+            border: 1px solid #333;
+        }
+        header h1 {
+            color: #fff;
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+        header p {
+            color: #aaa;
+            font-size: 14px;
+        }
+        .local-badge {
+            display: inline-block;
+            margin-top: 10px;
+            padding: 4px 12px;
+            background: #1a4d2e;
+            color: #4ade80;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .wizard {
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 30px;
+            background: #1e1e1e;
+            border-radius: 12px;
+            border: 1px solid #333;
+            overflow: hidden;
+            min-height: 600px;
+        }
+        .sidebar {
+            background: #151515;
+            padding: 30px 0;
+            border-right: 1px solid #333;
+        }
+        .step-item {
+            padding: 12px 30px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: #666;
+            font-size: 14px;
+            position: relative;
+        }
+        .step-item.active {
+            color: #fff;
+            background: linear-gradient(90deg, rgba(59, 130, 246, 0.1) 0%, transparent 100%);
+        }
+        .step-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: #3b82f6;
+        }
+        .step-item.completed {
+            color: #4ade80;
+        }
+        .step-number {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #252525;
+            border: 2px solid #333;
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+        .step-item.active .step-number {
+            background: #3b82f6;
+            border-color: #3b82f6;
+            color: #fff;
+        }
+        .step-item.completed .step-number {
+            background: #1a4d2e;
+            border-color: #4ade80;
+            color: #4ade80;
+        }
+        .content {
+            padding: 40px;
+        }
+        .step-content {
+            display: none;
+        }
+        .step-content.active {
+            display: block;
+        }
+        .step-content h2 {
+            color: #fff;
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        .step-content .subtitle {
+            color: #aaa;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .section {
+            margin-bottom: 30px;
+        }
+        .section-title {
+            color: #fff;
+            font-size: 16px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        .upload-zone {
+            border: 2px dashed #444;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            background: #151515;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-bottom: 16px;
+        }
+        .upload-zone:hover {
+            border-color: #3b82f6;
+            background: #1a1a2e;
+        }
+        .upload-zone.dragover {
+            border-color: #3b82f6;
+            background: #1a1a2e;
+        }
+        .upload-icon {
+            font-size: 40px;
+            margin-bottom: 10px;
+        }
+        .upload-text {
+            color: #fff;
+            margin-bottom: 4px;
+        }
+        .upload-hint {
+            color: #666;
+            font-size: 13px;
+        }
+        .file-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 6px;
+        }
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .file-name {
+            color: #fff;
+            font-size: 14px;
+        }
+        .file-status {
+            color: #4ade80;
+            font-size: 12px;
+        }
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: #3b82f6;
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: #2563eb;
+        }
+        .btn-secondary {
+            background: #252525;
+            color: #fff;
+            border: 1px solid #333;
+        }
+        .btn-secondary:hover {
+            background: #333;
+        }
+        .actions {
+            display: flex;
+            gap: 12px;
+            margin-top: 40px;
+            padding-top: 30px;
+            border-top: 1px solid #333;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-label {
+            display: block;
+            color: #fff;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .form-input {
+            width: 100%;
+            padding: 10px 14px;
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 14px;
+            font-family: inherit;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        .form-hint {
+            color: #666;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px;
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 6px;
+        }
+        .checkbox-group input {
+            width: 18px;
+            height: 18px;
+        }
+        .info-box {
+            background: #1a1a2e;
+            border: 1px solid #3b82f6;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+        .info-box p {
+            color: #93c5fd;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .image-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .image-preview {
+            aspect-ratio: 16/9;
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+        }
+        .image-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .image-preview .remove {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: rgba(0,0,0,0.7);
+            border: none;
+            color: #fff;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .auth-box {
+            text-align: center;
+            padding: 40px;
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 8px;
+        }
+        .auth-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        .summary-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid #333;
+        }
+        .summary-item:last-child {
+            border-bottom: none;
+        }
+        .summary-label {
+            color: #aaa;
+        }
+        .summary-value {
+            color: #fff;
+            font-weight: 500;
+        }
+        .success-icon {
+            text-align: center;
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎬 k2y Setup Wizard</h1>
+            <p>Configure Kick → YouTube auto-upload pipeline</p>
+            <span class="local-badge">🔒 Runs locally on http://127.0.0.1:8765</span>
+        </header>
+
+        <div class="wizard">
+            <div class="sidebar">
+                <div class="step-item completed">
+                    <div class="step-number">✓</div>
+                    <span>Intro & Checks</span>
+                </div>
+                <div class="step-item active">
+                    <div class="step-number">2</div>
+                    <span>Credentials</span>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">3</div>
+                    <span>Reaction Images</span>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">4</div>
+                    <span>Channel & Settings</span>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">5</div>
+                    <span>YouTube Auth</span>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">6</div>
+                    <span>Timer</span>
+                </div>
+                <div class="step-item">
+                    <div class="step-number">7</div>
+                    <span>Done</span>
+                </div>
+            </div>
+
+            <div class="content">
+                <!-- Step 2: Credentials -->
+                <div class="step-content active">
+                    <h2>Credentials</h2>
+                    <p class="subtitle">Upload your Google OAuth client and Gemini API key</p>
+
+                    <div class="info-box">
+                        <p>💡 <strong>Need help?</strong> These files come from Google Cloud and Google AI Studio. The full setup guide walks through creating them.</p>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">1. Google OAuth Client (Required)</div>
+                        <p style="color: #aaa; font-size: 13px; margin-bottom: 12px;">Download as "Desktop app" from Google Cloud Console</p>
+                        <div class="upload-zone">
+                            <div class="upload-icon">📁</div>
+                            <div class="upload-text">Drop client_secret.json here</div>
+                            <div class="upload-hint">or click to browse</div>
+                        </div>
+                        <div class="file-list">
+                            <div class="file-item">
+                                <div class="file-info">
+                                    <span>📄</span>
+                                    <span class="file-name">client_secret.json</span>
+                                    <span class="file-status">✓ Valid (Desktop app)</span>
+                                </div>
+                                <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Remove</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">2. Gemini API Key (Required)</div>
+                        <p style="color: #aaa; font-size: 13px; margin-bottom: 12px;">From Google AI Studio with billing enabled</p>
+                        <div class="form-group">
+                            <label class="form-label">Paste API key</label>
+                            <input type="password" class="form-input" placeholder="AIza..." value="AIza****************************">
+                            <div class="form-hint">Or upload a .txt file containing the key</div>
+                        </div>
+                        <div class="upload-zone" style="padding: 20px;">
+                            <div class="upload-text" style="font-size: 14px;">Drop gemini.key or .txt here</div>
+                        </div>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary">← Back</button>
+                        <button class="btn btn-primary" style="margin-left: auto;">Next: Reaction Images →</button>
+                    </div>
+                </div>
+
+                <!-- Step 3: Reaction Images -->
+                <div class="step-content">
+                    <h2>Reaction Images</h2>
+                    <p class="subtitle">Custom photos for thumbnails (optional)</p>
+
+                    <div class="info-box">
+                        <p>💡 k2y uses reaction photos to generate thumbnails. If you skip this, it will use images from <code>assets/faces/</code> in the repo.</p>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">Upload your images</div>
+                        <p style="color: #aaa; font-size: 13px; margin-bottom: 12px;">JPG, PNG, or WebP. You can upload multiple files or a ZIP.</p>
+                        <div class="upload-zone">
+                            <div class="upload-icon">🖼️</div>
+                            <div class="upload-text">Drop images or .zip here</div>
+                            <div class="upload-hint">or click to browse</div>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">Preview (3 images)</div>
+                        <div class="image-grid">
+                            <div class="image-preview">
+                                <img src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=225&fit=crop" alt="">
+                                <button class="remove">×</button>
+                            </div>
+                            <div class="image-preview">
+                                <img src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&h=225&fit=crop" alt="">
+                                <button class="remove">×</button>
+                            </div>
+                            <div class="image-preview">
+                                <img src="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=400&h=225&fit=crop" alt="">
+                                <button class="remove">×</button>
+                            </div>
+                        </div>
+                        <p style="color: #666; font-size: 12px; margin-top: 12px;">Will be copied to ~/.config/k2y/faces/</p>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary">← Back</button>
+                        <button class="btn btn-secondary">Skip</button>
+                        <button class="btn btn-primary" style="margin-left: auto;">Next: Channel & Settings →</button>
+                    </div>
+                </div>
+
+                <!-- Step 4: Channel & Settings -->
+                <div class="step-content">
+                    <h2>Channel & Settings</h2>
+                    <p class="subtitle">Configure your Kick channel and processing options</p>
+
+                    <div class="form-group">
+                        <label class="form-label">Kick Channel Slug *</label>
+                        <input type="text" class="form-input" placeholder="e.g., randomguy42" value="newstreamer">
+                        <div class="form-hint">From kick.com/your-channel-slug</div>
+                    </div>
+
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label class="form-label">Start Date *</label>
+                            <input type="date" class="form-input" value="2026-10-24">
+                            <div class="form-hint">Only process VODs from this date</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Min Part Length (minutes) *</label>
+                            <input type="number" class="form-input" value="15" min="1">
+                            <div class="form-hint">Shorter parts will be merged</div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Work Folder *</label>
+                        <input type="text" class="form-input" value="/home/user/.local/share/k2y">
+                        <div class="form-hint">Downloads, database, and logs</div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">Description Links (Optional)</div>
+                        <p style="color: #aaa; font-size: 13px; margin-bottom: 12px;">Added to the bottom of every YouTube description</p>
+                        <div class="form-group">
+                            <div class="grid-2">
+                                <input type="text" class="form-input" placeholder="Label (e.g., Discord)">
+                                <input type="text" class="form-input" placeholder="URL (https://...)">
+                            </div>
+                        </div>
+                        <button class="btn btn-secondary" style="font-size: 13px;">+ Add Link</button>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary">← Back</button>
+                        <button class="btn btn-primary" style="margin-left: auto;">Next: YouTube Auth →</button>
+                    </div>
+                </div>
+
+                <!-- Step 5: YouTube Auth -->
+                <div class="step-content">
+                    <h2>YouTube Authorization</h2>
+                    <p class="subtitle">Connect your YouTube channel</p>
+
+                    <div class="auth-box">
+                        <div class="auth-icon">🔐</div>
+                        <h3 style="color: #fff; margin-bottom: 10px;">Ready to authorize</h3>
+                        <p style="color: #aaa; margin-bottom: 30px; max-width: 400px; margin-left: auto; margin-right: auto;">
+                            A browser window will open. Choose the Google account that owns your YouTube channel.
+                            For a Brand Account, pick it in the account chooser.
+                        </p>
+                        <button class="btn btn-primary">Open Browser for Authorization</button>
+                        <p style="color: #666; font-size: 13px; margin-top: 20px;">
+                            Or use <a href="#" style="color: #3b82f6;">paste code</a> for headless machines
+                        </p>
+                    </div>
+
+                    <div class="info-box">
+                        <p>⚠️ <strong>OAuth Testing Mode:</strong> If your Google Cloud app is in Testing mode, tokens expire after 7 days. You'll need to re-authorize weekly or publish the app.</p>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary">← Back</button>
+                        <button class="btn btn-primary" style="margin-left: auto;">Next: Timer →</button>
+                    </div>
+                </div>
+
+                <!-- Step 6: Timer -->
+                <div class="step-content">
+                    <h2>Schedule Timer</h2>
+                    <p class="subtitle">Run k2y every 10 minutes automatically</p>
+
+                    <div class="info-box">
+                        <p>💡 Your computer needs to be on and awake for the timer to run. Nothing runs in the cloud.</p>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">Install Timer</div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="install-timer" checked>
+                            <label for="install-timer" style="color: #fff; cursor: pointer;">Install Task Scheduler (Windows) / Show crontab line (Linux)</label>
+                        </div>
+                        <p style="color: #666; font-size: 12px; margin-top: 10px;">Every 10 minutes: discovers new VODs and processes unfinished ones</p>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">Preview</div>
+                        <div style="background: #151515; padding: 16px; border-radius: 6px; border: 1px solid #333; font-family: 'Courier New', monospace; font-size: 13px; color: #4ade80;">
+                            schtasks /Create /F /SC MINUTE /MO 10 /TN k2y /TR "..." 
+                        </div>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary">← Back</button>
+                        <button class="btn btn-primary" style="margin-left: auto;">Finish Setup →</button>
+                    </div>
+                </div>
+
+                <!-- Step 7: Done -->
+                <div class="step-content">
+                    <div class="success-icon">✅</div>
+                    <h2 style="text-align: center;">Setup Complete!</h2>
+                    <p class="subtitle" style="text-align: center;">k2y is ready to go</p>
+
+                    <div class="section" style="max-width: 500px; margin: 0 auto 30px;">
+                        <div class="summary-item">
+                            <span class="summary-label">Kick Channel</span>
+                            <span class="summary-value">newstreamer</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Config Location</span>
+                            <span class="summary-value">~/.config/k2y/config.json</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Work Folder</span>
+                            <span class="summary-value">~/.local/share/k2y</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">YouTube</span>
+                            <span class="summary-value">✓ Authorized (private uploads)</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Timer</span>
+                            <span class="summary-value">✓ Installed (every 10 min)</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Reaction Images</span>
+                            <span class="summary-value">3 images in ~/.config/k2y/faces/</span>
+                        </div>
+                    </div>
+
+                    <div class="info-box" style="max-width: 500px; margin: 0 auto 30px;">
+                        <p><strong>Next steps:</strong><br>
+                        1. Run <code>py -m k2y status</code> to check setup<br>
+                        2. Test: <code>py -m k2y backfill &lt;vod_id&gt;</code> then <code>py -m k2y run</code><br>
+                        3. Review uploads in YouTube Studio (they're private)<br>
+                        4. Publish manually when ready</p>
+                    </div>
+
+                    <div style="text-align: center;">
+                        <button class="btn btn-primary">Open Setup Guide</button>
+                        <button class="btn btn-secondary">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-top: 30px; color: #666; font-size: 12px;">
+            <p>k2y web wizard - All processing happens locally. No data sent to external servers except Google APIs you authorize.</p>
+        </div>
+    </div>
+</body>
+</html>
